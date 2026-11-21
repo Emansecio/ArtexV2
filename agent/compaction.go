@@ -21,7 +21,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,15 +47,29 @@ type Compactor struct {
 	lastRun map[int64]time.Time
 }
 
-// NewCompactor builds a compactor. prov/model are used for the §4 body LLM call
-// (same model the agent runs on, per §4). A nil Compactor is a safe no-op.
+func coldDigestThreshold(envKey string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(envKey))
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 2 {
+		return def
+	}
+	return n
+}
+
+// NewCompactor builds a compactor. prov/model are used for the §4 body LLM call.
+// Thresholds default to N=12 / M=6 and can be overridden via
+// ARTEX_COLD_DIGEST_MIN_NODES and ARTEX_COLD_DIGEST_MAJOR_DIGESTS.
+// A nil Compactor is a safe no-op.
 func NewCompactor(prov llm.Provider, model string) *Compactor {
 	return &Compactor{
 		prov:     prov,
 		model:    model,
 		params:   defaultColdParams(),
-		n:        20,
-		m:        8,
+		n:        coldDigestThreshold("ARTEX_COLD_DIGEST_MIN_NODES", 12),
+		m:        coldDigestThreshold("ARTEX_COLD_DIGEST_MAJOR_DIGESTS", 6),
 		cooldown: 60 * time.Second,
 		maxDur:   5 * time.Minute,
 		running:  map[int64]bool{},
@@ -180,9 +196,7 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 	if len(blocks) == 0 {
 		return // this batch has no ≥2 connected/shared-parent block — nothing to fold (§7)
 	}
-	for _, b := range blocks {
-		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil))
-	}
+	c.foldBlocksParallel(ctx, ts, g, blocks, nodeByID, cvers, nil)
 	// A minor may have pushed the segment count over M → merge in the same run.
 	if ad, e := ts.ActiveDigests(); e == nil && len(ad) >= c.m {
 		c.major(ctx, ts)
@@ -246,9 +260,37 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 	if err := ts.SupersedeDigests(stale); err != nil {
 		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
 	}
-	for _, b := range toCreate {
-		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active))
+	c.foldBlocksParallel(ctx, ts, g, toCreate, nodeByID, cvers, active)
+}
+
+func (c *Compactor) foldBlocksParallel(ctx context.Context, ts *db.ExplorationStore, g *coldGraph, blocks []block, nodeByID map[int64]*db.Node, cvers map[int64]int, active []*db.Node) {
+	if len(blocks) <= 1 {
+		for _, b := range blocks {
+			c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active))
+		}
+		return
 	}
+	const maxFoldConcurrency = 3
+	sem := make(chan struct{}, maxFoldConcurrency)
+	var wg sync.WaitGroup
+	for _, b := range blocks {
+		if ctx.Err() != nil {
+			break
+		}
+		b := b
+		gen := c.generationFor(b, active)
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
+			c.foldBlock(ctx, ts, g, b, nodeByID, cvers, gen)
+		}()
+	}
+	wg.Wait()
 }
 
 // foldBlock compresses one block and writes its digest — with a commit-time

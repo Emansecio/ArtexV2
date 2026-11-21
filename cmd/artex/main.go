@@ -21,6 +21,8 @@ import (
 	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/server"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // configSnapshot is the single startup log line describing the effective
@@ -205,7 +207,7 @@ func run() int {
 	// WriteTimeout is left unset: a write deadline would cut that stream.
 	httpSrv := &http.Server{
 		Addr:              *addr,
-		Handler:           srv.Handler(),
+		Handler:           h2c.NewHandler(srv.Handler(), &http2.Server{}),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Minute,
 		IdleTimeout:       2 * time.Minute,

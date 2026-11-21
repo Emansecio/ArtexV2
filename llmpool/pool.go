@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"iter"
 	"log"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Autumn-27/norma/llm"
@@ -47,9 +49,10 @@ var ErrExhausted = errors.New("LLM failover: all profiles unavailable")
 // It is safe for concurrent use: members are immutable after construction and
 // all mutable state lives in the shared Registry.
 type Pool struct {
-	members []*Member // in chain order (active first, then priority DESC)
-	health  *Registry
-	rr      atomic.Uint64 // rotates the starting point within an equal-priority group
+	members    []*Member // in chain order (active first, then priority DESC)
+	health     *Registry
+	rr         atomic.Uint64 // rotates the starting point within an equal-priority group
+	hedgeDelay time.Duration // optional speculative hedge threshold (ARTEX_LLM_HEDGE_MS)
 }
 
 // New builds a Pool over members (already in chain order). Returns nil when the
@@ -62,7 +65,28 @@ func New(members []*Member, health *Registry) *Pool {
 	if health == nil {
 		health = NewRegistry(nil, nil)
 	}
-	return &Pool{members: members, health: health}
+	return &Pool{
+		members:    members,
+		health:     health,
+		hedgeDelay: hedgeDelayFromEnv(),
+	}
+}
+
+// SetHedgeDelay configures speculative hedging between the top two members in
+// Pool.Stream (0 disables). Only starts member 1 if member 0 yields no event
+// within d, and cancels the slower stream before emitting to the caller.
+func (p *Pool) SetHedgeDelay(d time.Duration) { p.hedgeDelay = d }
+
+func hedgeDelayFromEnv() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("ARTEX_LLM_HEDGE_MS"))
+	if raw == "" {
+		return 0
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // Members returns the chain in order (read-only).
@@ -81,16 +105,40 @@ func (p *Pool) Head() *Member { return p.members[0] }
 // credit, 401 bad key, 429, 5xx) all surface during request establishment,
 // before the body is read, so they always land in the safe window.
 func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
-	order := p.order(req)
+	order, releaseProbes := p.order(req)
 	return func(yield func(llm.StreamEvent, error) bool) {
+		defer releaseProbes()
 		var lastErr error
-		for i, m := range order {
+		startIdx := 0
+		if p.hedgeDelay > 0 && len(order) >= 2 {
+			done, err := p.streamHedgedFirstTwo(ctx, req, order[0], order[1], len(order) > 2, yield)
+			if done {
+				return
+			}
+			if err != nil {
+				lastErr = err
+			}
+			startIdx = 2
+		}
+		for i := startIdx; i < len(order); i++ {
+			m := order[i]
+			hasNext := i+1 < len(order)
+			attemptCtx := ctx
+			if hasNext {
+				attemptCtx = llm.WithMaxRetries(ctx, 0)
+			}
+			startAt := time.Now()
+			firstTTFT := false
 			emitted := false
 			var failed error
-			for ev, err := range m.Prov.Stream(ctx, req) {
+			for ev, err := range m.Prov.Stream(attemptCtx, req) {
 				if err != nil && !emitted && shouldFailover(ctx, err) {
 					failed = err
 					break // safe window: nothing reached the caller yet
+				}
+				if !firstTTFT && err == nil {
+					firstTTFT = true
+					p.health.RecordTTFT(m.ID, time.Since(startAt))
 				}
 				emitted = true
 				if !yield(ev, err) {
@@ -108,7 +156,7 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 			if tripped, msg := p.health.RecordCall(ctx, m.ID, true, false, failed); tripped {
 				log.Printf("[llmpool] profile %q(%s) breaker tripped: %s", m.Name, m.Model, msg)
 			}
-			if i+1 < len(order) {
+			if hasNext {
 				n := order[i+1]
 				log.Printf("[llmpool] LLM failover: %q(%s) → %q(%s), reason: %s",
 					m.Name, m.Model, n.Name, n.Model, trimErr(failed))
@@ -122,17 +170,187 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 	}
 }
 
+type hedgeResult struct {
+	ev  llm.StreamEvent
+	err error
+}
+
+// streamHedgedFirstTwo races m0 against a delayed speculative m1 when m0 has
+// yielded no event within p.hedgeDelay. Whichever yields its first non-error
+// event wins; the other is cancelled before anything reaches yield.
+// Returns (true, nil) if the stream finished or handed off to a winner;
+// returns (false, lastErr) only if both failed inside the safe pre-emit window.
+func (p *Pool) streamHedgedFirstTwo(
+	ctx context.Context,
+	req llm.CompletionRequest,
+	m0, m1 *Member,
+	hasMore bool,
+	yield func(llm.StreamEvent, error) bool,
+) (bool, error) {
+	runMember := func(mctx context.Context, m *Member, out chan<- hedgeResult) {
+		defer close(out)
+		for ev, err := range m.Prov.Stream(mctx, req) {
+			select {
+			case out <- hedgeResult{ev: ev, err: err}:
+			case <-mctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+
+	ctx0, cancel0 := context.WithCancel(llm.WithMaxRetries(ctx, 0))
+	defer cancel0()
+	ch0 := make(chan hedgeResult, 16)
+	start0 := time.Now()
+	go runMember(ctx0, m0, ch0)
+
+	var ctx1 context.Context
+	var cancel1 context.CancelFunc
+	var ch1 chan hedgeResult
+	var start1 time.Time
+	var m1Started, m0Dead, m1Dead bool
+	var lastErr error
+
+	drainWinner := func(m *Member, start time.Time, first hedgeResult, ch <-chan hedgeResult, cancelLoser context.CancelFunc) (bool, error) {
+		if cancelLoser != nil {
+			cancelLoser()
+		}
+		p.health.RecordTTFT(m.ID, time.Since(start))
+		if !yield(first.ev, nil) {
+			return true, nil
+		}
+		for res := range ch {
+			if !yield(res.ev, res.err) {
+				return true, nil
+			}
+			if res.err != nil {
+				return true, nil
+			}
+		}
+		p.health.RecordCall(ctx, m.ID, true, false, nil)
+		return true, nil
+	}
+
+	failMember := func(m *Member, err error) {
+		lastErr = err
+		if tripped, msg := p.health.RecordCall(ctx, m.ID, true, false, err); tripped {
+			log.Printf("[llmpool] profile %q(%s) breaker tripped: %s", m.Name, m.Model, msg)
+		}
+	}
+
+	// Fast path: wait up to p.hedgeDelay for m0 before hedging m1.
+	timer := time.NewTimer(p.hedgeDelay)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return true, nil
+	case res, ok := <-ch0:
+		timer.Stop()
+		if !ok {
+			res.err = ErrExhausted
+		}
+		if res.err == nil {
+			return drainWinner(m0, start0, res, ch0, nil)
+		}
+		if !shouldFailover(ctx, res.err) {
+			yield(llm.StreamEvent{}, res.err)
+			return true, nil
+		}
+		failMember(m0, res.err)
+		m0Dead = true
+	case <-timer.C:
+	}
+
+	// Launch speculative backup m1 immediately (either m0 timed out on TTFT or m0 failed fast).
+	if m1 != nil {
+		bctx := ctx
+		if hasMore || !m0Dead {
+			bctx = llm.WithMaxRetries(ctx, 0)
+		}
+		ctx1, cancel1 = context.WithCancel(bctx)
+		defer cancel1()
+		ch1 = make(chan hedgeResult, 16)
+		start1 = time.Now()
+		m1Started = true
+		go runMember(ctx1, m1, ch1)
+		if !m0Dead {
+			log.Printf("[llmpool] speculative hedge: racing %q(%s) alongside slow %q(%s) after %v",
+				m1.Name, m1.Model, m0.Name, m0.Model, p.hedgeDelay)
+		} else {
+			log.Printf("[llmpool] LLM failover: %q(%s) → %q(%s), reason: %s",
+				m0.Name, m0.Model, m1.Name, m1.Model, trimErr(lastErr))
+		}
+	}
+
+	for !(m0Dead && (!m1Started || m1Dead)) {
+		var c0 <-chan hedgeResult
+		var c1 <-chan hedgeResult
+		if !m0Dead {
+			c0 = ch0
+		}
+		if m1Started && !m1Dead {
+			c1 = ch1
+		}
+		select {
+		case <-ctx.Done():
+			return true, nil
+		case res, ok := <-c0:
+			if !ok {
+				res.err = ErrExhausted
+			}
+			if res.err == nil {
+				return drainWinner(m0, start0, res, ch0, cancel1)
+			}
+			if !shouldFailover(ctx, res.err) {
+				if cancel1 != nil {
+					cancel1()
+				}
+				yield(llm.StreamEvent{}, res.err)
+				return true, nil
+			}
+			failMember(m0, res.err)
+			m0Dead = true
+		case res, ok := <-c1:
+			if !ok {
+				res.err = ErrExhausted
+			}
+			if res.err == nil {
+				return drainWinner(m1, start1, res, ch1, cancel0)
+			}
+			if !shouldFailover(ctx, res.err) {
+				cancel0()
+				yield(llm.StreamEvent{}, res.err)
+				return true, nil
+			}
+			failMember(m1, res.err)
+			m1Dead = true
+		}
+	}
+	return false, lastErr
+}
+
 // Complete implements llm.Provider with failover for non-streaming calls. A
 // non-streaming request is atomic — it never delivers partial output — so every
 // failover-eligible failure lands in the safe window and the next member can be
 // tried without risk of duplicated output. Mirrors Stream's health-tripping and
 // chain-exhaustion behavior.
 func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
-	order := p.order(req)
+	order, releaseProbes := p.order(req)
+	defer releaseProbes()
 	var lastErr error
 	for i, m := range order {
-		msg, sr, usage, err := m.Prov.Complete(ctx, req)
+		hasNext := i+1 < len(order)
+		attemptCtx := ctx
+		if hasNext {
+			attemptCtx = llm.WithMaxRetries(ctx, 0)
+		}
+		startAt := time.Now()
+		msg, sr, usage, err := m.Prov.Complete(attemptCtx, req)
 		if err == nil {
+			p.health.RecordTTFT(m.ID, time.Since(startAt))
 			p.health.RecordCall(ctx, m.ID, false, false, nil) // Pass
 			return msg, sr, usage, nil
 		}
@@ -147,7 +365,7 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 		if tripped, msg := p.health.RecordCall(ctx, m.ID, false, false, err); tripped {
 			log.Printf("[llmpool] profile %q(%s) breaker tripped: %s", m.Name, m.Model, msg)
 		}
-		if i+1 < len(order) {
+		if hasNext {
 			n := order[i+1]
 			log.Printf("[llmpool] LLM failover: %q(%s) → %q(%s), reason: %s",
 				m.Name, m.Model, n.Name, n.Model, trimErr(err))
@@ -161,32 +379,44 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 }
 
 // order picks the members to try, in order: skip those in a cooling-off window
-// and those whose context window can't hold this request, then rotate within each
-// equal-priority group so same-priority profiles share the load. Never returns an
-// empty slice — if everything is filtered out, the head of the chain is tried
-// anyway, since stalling the engine is worse than one more failed request.
-func (p *Pool) order(req llm.CompletionRequest) []*Member {
+// (or already undergoing a single-flight half-open probe) and those whose context
+// window can't hold this request, then rotate within each equal-priority group
+// while preferring dramatically faster (>500ms TTFT) profiles.
+func (p *Pool) order(req llm.CompletionRequest) ([]*Member, func()) {
 	est := estimateTokens(req)
 	var open []*Member
+	var probes []int64
 	for _, m := range p.members {
-		if p.health.IsOpen(m.ID) {
+		usable, isProbe := p.health.AcquireUsable(m.ID)
+		if !usable {
 			continue
 		}
 		if m.WindowTokens > 0 && est > m.WindowTokens {
+			if isProbe {
+				p.health.ReleaseProbe(m.ID)
+			}
 			continue // would 400 on length — not a useful failover target
+		}
+		if isProbe {
+			probes = append(probes, m.ID)
 		}
 		open = append(open, m)
 	}
-	if len(open) == 0 {
-		return p.members[:1] // last resort: probe the head rather than stall
+	release := func() {
+		for _, id := range probes {
+			p.health.ReleaseProbe(id)
+		}
 	}
-	return rotateGroups(open, p.rr.Add(1)-1)
+	if len(open) == 0 {
+		return p.members[:1], release // last resort: probe the head rather than stall
+	}
+	return rotateGroups(open, p.rr.Add(1)-1, p.health), release
 }
 
 // rotateGroups rotates each run of equal-ranked members by n, so profiles sharing
-// a priority take turns going first (free load-spreading across duplicate keys).
-// The chain head has its own Rank and always stays at the front.
-func rotateGroups(in []*Member, n uint64) []*Member {
+// a priority take turns going first, and moves clearly faster (>500ms lower EWMA
+// TTFT when all members are measured) ahead within the equal-rank group.
+func rotateGroups(in []*Member, n uint64, health *Registry) []*Member {
 	out := make([]*Member, 0, len(in))
 	for i := 0; i < len(in); {
 		j := i + 1
@@ -195,10 +425,34 @@ func rotateGroups(in []*Member, n uint64) []*Member {
 		}
 		g := in[i:j]
 		if len(g) > 1 {
+			rotated := make([]*Member, len(g))
 			off := int(n % uint64(len(g)))
 			for k := range g {
-				out = append(out, g[(k+off)%len(g)])
+				rotated[k] = g[(k+off)%len(g)]
 			}
+			if health != nil {
+				bestIdx := -1
+				var bestTTFT time.Duration
+				allMeasured := true
+				for k, m := range rotated {
+					d := health.TTFT(m.ID)
+					if d <= 0 {
+						allMeasured = false
+						break
+					}
+					if bestIdx == -1 || d < bestTTFT {
+						bestTTFT = d
+						bestIdx = k
+					}
+				}
+				if allMeasured && bestIdx > 0 {
+					headTTFT := health.TTFT(rotated[0].ID)
+					if headTTFT-bestTTFT > 500*time.Millisecond {
+						rotated[0], rotated[bestIdx] = rotated[bestIdx], rotated[0]
+					}
+				}
+			}
+			out = append(out, rotated...)
 		} else {
 			out = append(out, g...)
 		}

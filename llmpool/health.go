@@ -11,8 +11,11 @@ package llmpool
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
+
+	"github.com/Autumn-27/norma/llm"
 )
 
 // backoff is the cooling-off ladder, indexed by trip count: the 1st trip cools
@@ -23,9 +26,10 @@ var backoff = []time.Duration{time.Minute, 5 * time.Minute, 30 * time.Minute}
 
 // State is one profile's circuit-breaker state.
 type State struct {
-	Fails     int       // consecutive failures; reset by a success
-	Trips     int       // total trips, indexes the backoff ladder
-	OpenUntil time.Time // zero / past = closed (usable)
+	Fails     int           // consecutive failures; reset by a success
+	Trips     int           // total trips, indexes the backoff ladder
+	OpenUntil time.Time     // zero / past = closed (usable)
+	TTFT      time.Duration // EWMA time-to-first-token (0 = unmeasured)
 	LastError string
 	LastAt    time.Time
 }
@@ -43,8 +47,9 @@ const softTripAfter = 3
 // (saving an unrelated profile, toggling a setting) never clears what we've learned
 // about which backends are broken.
 type Registry struct {
-	mu sync.Mutex
-	m  map[int64]*State
+	mu      sync.Mutex
+	m       map[int64]*State
+	probing map[int64]bool // true while one single-flight half-open probe is active
 
 	// persist / forget mirror state to the DB so a cooling-off window survives a
 	// restart. Both may be nil (no DB). Both run while r.mu is held, so a later
@@ -93,7 +98,12 @@ func (r *Registry) coolFor(trips int) time.Duration {
 
 // NewRegistry builds an empty registry. persist/forget may be nil.
 func NewRegistry(persist func(id int64, st State), forget func(id int64)) *Registry {
-	return &Registry{m: map[int64]*State{}, persist: persist, forget: forget}
+	return &Registry{
+		m:       map[int64]*State{},
+		probing: map[int64]bool{},
+		persist: persist,
+		forget:  forget,
+	}
 }
 
 // Restore seeds state loaded from the DB at startup (bypasses persistence).
@@ -117,14 +127,95 @@ func (r *Registry) Get(id int64) State {
 // IsOpen reports whether a profile is in its cooling-off window.
 func (r *Registry) IsOpen(id int64) bool { return r.Get(id).Open() }
 
+// AcquireUsable reports whether profile id is currently usable for a request and,
+// if it just exited a cooling-off window (Trips > 0 with expired OpenUntil),
+// admits only ONE concurrent half-open probe caller to avoid a thundering herd.
+// Returns (usable, isProbe). When isProbe is true, caller should ReleaseProbe(id)
+// if it returns without calling RecordCall (e.g. consumer broke early).
+func (r *Registry) AcquireUsable(id int64) (usable bool, isProbe bool) {
+	if id == 0 {
+		return true, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.m[id]
+	if st == nil {
+		return true, false
+	}
+	if time.Now().Before(st.OpenUntil) {
+		return false, false
+	}
+	// Expired breaker window (or half-open state): allow only a single probe in flight.
+	if st.Trips > 0 || !st.OpenUntil.IsZero() {
+		if r.probing[id] {
+			return false, false
+		}
+		r.probing[id] = true
+		return true, true
+	}
+	return true, false
+}
+
+// ReleaseProbe clears an active half-open probe slot without changing breaker state.
+func (r *Registry) ReleaseProbe(id int64) {
+	if id == 0 {
+		return
+	}
+	r.mu.Lock()
+	delete(r.probing, id)
+	r.mu.Unlock()
+}
+
+// RecordTTFT updates the EWMA time-to-first-token latency for profile id.
+func (r *Registry) RecordTTFT(id int64, d time.Duration) {
+	if id == 0 || d <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.m[id]
+	if st == nil {
+		st = &State{}
+		r.m[id] = st
+	}
+	if st.TTFT <= 0 {
+		st.TTFT = d
+	} else {
+		// EWMA alpha = 0.25
+		st.TTFT = (st.TTFT*3 + d) / 4
+	}
+}
+
+// TTFT returns the tracked EWMA time-to-first-token for profile id (0 if unmeasured).
+func (r *Registry) TTFT(id int64) time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if st := r.m[id]; st != nil {
+		return st.TTFT
+	}
+	return 0
+}
+
 // Pass records a successful call: clears the failure counters so a profile that
 // recovers is fully trusted again (and drops the persisted row).
 func (r *Registry) Pass(id int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	delete(r.probing, id)
 	st := r.m[id]
 	if st == nil || (st.Fails == 0 && st.Trips == 0 && st.OpenUntil.IsZero()) {
 		return // already clean; nothing to write
+	}
+	if st.TTFT > 0 {
+		// Preserve EWMA TTFT across Pass while clearing failure/trip counters.
+		st.Fails = 0
+		st.Trips = 0
+		st.OpenUntil = time.Time{}
+		st.LastError = ""
+		if r.forget != nil {
+			r.forget(id)
+		}
+		return
 	}
 	delete(r.m, id)
 	if r.forget != nil {
@@ -137,8 +228,16 @@ func (r *Registry) Pass(id int64) {
 // transient one (429 / 5xx / network) that needs softTripAfter in a row. Returns
 // true when this call is what opened the breaker, so the caller can log it once.
 func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
+	return r.TripWithCooldown(id, errMsg, hard, 0)
+}
+
+// TripWithCooldown behaves like Trip, and when minCooldown > 0 (e.g. from an
+// upstream Retry-After header) opens the breaker immediately for at least
+// minCooldown even on a single transient failure.
+func (r *Registry) TripWithCooldown(id int64, errMsg string, hard bool, minCooldown time.Duration) (tripped bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	delete(r.probing, id)
 	st := r.m[id]
 	if st == nil {
 		st = &State{}
@@ -148,9 +247,16 @@ func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
 	st.LastError = errMsg
 	st.LastAt = time.Now()
 	softTrip := r.tripAfter()
-	if hard || (softTrip > 0 && st.Fails >= softTrip) {
+	if hard || minCooldown > 0 || (softTrip > 0 && st.Fails >= softTrip) {
 		st.Trips++
-		st.OpenUntil = time.Now().Add(r.coolFor(st.Trips))
+		cool := r.coolFor(st.Trips)
+		if minCooldown > cool {
+			cool = minCooldown
+		} else if minCooldown > 0 && !hard && (softTrip <= 0 || st.Fails < softTrip) {
+			// Respect Retry-After directly without inflating the 30m ladder on a single 429.
+			cool = minCooldown
+		}
+		st.OpenUntil = time.Now().Add(cool)
 		st.Fails = 0 // counted into this trip; start fresh for the half-open probe
 		tripped = true
 	}
@@ -198,7 +304,12 @@ func (r *Registry) RecordCall(ctx context.Context, id int64, stream, committed b
 		return false, ""
 	}
 	msg := trimErr(err)
-	return r.Trip(id, msg, isHardFailure(err)), msg
+	var minCool time.Duration
+	var httpErr *llm.HTTPStatusError
+	if errors.As(err, &httpErr) && httpErr.RetryAfter > 0 {
+		minCool = httpErr.RetryAfter
+	}
+	return r.TripWithCooldown(id, msg, isHardFailure(err), minCool), msg
 }
 
 // Reset clears one profile's state — the UI's "Recover now" action.
@@ -206,6 +317,7 @@ func (r *Registry) Reset(id int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.m, id)
+	delete(r.probing, id)
 	if r.forget != nil {
 		r.forget(id)
 	}

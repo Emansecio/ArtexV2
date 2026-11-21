@@ -95,9 +95,11 @@ type Worker struct {
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
 	// lessonsBlock is the raw RSI evidence block. Empty = off. Execute() frames
-	// it with a per-run data envelope (field=lessons) and appends it after the
-	// rendered system prompt. The server renders the text from outcome records.
+	// it with a data envelope (field=lessons) using lessonsNonce (stable per task)
+	// and places it in the cacheable static prefix.
 	lessonsBlock string
+	lessonsNonce string
+	summaryProv  llm.Provider
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -154,7 +156,20 @@ func (w *Worker) SetConstraintInject(fn func() bool) { w.injectConstraints = fn 
 // SetLessonsBlock sets the raw RSI evidence block. Empty disables it. Execute()
 // frames it as data. The server renders it from outcome records; it is never
 // editable through the prompt UI.
-func (w *Worker) SetLessonsBlock(block string) { w.lessonsBlock = block }
+func (w *Worker) SetLessonsBlock(block string) {
+	w.lessonsBlock = block
+	if block != "" && w.lessonsNonce == "" {
+		w.lessonsNonce = NewTaskNonce()
+	}
+}
+
+// SetLessonsNonce fixes the task-scoped data-envelope nonce used for the RSI
+// lessons block so sibling workers and planner rounds share a cacheable prefix.
+func (w *Worker) SetLessonsNonce(nonce string) { w.lessonsNonce = nonce }
+
+// SetSummaryProvider configures an optional dedicated provider for AutoCompact
+// summarization. nil falls back to the worker's primary provider.
+func (w *Worker) SetSummaryProvider(p llm.Provider) { w.summaryProv = p }
 
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (w *Worker) wantConstraints() bool { return w.injectConstraints == nil || w.injectConstraints() }
@@ -387,24 +402,19 @@ func IsRunDirName(name string) bool {
 	return true
 }
 
-// CachePrefixEnv is the opt-in environment flag enabling the worker system
-// prompt cache-prefix split (P3.5 phase C). Off by default: when unset/false,
-// worker system segments and DynamicBoundary are byte-identical to the legacy
-// layout. Planner, mainagent, chat, and goals are unaffected.
+// CachePrefixEnv controls the worker system prompt cache-prefix split.
+// Enabled by default: set ARTEX_CACHE_PREFIX=0/false/off/no to revert to the
+// legacy unsplit layout. Planner, mainagent, chat, and goals are unaffected.
 const CachePrefixEnv = "ARTEX_CACHE_PREFIX"
 
 func cachePrefixEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(CachePrefixEnv))) {
-	case "1", "true", "on", "yes":
-		return true
-	}
-	return false
+	return !isFalsy(os.Getenv(CachePrefixEnv))
 }
 
-// workerSystemParts splits workerSystem at the first per-intent volatile
-// segment (workerArtifactSpec(runDir)) without reordering any text:
-//   - staticPart  = body + untrustedContentTail + workerTrafficBlock
-//   - dynamicHead = workerArtifactSpec(runDir) + noiseProfileBlock
+// workerSystemParts splits workerSystem into task-stable static prefix and
+// per-intent dynamic head:
+//   - staticPart  = body + untrustedContentTail + workerTrafficBlock + noiseProfileBlock
+//   - dynamicHead = workerArtifactSpec(runDir)
 //
 // Custom DB prompts that reference {{.Now}} remain volatile inside staticPart.
 func workerSystemParts(proxyAddr, caCert, dataDir, runDir string) (staticPart, dynamicHead string) {
@@ -412,8 +422,8 @@ func workerSystemParts(proxyAddr, caCert, dataDir, runDir string) (staticPart, d
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	staticPart = body + untrustedContentTail(body) + workerTrafficBlock(caCert != "")
-	dynamicHead = workerArtifactSpec(runDir) + noiseProfileBlock()
+	staticPart = body + untrustedContentTail(body) + workerTrafficBlock(caCert != "") + noiseProfileBlock()
+	dynamicHead = workerArtifactSpec(runDir)
 	return staticPart, dynamicHead
 }
 
@@ -423,21 +433,21 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 }
 
 // assembleWorkerSystem builds the worker's SystemPrompt segments and
-// DynamicBoundary. When split is false (default), it delegates directly to
-// deferredSystem(staticPart+dynamicTail, def). When split is true
-// (ARTEX_CACHE_PREFIX=1), it emits two segments [staticPart, dynamic] with
-// DynamicBoundary=1 so sibling workers in the same task share the cached static
-// prefix, absorbing the leading "\n\n" separator from workerArtifactSpec so
-// strings.Join(system, "\n\n") is byte-identical to the unsplit prompt.
+// DynamicBoundary. When split is false (ARTEX_CACHE_PREFIX=0), it delegates
+// directly to deferredSystem(staticPart+dynamicTail, def). When split is true
+// (default), it places all task-stable blocks (including FindingGuidance and
+// <available-deferred-tools>) in System[0] before DynamicBoundary=1 and keeps
+// only per-intent volatile content (runDir, intent, target assets) in System[1].
 func assembleWorkerSystem(staticPart, dynamicTail string, def DeferredInfo, split bool) (system []string, boundary int) {
 	if !split {
 		return deferredSystem(staticPart+dynamicTail, def)
 	}
-	dyn := strings.TrimPrefix(dynamicTail+def.FindingGuidance, "\n\n")
+	stat := staticPart + def.FindingGuidance
 	if block := actool.RenderDeferredToolsBlock(def.GlobalNames); block != "" {
-		dyn += "\n\n" + block
+		stat += "\n\n" + block
 	}
-	return []string{staticPart, dyn}, 1
+	dyn := strings.TrimPrefix(dynamicTail, "\n\n")
+	return []string{stat, dyn}, 1
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -478,7 +488,11 @@ func renderWorkerGraphOverview(data map[string]any, env dataEnvelope) string {
 	// worker view. data is a fresh map dedicated to this worker, so deleting the key
 	// doesn't affect the planner.
 	delete(data, "coverage")
-	sections := renderOverviewSections(data, env)
+	view := data
+	if workerCompactOverviewEnabled() {
+		view = compactWorkerOverviewData(data)
+	}
+	sections := renderOverviewSections(view, env)
 	if sections == "" {
 		return "" // fall back silently: the worker just won't have the global context
 	}
@@ -486,6 +500,57 @@ func renderWorkerGraphOverview(data map[string]any, env dataEnvelope) string {
 		"Below is the task's current exploration overview. Two purposes: first, know what others have already found — don't repeat; second, let you relate this intent to the global picture while exploring it.\n" +
 		"**Digressing is good**: while exploring this intent, think deep and associate freely. The only boundary is — don't actually go execute other intents (that's other workers' business, scheduled by the planner). But whenever you associate a valuable clue (cross-asset linkage, the suspected entry of another exploit chain, a global-level suspicious point), **be sure to write it into a fact for the planner** — this is an important output of yours, not optional. Better to report one more for the planner to judge than to swallow it yourself." +
 		sections
+}
+
+// compactWorkerOverviewData trims the worker's launch overview to save turn-1
+// tokens while preserving awareness of active work, recent facts, and findings.
+// Deeper details remain one node_detail / expand_digest / list_facts call away.
+func compactWorkerOverviewData(data map[string]any) map[string]any {
+	out := make(map[string]any, len(data))
+	for k, v := range data {
+		out[k] = v
+	}
+	trimMapSlice := func(key string, capN int) {
+		if items, ok := out[key].([]map[string]any); ok && len(items) > capN {
+			out[key] = items[:capN]
+		}
+	}
+	trimMapSlice("open_intents", 10)
+	trimMapSlice("recent_done_intents", 6)
+	trimMapSlice("recent_facts", 10)
+	trimMapSlice("cold_digests", 8)
+	if rts, ok := out["related_tasks"].([]map[string]any); ok && len(rts) > 0 {
+		slim := make([]map[string]any, 0, len(rts))
+		for _, rt := range rts {
+			entry := map[string]any{}
+			for _, keepKey := range []string{"source_task_id", "inherited", "task", "facts", "findings"} {
+				if v, exists := rt[keepKey]; exists {
+					entry[keepKey] = v
+				}
+			}
+			if rf, ok := rt["recent_findings"].([]map[string]any); ok && len(rf) > 0 {
+				if len(rf) > 5 {
+					rf = rf[:5]
+				}
+				entry["recent_findings"] = rf
+			}
+			if rfacts, ok := rt["recent_facts"].([]map[string]any); ok && len(rfacts) > 0 {
+				if len(rfacts) > 3 {
+					rfacts = rfacts[:3]
+				}
+				entry["recent_facts"] = rfacts
+			}
+			if cds, ok := rt["cold_digests"].([]map[string]any); ok && len(cds) > 0 {
+				if len(cds) > 3 {
+					cds = cds[:3]
+				}
+				entry["cold_digests"] = cds
+			}
+			slim = append(slim, entry)
+		}
+		out["related_tasks"] = slim
+	}
+	return out
 }
 
 // writeIntentAutoScope records the intent's target assets as auto scope when
@@ -570,12 +635,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData(), newDataEnvelope())
 	staticPart, dynamicTail := workerSystemParts(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
-	dynamicTail += frameLessonsBlock(w.lessonsBlock)
+	staticPart += frameLessonsBlockWithNonce(w.lessonsBlock, w.lessonsNonce)
 	if w.wantConstraints() {
-		dynamicTail += constraintBlock(ts) // inject the operation constraints (if any) into the system prompt; the worker strictly obeys them during execution
+		staticPart += constraintBlock(ts) // task-stable operation constraints live in the cached prefix
 	}
-	// intent block → intent-anchored assets block → launch instruction, appended to
-	// the system tail in that order (same append pattern as constraintBlock).
+	// intent block → intent-anchored assets block → launch instruction stay in the
+	// per-intent dynamic suffix after DynamicBoundary.
 	dynamicTail += renderIntentTask(intent)
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
@@ -609,8 +674,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 	opts := agentcore.Options{
 		Provider:        w.prov,
+		SummaryProvider: w.summaryProv,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
+		PromptCacheKey:  fmt.Sprintf("artex-task-%d-worker", taskID),
 		Tools:           withWebFetch(ctx, tools, w.proxyAddr, w.proxyCACert),
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
@@ -647,11 +714,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// deadline → task-timeout prompt; turns = the turn budget ran out inside the
 		// clamped window → fall back to the per-run prompt. Non-clamped stays pure per-run.
 		Settlement: settle,
-		// large tool output spills to a file with a head + pointer (SDK tool.Capture);
+		// large tool output spills to a file with head+tail preview + pointer (SDK tool.Capture);
 		// full output preserved on disk, in cmd-output/ or in the task's spill
-		// directory (spill.go). The truncation cap uses the SDK default (30000 chars).
-		ToolOutputDir: TaskToolOutputDir(w.workDir, taskID, runDir),
-		Compaction:    compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
+		// directory (spill.go). Cap configurable via ARTEX_MAX_TOOL_OUTPUT_CHARS (default 8000).
+		ToolOutputDir:      TaskToolOutputDir(w.workDir, taskID, runDir),
+		MaxToolOutputChars: maxToolOutputChars(),
+		Compaction:         compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
 		Todos:         actool.NewTodoStore(),                  // session-level scratch todos (TodoWrite), pure planning, discarded on exit
 		NonStreaming:  w.nonStreaming(),                       // when this profile selects non-streaming, use Provider.Complete
 		MaxTokens:     w.maxTokens(),                          // 0 = send no cap; the server default decides

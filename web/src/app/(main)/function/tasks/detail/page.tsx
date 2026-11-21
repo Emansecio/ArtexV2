@@ -3,6 +3,7 @@
 import * as React from "react";
 
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
@@ -40,18 +41,24 @@ import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import type { LLMProfile, Task } from "@/lib/types";
 
-import { AssetsTab } from "./_tabs/assets-tab";
-import { BroadcastTab } from "./_tabs/broadcast-tab";
-import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
-import { CredentialsTab } from "./_tabs/credentials-tab";
-import { FindingsTab } from "./_tabs/findings-tab";
-import { GraphTab } from "./_tabs/graph-tab";
-import { InterceptTab } from "./_tabs/intercept-tab";
-import { OverviewTab } from "./_tabs/overview-tab";
-import { ReportTab } from "./_tabs/report-tab";
-import { RetestsTab } from "./_tabs/retests-tab";
 import { SessionsTab } from "./_tabs/sessions-tab";
 import { setVisibleInterval } from "@/lib/polling";
+
+const AssetsTab = dynamic(() => import("./_tabs/assets-tab").then((m) => m.AssetsTab), { ssr: false });
+const BroadcastTab = dynamic(() => import("./_tabs/broadcast-tab").then((m) => m.BroadcastTab), { ssr: false });
+const CoverageGraphTab = dynamic(
+  () => import("./_tabs/coverage-graph-tab").then((m) => m.CoverageGraphTab),
+  { ssr: false },
+);
+const CredentialsTab = dynamic(() => import("./_tabs/credentials-tab").then((m) => m.CredentialsTab), {
+  ssr: false,
+});
+const FindingsTab = dynamic(() => import("./_tabs/findings-tab").then((m) => m.FindingsTab), { ssr: false });
+const GraphTab = dynamic(() => import("./_tabs/graph-tab").then((m) => m.GraphTab), { ssr: false });
+const InterceptTab = dynamic(() => import("./_tabs/intercept-tab").then((m) => m.InterceptTab), { ssr: false });
+const OverviewTab = dynamic(() => import("./_tabs/overview-tab").then((m) => m.OverviewTab), { ssr: false });
+const ReportTab = dynamic(() => import("./_tabs/report-tab").then((m) => m.ReportTab), { ssr: false });
+const RetestsTab = dynamic(() => import("./_tabs/retests-tab").then((m) => m.RetestsTab), { ssr: false });
 
 const TABS = [
   { value: "sessions", label: t("Sessions") },

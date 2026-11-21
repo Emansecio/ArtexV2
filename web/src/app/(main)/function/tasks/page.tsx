@@ -517,17 +517,16 @@ export default function TasksPage() {
     if (!categories.some((category) => String(category.id) === categoryFilter)) setCategoryFilter("all");
   }, [categories, categoriesLoaded, categoryFilter]);
 
-  // Only tick every second when there really is a running task — otherwise "duration" is static, and an idle tick would
-  // re-render the whole table for nothing.
+  // Only tick every second at table level when sorting by duration so running-row
+  // clocks do not force full-table re-renders every second.
   const hasRunning = React.useMemo(() => tasks.some((t) => t.status === "running"), [tasks]);
 
-  // tick every second so running tasks' duration counts up live.
   React.useEffect(() => {
-    if (!hasRunning) return;
+    if (!hasRunning || sortField !== "duration") return;
     setNowSec(Math.floor(Date.now() / 1000));
     const i = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 1000);
     return () => clearInterval(i);
-  }, [hasRunning]);
+  }, [hasRunning, sortField]);
 
   const deleteTask = React.useCallback(
     async (id: string, options: DeleteTaskOptions) => {
@@ -1026,9 +1025,7 @@ export default function TasksPage() {
                     <TaskRow
                       key={task.id}
                       task={task}
-                      // only running tasks consume nowSec; other rows get 0 — with unchanged props, memo blocks the per-second tick's
-                      // whole-table re-render and only the running rows advance their duration.
-                      nowSec={task.status === "running" ? nowSec : 0}
+                      nowSec={sortField === "duration" && task.status === "running" ? nowSec : 0}
                       onDelete={deleteTask}
                       onControl={controlTask}
                       onRename={renameTask}
@@ -1212,6 +1209,30 @@ function ConcurrencySettingsDialog() {
 // the POLL_MS list refresh only re-render the rows whose data actually moved — a table page
 // is 20 rows × (StatusBadge + Link + a Radix AlertDialog tree), far too heavy to rebuild
 // wholesale on every parent render.
+const LiveTaskDuration = React.memo(function LiveTaskDuration({
+  task,
+  forcedNowSec,
+}: {
+  task: Task;
+  forcedNowSec: number;
+}) {
+  const [localNow, setLocalNow] = React.useState(() => Math.floor(Date.now() / 1000));
+  const live = task.status === "running" && forcedNowSec === 0;
+  React.useEffect(() => {
+    if (!live) return;
+    setLocalNow(Math.floor(Date.now() / 1000));
+    const id = setInterval(() => setLocalNow(Math.floor(Date.now() / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [live]);
+  const secs = taskDuration(task, forcedNowSec || localNow);
+  if (secs <= 0) return <span className="text-muted-foreground">—</span>;
+  return (
+    <span className={task.status === "running" ? "text-foreground" : "text-muted-foreground"}>
+      {fmtDuration(secs)}
+    </span>
+  );
+});
+
 const TaskRow = React.memo(function TaskRow({
   task,
   nowSec,
@@ -1306,15 +1327,7 @@ const TaskRow = React.memo(function TaskRow({
         {fmtDateTime(task.created_unix)}
       </TableCell>
       <TableCell className="text-right text-xs whitespace-nowrap tabular-nums">
-        {(() => {
-          const secs = taskDuration(task, nowSec);
-          if (secs <= 0) return <span className="text-muted-foreground">—</span>;
-          return (
-            <span className={task.status === "running" ? "text-foreground" : "text-muted-foreground"}>
-              {fmtDuration(secs)}
-            </span>
-          );
-        })()}
+        <LiveTaskDuration task={task} forcedNowSec={nowSec} />
       </TableCell>
       <TableCell
         className="text-right text-xs whitespace-nowrap tabular-nums"

@@ -26,7 +26,7 @@ import { MentionTextarea } from "@/components/mention-textarea";
 import { SideQuestionButton, SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
 import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
-import { Transcript } from "@/components/transcript";
+import { Transcript, type StreamingDeltaView } from "@/components/transcript";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -54,7 +54,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Spinner } from "@/components/ui/spinner";
 import { useSideQuestions } from "@/hooks/use-side-questions";
 import { mergeActivities } from "@/lib/activity-merge";
-import { api } from "@/lib/api";
+import { api, sseUrl } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { isBtwCommand } from "@/lib/side-questions";
@@ -505,6 +505,7 @@ function ChatView({
 }) {
   const approvalFocus = useApprovalFocus({ conversationId: conv.id });
   const [messages, setMessages] = React.useState<Activity[]>([]);
+  const [streamingDelta, setStreamingDelta] = React.useState<StreamingDeltaView | null>(null);
   const [running, setRunning] = React.useState(false);
   const [input, setInput] = React.useState(initial?.input ?? "");
   const [sending, setSending] = React.useState(false);
@@ -554,6 +555,7 @@ function ChatView({
     hasMoreRef.current = false;
     setHasMore(false);
     setMessages([]);
+    setStreamingDelta(null);
     setHistoryLoaded(false);
     setRunning(false);
     let live = true;
@@ -585,34 +587,115 @@ function ChatView({
     if (conv.running) setRunning(true);
   }, [conv.running]);
 
-  // poll while a turn is running: pull new steps after the cursor.
+  // Real-time SSE token & activity stream while a turn is running, with graceful polling fallback.
   React.useEffect(() => {
-    if (!running) return;
+    if (!running) {
+      setStreamingDelta(null);
+      return;
+    }
     let live = true;
-    let timer: ReturnType<typeof setTimeout>;
-    const tick = async () => {
-      let keepPolling = true;
-      try {
-        const r = await api.conversationMessages(conv.id, cursorRef.current);
-        if (!live) return;
-        if (r.items.length) {
-          setMessages((prev) => mergeActivities(prev, r.items));
+    let pollTimer: ReturnType<typeof setTimeout> | undefined;
+    let es: EventSource | null = null;
+    const pendingActs: Activity[] = [];
+    const pendingDeltas: Array<{ kind: "text" | "thinking"; text: string }> = [];
+    let rafId = 0;
+
+    const flush = () => {
+      rafId = 0;
+      if (!live) return;
+      const acts = pendingActs.splice(0, pendingActs.length);
+      const ds = pendingDeltas.splice(0, pendingDeltas.length);
+      if (acts.length > 0) {
+        const last = acts[acts.length - 1];
+        cursorRef.current = Math.max(cursorRef.current, last.seq);
+        setMessages((prev) => mergeActivities(prev, acts));
+        if (acts.some((a) => a.kind === "text" || a.kind === "thinking" || a.kind === "tool_use" || a.kind === "result")) {
+          setStreamingDelta(null);
         }
-        cursorRef.current = Math.max(cursorRef.current, r.cursor);
-        keepPolling = r.running;
-        setRunning(r.running);
-        if (!r.running) onTitleMaybeChanged(); // first-turn auto-title landed
-      } catch {
-        /* transient — keep polling */
-      } finally {
-        // Slow responses must not overlap another poll with the same cursor.
-        if (live && keepPolling) timer = setTimeout(() => void tick(), 1000);
+      }
+      if (ds.length > 0) {
+        setStreamingDelta((prev) => {
+          let cur = prev;
+          for (const d of ds) {
+            cur = cur && cur.kind === d.kind ? { kind: d.kind, text: cur.text + d.text } : { kind: d.kind, text: d.text };
+          }
+          return cur;
+        });
       }
     };
-    void tick();
+    const schedule = () => {
+      if (!rafId) rafId = window.requestAnimationFrame(flush);
+    };
+
+    const startFallbackPoll = () => {
+      if (!live || pollTimer) return;
+      const tick = async () => {
+        let keepPolling = true;
+        try {
+          const r = await api.conversationMessages(conv.id, cursorRef.current);
+          if (!live) return;
+          if (r.items.length) {
+            setMessages((prev) => mergeActivities(prev, r.items));
+            setStreamingDelta(null);
+          }
+          cursorRef.current = Math.max(cursorRef.current, r.cursor);
+          keepPolling = r.running;
+          setRunning(r.running);
+          if (!r.running) onTitleMaybeChanged();
+        } catch {
+          /* transient */
+        } finally {
+          if (live && keepPolling) pollTimer = setTimeout(() => void tick(), 2000);
+        }
+      };
+      void tick();
+    };
+
+    try {
+      es = new EventSource(sseUrl(`/api/conversations/${conv.id}/stream?since=${cursorRef.current}`));
+      es.addEventListener("activity", (e) => {
+        try {
+          pendingActs.push(JSON.parse((e as MessageEvent).data) as Activity);
+          schedule();
+        } catch {
+          /* ignore */
+        }
+      });
+      es.addEventListener("delta", (e) => {
+        try {
+          const df = JSON.parse((e as MessageEvent).data) as { kind?: string; text?: string };
+          if (!df.text || (df.kind !== "text" && df.kind !== "thinking")) return;
+          pendingDeltas.push({ kind: df.kind, text: df.text });
+          schedule();
+        } catch {
+          /* ignore */
+        }
+      });
+      es.addEventListener("status", (e) => {
+        try {
+          const st = JSON.parse((e as MessageEvent).data) as { running?: boolean };
+          if (st.running === false) {
+            setRunning(false);
+            setStreamingDelta(null);
+            onTitleMaybeChanged();
+          }
+        } catch {
+          /* ignore */
+        }
+      });
+      es.onerror = () => {
+        if (!live) return;
+        startFallbackPoll();
+      };
+    } catch {
+      startFallbackPoll();
+    }
+
     return () => {
       live = false;
-      clearTimeout(timer);
+      if (rafId) window.cancelAnimationFrame(rafId);
+      if (pollTimer) clearTimeout(pollTimer);
+      es?.close();
     };
   }, [running, conv.id, onTitleMaybeChanged]);
 
@@ -817,7 +900,7 @@ function ChatView({
               {hasMore && (
                 <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">{t("Scroll up to load earlier messages…")}</div>
               )}
-              <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined} />
+              <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined} streamingDelta={running ? streamingDelta : null} />
             </>
           )}
         </div>

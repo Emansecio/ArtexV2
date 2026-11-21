@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -314,6 +315,110 @@ func (s *Server) pgDeleteConversationsBatch(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) convBusyKey(id int64) string { return "conv-" + strconv.FormatInt(id, 10) }
 
+// pgStreamConversation streams live token deltas ("delta"), newly persisted
+// activities ("activity"), and running-state changes ("status") over SSE so
+// the Chat page renders tokens instantaneously without 1s polling.
+func (s *Server) pgStreamConversation(w http.ResponseWriter, r *http.Request) {
+	tok := extractToken(r)
+	if !s.sessionOK(tok) {
+		writeErr(w, 401, "token is invalid or expired")
+		return
+	}
+	pg, c, ok := s.convByID(w, r)
+	if !ok {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, 500, "streaming unsupported")
+		return
+	}
+	since := int64(atoiDefault(r.URL.Query().Get("since"), 0))
+	if le := r.Header.Get("Last-Event-ID"); le != "" {
+		if n, err := strconv.ParseInt(le, 10, 64); err == nil {
+			since = n
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ch, unsub := s.deltaHub.Subscribe("conv:" + strconv.FormatInt(c.ID, 10))
+	defer unsub()
+
+	for {
+		if !s.sessionOK(tok) {
+			return
+		}
+		items, cursor, err := pg.ConvActivityList(c.ID, since, 500)
+		if err != nil {
+			return
+		}
+		for idx, a := range items {
+			b, _ := json.Marshal(activityDTO(a))
+			fmt.Fprintf(w, "id: %d\nevent: activity\ndata: %s\n\n", a.ID, b)
+			if idx%50 == 49 {
+				flusher.Flush()
+			}
+		}
+		flusher.Flush()
+		if cursor > since {
+			since = cursor
+		}
+		if len(items) < 500 {
+			break
+		}
+	}
+
+	s.chatMu.Lock()
+	running := s.chatBusy[s.convBusyKey(c.ID)]
+	s.chatMu.Unlock()
+	sb, _ := json.Marshal(map[string]bool{"running": running})
+	fmt.Fprintf(w, "event: status\ndata: %s\n\n", sb)
+	flusher.Flush()
+
+	ctx := r.Context()
+	ping := time.NewTicker(20 * time.Second)
+	defer ping.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.ctx.Done():
+			return
+		case msg, ok := <-ch:
+			if !ok || !s.sessionOK(tok) {
+				return
+			}
+			switch msg.Event {
+			case "activity":
+				if dto, ok := msg.Data.(ActivityDTO); ok {
+					if dto.Seq > 0 && dto.Seq <= since {
+						continue
+					}
+					if dto.Seq > since {
+						since = dto.Seq
+					}
+					b, _ := json.Marshal(dto)
+					fmt.Fprintf(w, "id: %d\nevent: activity\ndata: %s\n\n", dto.Seq, b)
+				}
+			default:
+				b, _ := json.Marshal(msg.Data)
+				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", msg.Event, b)
+			}
+			flusher.Flush()
+		case <-ping.C:
+			if !s.sessionOK(tok) {
+				return
+			}
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
 // pgConversationMessages returns steps after ?since=cursor plus whether a turn is
 // still running (so the client knows to keep polling). Same item shape as the task
 // activity stream, so the frontend transcript renderer is reused verbatim.
@@ -464,8 +569,16 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 	if ua.Detail == "" {
 		ua.Detail = msg
 	}
-	if _, err := pg.AppendConvActivity(c.ID, ua); err != nil {
+	if seq, err := pg.AppendConvActivity(c.ID, ua); err != nil {
 		log.Printf("[conv %d] append user msg failed: %v", c.ID, err)
+	} else {
+		ua.ID = seq
+		if ua.CreatedAt.IsZero() {
+			ua.CreatedAt = time.Now()
+		}
+		if s.deltaHub != nil {
+			s.deltaHub.Publish("conv:"+strconv.FormatInt(c.ID, 10), DeltaMsg{Event: "activity", Data: activityDTO(ua)})
+		}
 	}
 	if c.Title == "" || c.Title == "New conversation" {
 		title := firstLine(msg, 40)
@@ -521,12 +634,19 @@ func (s *Server) conversationRunContext(id int64, busyKey string) (context.Conte
 }
 
 func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelCauseFunc, c *db.Conversation, msg, busyKey string) {
+	convChan := "conv:" + strconv.FormatInt(c.ID, 10)
+	if s.deltaHub != nil {
+		s.deltaHub.Publish(convChan, DeltaMsg{Event: "status", Data: map[string]bool{"running": true}})
+	}
 	defer func() {
 		cancel(agent.AbortChatTurnFinished)
 		s.chatMu.Lock()
 		delete(s.chatBusy, busyKey)
 		delete(s.chatCancel, busyKey)
 		s.chatMu.Unlock()
+		if s.deltaHub != nil {
+			s.deltaHub.Publish(convChan, DeltaMsg{Event: "status", Data: map[string]bool{"running": false}})
+		}
 	}()
 	// Only the first turn executes a historical retest. Follow-up conversation
 	// turns may explain the sealed result; the result tool refuses to overwrite it.
@@ -581,8 +701,17 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	}
 	sessionID := s.convBusyKey(c.ID) // "conv-<id>" transcript session
 	emit := func(rec db.Activity) {
-		if _, err := pg.AppendConvActivity(c.ID, rec); err != nil {
+		seq, err := pg.AppendConvActivity(c.ID, rec)
+		if err != nil {
 			log.Printf("[conv %d] append activity failed: %v", c.ID, err)
+			return
+		}
+		rec.ID = seq
+		if rec.CreatedAt.IsZero() {
+			rec.CreatedAt = time.Now()
+		}
+		if s.deltaHub != nil {
+			s.deltaHub.Publish(convChan, DeltaMsg{Event: "activity", Data: activityDTO(rec)})
 		}
 	}
 	// Approval scope of this turn's tool calls for the target gate (chat and retester).
@@ -591,13 +720,26 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	gate := c.TargetGate
 	gctx := intercept.WithTargetScope(ctx, intercept.TargetScope{ConversationID: c.ID, Enabled: func() bool { return gate },
 		WaitBound: intercept.DefaultTargetWaitBound, Interceptor: s.m.interceptor})
+	if s.deltaHub != nil {
+		gctx = agent.WithDeltaSink(gctx, func(ev agent.DeltaEvent) {
+			s.deltaHub.Publish(convChan, DeltaMsg{
+				Event: "delta",
+				Data:  DeltaFrame{Worker: c.AgentKey, Kind: ev.Kind, Text: ev.Text},
+			})
+		})
+	}
 	// On a manual stop ctx is cancelled; Chat already emits a clean "stopped by the user"
 	// step, so skip the raw-error entry — only surface genuine failures.
 	if _, err := ca.Chat(gctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
 		finishReason = err.Error()
 		if ctx.Err() == nil {
-			_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
-				Summary: "(error: " + err.Error() + ")", Detail: err.Error()})
+			errRec := db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
+				Summary: "(error: " + err.Error() + ")", Detail: err.Error()}
+			if seq, aerr := pg.AppendConvActivity(c.ID, errRec); aerr == nil && s.deltaHub != nil {
+				errRec.ID = seq
+				errRec.CreatedAt = time.Now()
+				s.deltaHub.Publish(convChan, DeltaMsg{Event: "activity", Data: activityDTO(errRec)})
+			}
 		}
 	} else {
 		finishStatus, finishReason = "completed", ""

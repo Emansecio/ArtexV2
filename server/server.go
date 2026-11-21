@@ -164,6 +164,16 @@ type Server struct {
 	archiveStore    *archivestore.Store
 	archiveStoreErr error
 	side            *sideQuestionState
+	deltaHub        *DeltaHub
+	mcpPool         *mcpPool
+
+	agentCacheMu sync.Mutex
+	agentCache   map[string]cachedAgentEntry
+}
+
+type cachedAgentEntry struct {
+	agent     *db.Agent
+	fetchedAt time.Time
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -199,7 +209,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{},
 		taskAgents:     map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1),
-		loginLimit: newLoginLimiter(time.Now), pwdLimit: newLoginLimiter(time.Now)}
+		loginLimit: newLoginLimiter(time.Now), pwdLimit: newLoginLimiter(time.Now),
+		deltaHub: NewDeltaHub(),
+		mcpPool:  newMCPPool(ctx),
+		agentCache: map[string]cachedAgentEntry{}}
+	s.engine.SetDeltaHub(s.deltaHub)
 	s.llmHealth, s.llmHealthSync = newLLMHealthRegistry(ctx, m.pg)
 	for _, o := range opts {
 		o(s)
@@ -231,7 +245,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// override row, agents keep their built-in defaults — behavior is unchanged.
 	if m.pg != nil {
 		agent.SetPromptOverride(func(key string) (string, bool) {
-			a, err := m.pg.GetAgentByKey(key)
+			a, err := s.cachedAgentByKey(key)
 			if err != nil || a == nil {
 				return "", false
 			}
@@ -243,7 +257,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		})
 		// Wire DB-stored wrap-up (settlement) prompts. Empty column → built-in default.
 		agent.SetWrapupOverride(func(key string) (string, bool) {
-			a, err := m.pg.GetAgentByKey(key)
+			a, err := s.cachedAgentByKey(key)
 			if err != nil || a == nil || a.WrapupPrompt == "" {
 				return "", false
 			}
@@ -251,7 +265,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		})
 		// Wire DB-stored wrap-up turn budgets. 0 / missing → built-in per-agent default.
 		agent.SetWrapupMaxTurnsOverride(func(key string) (int, bool) {
-			a, err := m.pg.GetAgentByKey(key)
+			a, err := s.cachedAgentByKey(key)
 			if err != nil || a == nil || a.WrapupMaxTurns <= 0 {
 				return 0, false
 			}
@@ -259,20 +273,20 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		})
 		// Wire DB-stored TASK-TIMEOUT wrap-up prompt/turns (worker/planner). Empty/0 → default.
 		agent.SetWrapupTaskTimeoutOverride(func(key string) (string, bool) {
-			a, err := m.pg.GetAgentByKey(key)
+			a, err := s.cachedAgentByKey(key)
 			if err != nil || a == nil || a.TaskTimeoutWrapupPrompt == "" {
 				return "", false
 			}
 			return a.TaskTimeoutWrapupPrompt, true
 		})
 		agent.SetWrapupTaskTimeoutTurnsOverride(func(key string) (int, bool) {
-			a, err := m.pg.GetAgentByKey(key)
+			a, err := s.cachedAgentByKey(key)
 			if err != nil || a == nil || a.TaskTimeoutWrapupMaxTurns <= 0 {
 				return 0, false
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
 		})
-		wireAgentAugment(m.pg, s.skillDir, s.hostTools, s.execPriv) // wire visible skills/MCP + traffic/orchestration host tools into the agent toolset
+		wireAgentAugmentWithPool(s.mcpPool, m.pg, s.skillDir, s.hostTools, s.execPriv) // wire visible skills/MCP + traffic/orchestration host tools into the agent toolset
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg)   // built-in tools table: filter per agent + override description/schema + inject defaults
 		seedPrompts(m.pg)            // seed built-in agent default prompt bodies into agent_prompts (only when empty)
@@ -383,10 +397,49 @@ func (s *Server) Wait(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		s.mcpPool.CloseAll()
 		return nil
 	case <-ctx.Done():
+		s.mcpPool.CloseAll()
 		return ctx.Err()
 	}
+}
+
+func (s *Server) cachedAgentByKey(key string) (*db.Agent, error) {
+	if s == nil || s.m == nil || s.m.pg == nil || key == "" {
+		return nil, nil
+	}
+	s.agentCacheMu.Lock()
+	if ent, ok := s.agentCache[key]; ok && time.Since(ent.fetchedAt) < 2*time.Second {
+		a := ent.agent
+		s.agentCacheMu.Unlock()
+		return a, nil
+	}
+	s.agentCacheMu.Unlock()
+	a, err := s.m.pg.GetAgentByKey(key)
+	if err != nil {
+		return nil, err
+	}
+	s.agentCacheMu.Lock()
+	if s.agentCache == nil {
+		s.agentCache = map[string]cachedAgentEntry{}
+	}
+	s.agentCache[key] = cachedAgentEntry{agent: a, fetchedAt: time.Now()}
+	s.agentCacheMu.Unlock()
+	return a, nil
+}
+
+func (s *Server) invalidateAgentCache(key string) {
+	if s == nil {
+		return
+	}
+	s.agentCacheMu.Lock()
+	if key == "" {
+		clear(s.agentCache)
+	} else {
+		delete(s.agentCache, key)
+	}
+	s.agentCacheMu.Unlock()
 }
 
 // agentMaxTurns returns the configured max_turns for an agent key (0 = unlimited,
@@ -395,7 +448,7 @@ func (s *Server) agentMaxTurns(key string) int {
 	if s.m.pg == nil {
 		return 0
 	}
-	a, err := s.m.pg.GetAgentByKey(key)
+	a, err := s.cachedAgentByKey(key)
 	if err != nil || a == nil {
 		return 0
 	}
@@ -408,7 +461,7 @@ func (s *Server) agentRunSeconds(key string) int {
 	if s.m.pg == nil {
 		return 1200
 	}
-	a, err := s.m.pg.GetAgentByKey(key)
+	a, err := s.cachedAgentByKey(key)
 	if err != nil || a == nil {
 		return 1200
 	}
@@ -503,7 +556,7 @@ func (s *Server) reapplyActiveProfile() {
 // web_search flag: the backend/key come from the global config, each agent decides on/off.
 func (s *Server) webSearchFor(key string) agent.WebSearchOpts {
 	o := s.m.WebSearchOpts()
-	if a, err := s.m.pg.GetAgentByKey(key); err != nil || a == nil || !a.WebSearch {
+	if a, err := s.cachedAgentByKey(key); err != nil || a == nil || !a.WebSearch {
 		o.Enabled = false
 	}
 	return o
@@ -578,6 +631,9 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
 	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
 	s.chatAgent.SetNoaEnabled(s.m.NoaCompactionEnabled) // experimental: noa context compaction (read per run)
+	if sumProv, _, ok := agent.SummaryProviderFromEnv(); ok {
+		s.chatAgent.SetSummaryProvider(sumProv)
+	}
 	s.llmProv = prov
 	s.llmCfg = cfg
 	s.llmHealthProfileID = healthID
@@ -623,7 +679,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 // by loadProfileConfig, letting the caller fall back.
 func (s *Server) effectiveProfileForAgent(agentKey string, pinID *int64) *int64 {
 	if s.m.pg != nil && agentKey != "" {
-		if a, _ := s.m.pg.GetAgentByKey(agentKey); a != nil && a.LLMProfileID != nil {
+		if a, _ := s.cachedAgentByKey(agentKey); a != nil && a.LLMProfileID != nil {
 			return a.LLMProfileID
 		}
 	}
@@ -722,6 +778,9 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
 	ca.SetMaxTokens(maxTokensResolver(cfg))
 	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // experimental: noa context compaction (read per run)
+	if sumProv, _, ok := agent.SummaryProviderFromEnv(); ok {
+		ca.SetSummaryProvider(sumProv)
+	}
 	s.profMu.Lock()
 	if ex := s.profChatAgents[id]; ex != nil { // lost the race → keep the winner
 		ca = ex
@@ -768,6 +827,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/logs", s.getLogs)
 	mux.HandleFunc("GET /api/logs/history", s.getLogsHistory)
 	mux.HandleFunc("GET /api/logs/stream", s.streamLogs)
+	mux.HandleFunc("GET /api/ws", s.wsStream)
 
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
@@ -945,6 +1005,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/conversations/{id}/profile", s.pgUpdateConversation)
 	mux.HandleFunc("DELETE /api/conversations/{id}", s.pgDeleteConversation)
 	mux.HandleFunc("GET /api/conversations/{id}/messages", s.pgConversationMessages)
+	mux.HandleFunc("GET /api/conversations/{id}/stream", s.pgStreamConversation)
 	mux.HandleFunc("POST /api/conversations/{id}/messages", s.pgSendConversationMessage)
 	mux.HandleFunc("POST /api/conversations/{id}/stop", s.pgStopConversation)
 	mux.HandleFunc("GET /api/conversations/{id}/messages/{seq}", s.pgConversationMsgDetail)
@@ -1087,7 +1148,7 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Referrer-Policy", "same-origin")
 		webui.ServeHTTP(w, r)
 	})
-	return limitRequestBody(root)
+	return limitRequestBody(gzipMiddleware(root))
 }
 
 // --- handlers ---
@@ -1138,30 +1199,18 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, out) // no task selected: only global fields
 		return
 	}
-	out["llm_configured"] = s.engine.ReadyFor(t)
+	ready := s.engine.ReadyFor(t)
+	out["llm_configured"] = ready
 
 	st, _ := t.Store.Stats()
 	out["exploration"] = st
 
-	// per-task running state + heartbeat (distinct from "LLM configured").
-	intents, _ := t.Store.ListByKind(db.KindIntent, 100000)
-	inFlight := 0
-	for _, in := range intents {
-		if in.State == "running" {
-			inFlight++
-		}
-	}
-	goals, _ := t.Store.ListByKind(db.KindGoal, 10000)
-	goalsMet := 0
-	for _, g := range goals {
-		if g.State == "met" {
-			goalsMet++
-		}
-	}
+	// per-task running state + heartbeat via single SQL aggregation.
+	inFlight, goalsTotal, goalsMet, _ := t.Store.QuickCounts()
 	last := s.engine.LastActivity(t.ID)
 	paused := s.engine.IsPaused(t.ID)
 	activeCalls := s.engine.ActiveLLMCalls(t.ID)
-	running := s.engine.ReadyFor(t) && s.engine.Started(t.ID) && !paused
+	running := ready && s.engine.Started(t.ID) && !paused
 	// A live event-driven engine with no work is healthy idle. Only a persisted
 	// running intent without any corresponding LLM call can be considered stalled.
 	stalled := running && activeCalls == 0 && inFlight > 0 && last > 0 && time.Now().Unix()-last > 120
@@ -1187,7 +1236,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		"llm_in_flight": activeCalls,
 		"last_activity": last,
 		"stalled":       stalled,
-		"goals_total":   len(goals),
+		"goals_total":   goalsTotal,
 		"goals_met":     goalsMet,
 	}
 	writeJSON(w, 200, out)
@@ -2926,17 +2975,37 @@ func (s *Server) explorationGraph(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"nodes": []any{}, "edges": []any{}})
 		return
 	}
+	sources, err := t.Store.DirectSourceStores()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	var etag string
+	if fp, ferr := t.Store.OverviewFingerprint(); ferr == nil && fp != "" {
+		if len(sources) == 0 {
+			etag = fmt.Sprintf(`W/"%s"`, fp)
+		} else {
+			var b strings.Builder
+			b.WriteString(fp)
+			for _, src := range sources {
+				sfp, _ := src.Store.OverviewFingerprint()
+				fmt.Fprintf(&b, "|%d:%s", src.Task.TaskID, sfp)
+			}
+			etag = fmt.Sprintf(`W/"%s"`, b.String())
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", "no-cache")
+		if inm := strings.TrimSpace(r.Header.Get("If-None-Match")); inm != "" && inm == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
 	nodes, err := t.Store.Nodes(2000)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	edges, err := t.Store.Edges(5000)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	sources, err := t.Store.DirectSourceStores()
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -3374,17 +3443,19 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 
 	ch, unsub := logSink.subscribe()
 	defer unsub()
-	send := func(l LogLine) {
+	send := func(l LogLine, flush bool) {
 		b, _ := json.Marshal(l)
 		fmt.Fprintf(w, "data: %s\n\n", b)
-		flusher.Flush()
+		if flush {
+			flusher.Flush()
+		}
 	}
 	lines, cursor := logSink.recent(since, 1000)
-	for _, l := range lines {
-		if !s.sessionOK(tok) {
+	for idx, l := range lines {
+		if idx%100 == 0 && !s.sessionOK(tok) {
 			return
 		}
-		send(l)
+		send(l, idx%50 == 49)
 	}
 	if cursor > since {
 		since = cursor
@@ -3406,7 +3477,7 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			since = l.Seq
-			send(l)
+			send(l, true)
 		case <-ping.C:
 			if !s.sessionOK(tok) {
 				return
@@ -3459,35 +3530,33 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 	// overlap by skipping channel events whose id was already replayed.
 	ch, unsub := s.engine.Broadcaster().Subscribe(t.ID)
 	defer unsub()
+	dch, dunsub := s.deltaHub.Subscribe("task:" + t.ID)
+	defer dunsub()
 
 	// Emit a standard SSE id: line so the browser echoes it as Last-Event-ID on
 	// auto-reconnect (see cursor precedence above).
-	sendSSE := func(a db.Activity) {
+	sendSSE := func(a db.Activity, flush bool) {
 		b, _ := json.Marshal(activityDTO(a))
 		fmt.Fprintf(w, "id: %d\ndata: %s\n\n", a.ID, b)
-		flusher.Flush()
+		if flush {
+			flusher.Flush()
+		}
 	}
 
-	// Compensate the DB backlog after `since` in batches until caught up. This is the
-	// gap between the history snapshot and the live tail — NOT the first-page history
-	// (that's the /activity/history endpoint). A long task can have far more than one
-	// batch, so loop instead of a single fixed read; on a query error log it and close
-	// so the client reconnects and retries from its last id (broadcast is lossy — the
-	// DB is the source of truth). The Broadcaster keeps buffering live events meanwhile;
-	// the id<=since skip below drops any that this replay already covered.
 	const replayBatch = 500
 	for {
+		if !s.sessionOK(tok) {
+			return
+		}
 		items, cursor, err := t.Store.ActivityList(intentPtr, since, replayBatch)
 		if err != nil {
 			log.Printf("[activity/stream] task=%s replay since=%d: %v", t.ID, since, err)
 			return
 		}
-		for _, a := range items {
-			if !s.sessionOK(tok) {
-				return
-			}
-			sendSSE(a)
+		for idx, a := range items {
+			sendSSE(a, idx%50 == 49)
 		}
+		flusher.Flush()
 		if cursor > since {
 			since = cursor
 		}
@@ -3495,7 +3564,6 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	flusher.Flush()
 
 	ctx := r.Context()
 	ping := time.NewTicker(20 * time.Second)
@@ -3515,7 +3583,19 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 				continue // scoped session: only this intent's steps
 			}
 			since = a.ID
-			sendSSE(a)
+			sendSSE(a, true)
+		case dmsg, ok := <-dch:
+			if !ok || !s.sessionOK(tok) {
+				return
+			}
+			if df, isDelta := dmsg.Data.(DeltaFrame); isDelta {
+				if intentPtr != nil && (df.IntentID == nil || *df.IntentID != *intentPtr) {
+					continue
+				}
+			}
+			b, _ := json.Marshal(dmsg.Data)
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", dmsg.Event, b)
+			flusher.Flush()
 		case <-ping.C:
 			if !s.sessionOK(tok) {
 				return

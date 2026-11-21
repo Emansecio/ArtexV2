@@ -2418,6 +2418,7 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			"required": []any{"host"},
 		},
 		ReadOnly:    ro,
+		Concurrent:  ro,
 		Permissions: allow,
 		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			var a struct {
@@ -2463,6 +2464,7 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			"required":   []any{"id"},
 		},
 		ReadOnly:    ro,
+		Concurrent:  ro,
 		Permissions: allow,
 		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			var a struct{ ID string }
@@ -2496,6 +2498,7 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			"required": []any{"hash"},
 		},
 		ReadOnly:    ro,
+		Concurrent:  ro,
 		Permissions: allow,
 		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			var a struct {
@@ -2536,6 +2539,7 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			"required": []any{"id"},
 		},
 		ReadOnly:    ro,
+		Concurrent:  ro,
 		Permissions: allow,
 		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			var a struct {

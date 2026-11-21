@@ -716,42 +716,56 @@ function ExecView({
   fetchDetail?: (seq: number) => Promise<string>;
   focusedSeq?: number;
 }) {
-  const showWorker = new Set(activity.map((a) => a.worker)).size > 1;
+  const showWorker = React.useMemo(() => new Set(activity.map((a) => a.worker)).size > 1, [activity]);
+  const steps = React.useMemo(() => groupSteps(activity, !!chat), [activity, chat]);
   // default detail fetcher: the task-scoped activity endpoint. The chat page passes
   // its own (conversation-scoped) fetcher instead.
   const getDetail = React.useCallback(
     (seq: number) => (fetchDetail ? fetchDetail(seq) : api.activityDetail(seq, taskId).then((r) => r.detail ?? "")),
     [fetchDetail, taskId],
   );
+  const rowStyle = React.useMemo<React.CSSProperties>(
+    () => ({ contentVisibility: "auto", containIntrinsicSize: "0 72px" }),
+    [],
+  );
   return (
     <div className="flex flex-col">
-      {groupSteps(activity, !!chat).map((g) =>
-        g.type === "round" ? (
-          <div key={"r" + g.key} className="my-2 flex items-center gap-2 text-[10px] font-medium text-muted-foreground">
-            <span className="h-px flex-1 bg-border" />
-            {g.label}
-            <span className="h-px flex-1 bg-border" />
-          </div>
-        ) : g.type === "user" ? (
-          <UserRow key={"u" + g.key} step={g.step} intent={g.intent} getDetail={getDetail} />
-        ) : g.type === "answer" ? (
-          <AnswerBlock key={"a" + g.key} step={g.step} getDetail={getDetail} />
-        ) : g.type === "tool" ? (
-          <ToolBlock
-            key={"t" + g.key}
-            group={g}
-            getDetail={getDetail}
-            showWorker={showWorker}
-            focused={focusedSeq != null && g.use?.seq === focusedSeq}
-          />
-        ) : g.type === "intercept" ? (
-          <InterceptCard key={"ic" + g.key} step={g.step} getDetail={getDetail} />
-        ) : (
-          <MessageBlock key={"m" + g.key} group={g} getDetail={getDetail} showWorker={showWorker} />
-        ),
-      )}
+      {steps.map((g) => (
+        <div
+          key={(g.type === "tool" ? "t" : g.type === "round" ? "r" : g.type === "user" ? "u" : g.type === "answer" ? "a" : g.type === "intercept" ? "ic" : "m") + g.key}
+          style={rowStyle}
+        >
+          {g.type === "round" ? (
+            <div className="my-2 flex items-center gap-2 text-[10px] font-medium text-muted-foreground">
+              <span className="h-px flex-1 bg-border" />
+              {g.label}
+              <span className="h-px flex-1 bg-border" />
+            </div>
+          ) : g.type === "user" ? (
+            <UserRow step={g.step} intent={g.intent} getDetail={getDetail} />
+          ) : g.type === "answer" ? (
+            <AnswerBlock step={g.step} getDetail={getDetail} />
+          ) : g.type === "tool" ? (
+            <ToolBlock
+              group={g}
+              getDetail={getDetail}
+              showWorker={showWorker}
+              focused={focusedSeq != null && g.use?.seq === focusedSeq}
+            />
+          ) : g.type === "intercept" ? (
+            <InterceptCard step={g.step} getDetail={getDetail} />
+          ) : (
+            <MessageBlock group={g} getDetail={getDetail} showWorker={showWorker} />
+          )}
+        </div>
+      ))}
     </div>
   );
+}
+
+export interface StreamingDeltaView {
+  kind: "text" | "thinking";
+  text: string;
 }
 
 // Transcript renders a session's activity as a compact grouped execution replay:
@@ -764,6 +778,7 @@ export function Transcript({
   chat,
   fetchDetail,
   focusedSeq,
+  streamingDelta,
 }: {
   activity: Activity[];
   live?: boolean;
@@ -771,6 +786,7 @@ export function Transcript({
   chat?: boolean;
   fetchDetail?: (seq: number) => Promise<string>;
   focusedSeq?: number;
+  streamingDelta?: StreamingDeltaView | null;
 }) {
   const transcriptRef = React.useRef<HTMLDivElement>(null);
   const [focusPadding, setFocusPadding] = React.useState(0);
@@ -787,6 +803,26 @@ export function Transcript({
   return (
     <div ref={transcriptRef} className="flex flex-col gap-1" style={focusPadding ? { paddingBlock: focusPadding } : undefined}>
       <ExecView activity={activity} taskId={taskId} chat={chat} fetchDetail={fetchDetail} focusedSeq={focusedSeq} />
+      {streamingDelta?.text && (
+        <div
+          className={
+            streamingDelta.kind === "thinking"
+              ? "my-1 rounded-md border border-dashed border-muted-foreground/30 bg-muted/20 px-3 py-2 text-xs text-muted-foreground whitespace-pre-wrap break-words"
+              : "my-1 px-2 py-1 text-sm whitespace-pre-wrap break-words"
+          }
+        >
+          {streamingDelta.kind === "thinking" ? (
+            <>
+              <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/80">
+                {t("Thinking")}…
+              </div>
+              {streamingDelta.text}
+            </>
+          ) : (
+            <Markdown text={streamingDelta.text} />
+          )}
+        </div>
+      )}
       {live && (
         <div className="flex items-center gap-2 pl-2 pt-1 text-xs text-muted-foreground">
           <span className="flex gap-1">

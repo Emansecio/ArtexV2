@@ -74,6 +74,8 @@ type Task struct {
 	Guard                *guard.Guard           `json:"-"`
 	TargetGuard          *guard.Guard           `json:"-"` // planner and main-agent hooks: target gate only
 	notify               chan struct{}
+	wakeMu               sync.Mutex
+	wakeCh               chan struct{}
 	lifecycleMu          sync.RWMutex
 	llmMu                sync.RWMutex
 	// targetGate is the task's opt-in to the approval gate for asset targets.
@@ -1954,12 +1956,41 @@ func (m *Manager) List() []*Task {
 }
 
 // Notify signals that the asset/exploration graph changed (debounced consumer
-// wakes the planner). Non-blocking.
+// wakes the planner). Non-blocking. Also wakes any sleeping idle workers in
+// case an intent became claimable.
 func (t *Task) Notify() {
 	select {
 	case t.notify <- struct{}{}:
 	default:
 	}
+	t.WakeWorkers()
+}
+
+// wakeSignal returns the current broadcast channel closed by the next WakeWorkers call.
+func (t *Task) wakeSignal() <-chan struct{} {
+	if t == nil {
+		return nil
+	}
+	t.wakeMu.Lock()
+	if t.wakeCh == nil {
+		t.wakeCh = make(chan struct{})
+	}
+	ch := t.wakeCh
+	t.wakeMu.Unlock()
+	return ch
+}
+
+// WakeWorkers immediately wakes all idle worker goroutines waiting on a frontier poll.
+func (t *Task) WakeWorkers() {
+	if t == nil {
+		return
+	}
+	t.wakeMu.Lock()
+	if t.wakeCh != nil {
+		close(t.wakeCh)
+	}
+	t.wakeCh = make(chan struct{})
+	t.wakeMu.Unlock()
 }
 
 // NotifyDone is Notify plus a hint: a worker just finished intentID and that is

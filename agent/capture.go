@@ -51,9 +51,26 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 	}
 	toolNames := map[string]string{} // tool_use id -> name, to label results
 
+	deltaSink := deltaSinkFrom(ctx)
+	var dbuf strings.Builder
+	var dkind string
+	lastDeltaFlush := time.Now()
+	flushDelta := func() {
+		if dbuf.Len() == 0 || deltaSink == nil {
+			dbuf.Reset()
+			dkind = ""
+			return
+		}
+		deltaSink(DeltaEvent{Kind: dkind, Text: dbuf.String()})
+		dbuf.Reset()
+		dkind = ""
+		lastDeltaFlush = time.Now()
+	}
+
 	var tbuf strings.Builder
 	var tkind string
 	flush := func() {
+		flushDelta()
 		if tbuf.Len() == 0 {
 			return
 		}
@@ -74,6 +91,16 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 		}
 		tkind = kind
 		tbuf.WriteString(text)
+		if deltaSink != nil {
+			if dkind != "" && dkind != kind {
+				flushDelta()
+			}
+			dkind = kind
+			dbuf.WriteString(text)
+			if dbuf.Len() >= 256 || time.Since(lastDeltaFlush) >= 40*time.Millisecond {
+				flushDelta()
+			}
+		}
 	}
 	lastTool := &runTrace{startedAt: time.Now()}
 	var lastUsage *llm.Usage

@@ -390,6 +390,7 @@ func (s *Server) pgUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.invalidateAgentCache(a.Key)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -408,6 +409,7 @@ func (s *Server) pgDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.invalidateAgentCache(a.Key)
 	if err := pg.RemoveAgentFromToolBindings(a.Key); err != nil {
 		log.Printf("[agents] failed to clean up tool bindings for %s: %v", a.Key, err)
 	}
@@ -536,6 +538,7 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	// Task bundles capture operational Agent settings (turn/time budgets, tools,
 	// web search). Rebuild them even when no global profile is configured.
+	s.invalidateAgentCache(a.Key)
 	s.invalidateTaskAgents()
 	// rebuild the live agents so the new max_turns/run_seconds/binding apply without a restart.
 	s.cfgMu.Lock()
@@ -670,6 +673,7 @@ func (s *Server) pgSaveWrapup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.invalidateAgentCache(a.Key)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -688,6 +692,7 @@ func (s *Server) pgResetWrapup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.invalidateAgentCache(a.Key)
 	writeJSON(w, 200, map[string]any{
 		"ok":                       true,
 		"wrapup_default":           agent.WrapupDefault(a.Key),
@@ -721,6 +726,7 @@ func (s *Server) pgSaveTaskTimeoutWrapup(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.invalidateAgentCache(a.Key)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -734,6 +740,7 @@ func (s *Server) pgResetTaskTimeoutWrapup(w http.ResponseWriter, r *http.Request
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.invalidateAgentCache(a.Key)
 	writeJSON(w, 200, map[string]any{
 		"ok":                                    true,
 		"task_timeout_wrapup_default":           agent.TaskTimeoutWrapupDefault(a.Key),
@@ -1064,6 +1071,7 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.mcpPool.Invalidate(id)
 	// On initial add, auto-discover + cache the tool list so the UI shows it right
 	// away (bounded so a slow/broken server can't hang the request). Skipped on
 	// plain updates (e.g. enable toggles) to avoid re-spawning the server each time.
@@ -1088,6 +1096,7 @@ func (s *Server) pgDeleteMCP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.mcpPool.Invalidate(id)
 	writeJSON(w, 200, map[string]any{"deleted": id})
 }
 
@@ -1115,6 +1124,7 @@ func (s *Server) pgRefreshMCP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "MCP does not exist")
 		return
 	}
+	s.mcpPool.Invalidate(id)
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 	if err := s.discoverAndCacheMCP(ctx, target); err != nil {

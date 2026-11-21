@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -22,6 +24,47 @@ func (d *DB) InsertLog(level, tag, text string) (int64, error) {
 		level, tag, text,
 	).Scan(&id)
 	return id, err
+}
+
+// InsertLogsBatch persists a batch of log entries in a single multi-row INSERT
+// statement and returns their auto-assigned ids in input order.
+func (d *DB) InsertLogsBatch(entries []DBLog) ([]int64, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	if len(entries) == 1 {
+		id, err := d.InsertLog(entries[0].Level, entries[0].Tag, entries[0].Text)
+		if err != nil {
+			return nil, err
+		}
+		return []int64{id}, nil
+	}
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO server_logs(level,tag,text) VALUES ")
+	args := make([]any, 0, len(entries)*3)
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		base := i*3 + 1
+		fmt.Fprintf(&sb, "($%d,$%d,$%d)", base, base+1, base+2)
+		args = append(args, e.Level, e.Tag, e.Text)
+	}
+	sb.WriteString(" RETURNING id")
+	rows, err := d.QueryContext(context.Background(), sb.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]int64, 0, len(entries))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // RecentLogs returns the most recent limit rows, oldest-first.

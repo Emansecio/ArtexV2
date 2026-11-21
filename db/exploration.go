@@ -1421,6 +1421,62 @@ func (s *ExplorationStore) Stats() (map[string]int, error) {
 	return out, rows.Err()
 }
 
+// QuickCounts returns active running intents, total goals, and met goals for
+// one exploration using a single SQL aggregation (avoiding full-row scans).
+func (s *ExplorationStore) QuickCounts() (inFlightIntents, goalsTotal, goalsMet int, err error) {
+	rows, err := s.db.Query(
+		`SELECT kind, state, COUNT(*)
+		   FROM exploration_nodes
+		  WHERE exploration_id=$1 AND kind IN ('intent', 'goal')
+		  GROUP BY kind, state`, s.expID)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind, state string
+		var cnt int
+		if err := rows.Scan(&kind, &state, &cnt); err != nil {
+			return 0, 0, 0, err
+		}
+		switch kind {
+		case KindIntent:
+			if state == "running" {
+				inFlightIntents += cnt
+			}
+		case KindGoal:
+			goalsTotal += cnt
+			if state == "met" {
+				goalsMet += cnt
+			}
+		}
+	}
+	return inFlightIntents, goalsTotal, goalsMet, rows.Err()
+}
+
+// OverviewFingerprint returns a lightweight mutation stamp for this exploration's
+// graph (nodes + edges) so concurrent workers can safely reuse an overview snapshot.
+func (s *ExplorationStore) OverviewFingerprint() (string, error) {
+	if s == nil {
+		return "", nil
+	}
+	var maxID, nodeCnt, edgeCnt int64
+	var maxUpd sql.NullTime
+	err := s.db.QueryRow(`
+		SELECT COALESCE(MAX(id), 0), COUNT(*), MAX(updated_at),
+		       COALESCE((SELECT COUNT(*) FROM exploration_edges WHERE exploration_id=$1), 0)
+		  FROM exploration_nodes
+		 WHERE exploration_id=$1`, s.expID).Scan(&maxID, &nodeCnt, &maxUpd, &edgeCnt)
+	if err != nil {
+		return "", err
+	}
+	var updNs int64
+	if maxUpd.Valid {
+		updNs = maxUpd.Time.UnixNano()
+	}
+	return fmt.Sprintf("%d:%d:%d:%d", maxID, nodeCnt, updNs, edgeCnt), nil
+}
+
 // --- activity (poll by global id cursor) ---
 
 // queryRower is the subset of *sql.DB and *sql.Tx that AppendActivity needs,

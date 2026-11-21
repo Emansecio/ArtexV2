@@ -35,11 +35,18 @@ var dataMarkerNeutraliser = strings.NewReplacer(dataMarkerStem, "artex-data-mark
 // message with newDataEnvelope; every frame in that message shares its nonce.
 type dataEnvelope struct{ nonce string }
 
-// newDataEnvelope returns an envelope with a fresh crypto/rand nonce (32 hex).
-func newDataEnvelope() dataEnvelope {
+// NewTaskNonce returns a fresh 128-bit hex nonce suitable for sharing across
+// planner rounds and sibling workers of one task, keeping system-prompt data
+// envelopes stable for prompt caching while remaining unpredictable to targets.
+func NewTaskNonce() string {
 	b := make([]byte, dataNonceBytes)
 	_, _ = rand.Read(b) // never returns an error since Go 1.24: it crashes the program instead
-	return dataEnvelope{nonce: hex.EncodeToString(b)}
+	return hex.EncodeToString(b)
+}
+
+// newDataEnvelope returns an envelope with a fresh crypto/rand nonce (32 hex).
+func newDataEnvelope() dataEnvelope {
+	return dataEnvelope{nonce: NewTaskNonce()}
 }
 
 // intro explains the frame once per message, naming this message's nonce. It
@@ -60,10 +67,21 @@ func (e dataEnvelope) wrap(field, content string) string {
 // for one system prompt. Empty input stays empty. A fresh nonce is used per
 // call so each Plan/Execute assembly gets its own frame (field=lessons).
 func frameLessonsBlock(block string) string {
+	return frameLessonsBlockWithNonce(block, "")
+}
+
+// frameLessonsBlockWithNonce wraps the RSI evidence block with a caller-supplied
+// per-task nonce so sibling workers and successive planner rounds share a
+// byte-identical cacheable system prompt prefix. Empty nonce falls back to a
+// fresh crypto/rand nonce.
+func frameLessonsBlockWithNonce(block, nonce string) string {
 	if block == "" {
 		return ""
 	}
 	env := newDataEnvelope()
+	if nonce != "" {
+		env = dataEnvelope{nonce: nonce}
+	}
 	return env.intro() + "\n\n" + env.wrap("lessons", block)
 }
 

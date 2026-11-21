@@ -37,7 +37,11 @@ type ChatAgent struct {
 	nonStreamingFn func() bool  // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn   func() bool  // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn    func() int   // resolver: per-reply output cap (nil/0 = send no cap)
+	summaryProv    llm.Provider
 }
+
+// SetSummaryProvider configures an optional dedicated provider for AutoCompact summarization.
+func (c *ChatAgent) SetSummaryProvider(p llm.Provider) { c.summaryProv = p }
 
 func NewChatAgent(prov llm.Provider, model, workDir string, tx *transcript.Store, window int) *ChatAgent {
 	return &ChatAgent{prov: prov, model: model, workDir: workDir, tx: tx, window: window}
@@ -167,8 +171,10 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	system, boundary := deferredSystem(chatSystem(agentKey, c.workDir, sessionWorkDir), def)
 	opts := agentcore.Options{
 		Provider:        c.prov,
+		SummaryProvider: c.summaryProv,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
+		PromptCacheKey:  fmt.Sprintf("artex-chat-%s", sessionID),
 		Tools:           withWebFetch(ctx, tools, c.proxyAddr, c.proxyCACert), // WebFetch: routed through the recording proxy for tracing; loads the proxy CA to verify MITM-resigned HTTPS certificates; every redirect hop is gated
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
@@ -194,7 +200,8 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		// large tool output spills to cmd-output/ under the session dir, or to the
 		// session's spill directory (spill.go).
 		// the truncation cap uses the SDK default (30000 chars of tool.Capture).
-		ToolOutputDir: SessionToolOutputDir(c.workDir, sessionID, sessionWorkDir),
+		ToolOutputDir:      SessionToolOutputDir(c.workDir, sessionID, sessionWorkDir),
+		MaxToolOutputChars: maxToolOutputChars(),
 		// hitting the budget (steps) → the SDK runs wrap-up: output a one-line summary. The prompt and
 		// wrap-up rounds are editable in the backend per agent key
 		// (each custom agent gets its own copy; empty/0 uses the generic default: 10 rounds).

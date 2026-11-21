@@ -22,6 +22,7 @@ type Answer struct {
 func (s SideQuestionService) Answer(ctx context.Context, req llm.CompletionRequest, streaming bool, update func(Answer)) (out Answer, err error) {
 	if streaming {
 		complete := false
+		var tb strings.Builder
 		for ev, streamErr := range s.Provider.Stream(ctx, req) {
 			if streamErr != nil {
 				err = streamErr
@@ -29,7 +30,8 @@ func (s SideQuestionService) Answer(ctx context.Context, req llm.CompletionReque
 			}
 			switch ev.Type {
 			case llm.SETextDelta:
-				out.Text += ev.Text
+				tb.WriteString(ev.Text)
+				out.Text = tb.String()
 			case llm.SEToolUseStart:
 				out.ToolUse = true
 			case llm.SEMessageStart:
@@ -48,6 +50,7 @@ func (s SideQuestionService) Answer(ctx context.Context, req llm.CompletionReque
 				break
 			}
 		}
+		out.Text = tb.String()
 		if err == nil && !complete {
 			err = errors.New("model response was interrupted, please ask again")
 		}

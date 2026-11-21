@@ -450,18 +450,67 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 			}
 		}
 	}()
-	lastSave := time.Now()
-	persist := func() (bool, error) {
-		e.Sequence++
+	lastPush := time.Time{}
+	var saveMu sync.Mutex
+	var pendingSave *sidequestion.Exchange
+	saveWake := make(chan struct{}, 1)
+	saveStop := make(chan struct{})
+	saveDone := make(chan struct{})
+
+	persistSync := func(ex sidequestion.Exchange) (bool, error) {
 		writeCtx, stop := context.WithTimeout(context.Background(), 3*time.Second)
 		defer stop()
-		ok, err := s.m.pg.UpdateSideRequest(writeCtx, e)
+		ok, err := s.m.pg.UpdateSideRequest(writeCtx, ex)
 		if err != nil {
 			log.Printf("[btw] answer persistence: %v", err)
 			return true, err
 		}
 		return ok, nil
 	}
+
+	go func() {
+		defer close(saveDone)
+		lastWrite := time.Time{}
+		for {
+			select {
+			case <-saveStop:
+				return
+			case <-saveWake:
+				if d := time.Second - time.Since(lastWrite); d > 0 && !lastWrite.IsZero() {
+					t := time.NewTimer(d)
+					select {
+					case <-saveStop:
+						t.Stop()
+						return
+					case <-t.C:
+					}
+				}
+				saveMu.Lock()
+				next := pendingSave
+				pendingSave = nil
+				saveMu.Unlock()
+				if next != nil {
+					lastWrite = time.Now()
+					if ok, _ := persistSync(*next); !ok {
+						cancel()
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	queuePersist := func(ex sidequestion.Exchange) {
+		cp := ex
+		saveMu.Lock()
+		pendingSave = &cp
+		saveMu.Unlock()
+		select {
+		case saveWake <- struct{}{}:
+		default:
+		}
+	}
+
 	memory, runErr := s.m.pg.SideMemory(ctx, e)
 	var answer sidequestion.Answer
 	if runErr == nil {
@@ -476,14 +525,19 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 		}, sidequestion.ContextOptions{OutputTokens: s.side.outputTokens}, func(a sidequestion.Answer, info sidequestion.ContextInfo) {
 			phaseChanged := e.Context.Phase != info.Phase
 			e.Answer, e.Usage, e.Context = a.Text, a.Usage, info
-			if phaseChanged || time.Since(lastSave) >= 250*time.Millisecond {
-				lastSave = time.Now()
-				if ok, _ := persist(); !ok {
-					cancel()
+			if phaseChanged || lastPush.IsZero() || time.Since(lastPush) >= 40*time.Millisecond {
+				lastPush = time.Now()
+				e.Sequence++
+				snap := e
+				if s.deltaHub != nil {
+					s.deltaHub.Publish("side:"+e.ID, DeltaMsg{Event: "side", Data: snap})
 				}
+				queuePersist(snap)
 			}
 		})
 	}
+	close(saveStop)
+	<-saveDone
 	e.Answer, e.Usage = answer.Text, answer.Usage
 	e.Status = "completed"
 	if ctx.Err() != nil {
@@ -497,8 +551,12 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 		e.Status = "failed"
 		e.Error = runErr.Error()
 	}
+	e.Sequence++
+	if s.deltaHub != nil {
+		s.deltaHub.Publish("side:"+e.ID, DeltaMsg{Event: "side", Data: e})
+	}
 	for attempt := 0; attempt < 3; attempt++ {
-		if _, err := persist(); err == nil {
+		if _, err := persistSync(e); err == nil {
 			break
 		}
 		if attempt < 2 {
@@ -537,6 +595,12 @@ func (s *Server) sideEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("requestID")
+	var dch <-chan DeltaMsg
+	if s.deltaHub != nil {
+		var dunsub func()
+		dch, dunsub = s.deltaHub.Subscribe("side:" + id)
+		defer dunsub()
+	}
 	first, err := s.m.pg.SideRequest(r.Context(), id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -549,44 +613,86 @@ func (s *Server) sideEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
+
 	seq := int64(-1)
-	tick := time.NewTicker(250 * time.Millisecond)
+	lastText := ""
+	lastPhase := ""
+	lastStatus := ""
+
+	sendExchange := func(e *sidequestion.Exchange) bool {
+		if e == nil {
+			fmt.Fprint(w, "event: cleared\ndata: {}\n\n")
+			flusher.Flush()
+			return true
+		}
+		if e.Sequence > seq {
+			if lastText != "" && e.Status == lastStatus && e.Context.Phase == lastPhase &&
+				len(e.Answer) > len(lastText) && strings.HasPrefix(e.Answer, lastText) {
+				payload := struct {
+					ID       string                  `json:"id"`
+					Sequence int64                   `json:"sequence"`
+					Append   string                  `json:"append"`
+					Usage    llm.Usage               `json:"usage"`
+					Context  sidequestion.ContextInfo `json:"context"`
+				}{
+					ID:       e.ID,
+					Sequence: e.Sequence,
+					Append:   e.Answer[len(lastText):],
+					Usage:    e.Usage,
+					Context:  e.Context,
+				}
+				b, _ := json.Marshal(payload)
+				fmt.Fprintf(w, "id: %d\nevent: delta\ndata: %s\n\n", e.Sequence, b)
+			} else {
+				b, _ := json.Marshal(e)
+				fmt.Fprintf(w, "id: %d\nevent: snapshot\ndata: %s\n\n", e.Sequence, b)
+			}
+			flusher.Flush()
+			seq = e.Sequence
+			lastText = e.Answer
+			lastPhase = e.Context.Phase
+			lastStatus = e.Status
+		}
+		return !e.Running()
+	}
+
+	if sendExchange(first) {
+		return
+	}
+	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
 	for {
-		if !s.sessionOK(tok) {
-			return
-		}
-		e := first
-		first = nil
-		if e == nil {
-			e, err = s.m.pg.SideRequest(r.Context(), id)
-		}
-		if err != nil {
-			return
-		}
-		if e == nil {
-			fmt.Fprint(w, "event: cleared\ndata: {}\n\n")
-			flusher.Flush()
-			return
-		}
-		if e.Sequence > seq {
-			b, _ := json.Marshal(e)
-			fmt.Fprintf(w, "id: %d\nevent: snapshot\ndata: %s\n\n", e.Sequence, b)
-			flusher.Flush()
-			seq = e.Sequence
-		}
-		if !e.Running() {
-			return
-		}
 		select {
 		case <-r.Context().Done():
 			return
 		case <-s.ctx.Done():
 			return
+		case msg, ok := <-dch:
+			if !ok || !s.sessionOK(tok) {
+				return
+			}
+			if ex, isEx := msg.Data.(sidequestion.Exchange); isEx {
+				if sendExchange(&ex) {
+					return
+				}
+			}
 		case <-tick.C:
+			if !s.sessionOK(tok) {
+				return
+			}
+			e, err := s.m.pg.SideRequest(r.Context(), id)
+			if err != nil {
+				return
+			}
+			if sendExchange(e) {
+				return
+			}
 		case <-heartbeat.C:
+			if !s.sessionOK(tok) {
+				return
+			}
 			fmt.Fprint(w, ": keepalive\n\n")
 			flusher.Flush()
 		}

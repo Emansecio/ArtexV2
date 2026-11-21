@@ -246,8 +246,10 @@ BEGIN
         );
     END IF;
 END $$;
-CREATE INDEX IF NOT EXISTS idx_expnodes_part     ON exploration_nodes(exploration_id, kind);
-CREATE INDEX IF NOT EXISTS idx_expnodes_frontier ON exploration_nodes(exploration_id, priority DESC)
+CREATE INDEX IF NOT EXISTS idx_expnodes_part          ON exploration_nodes(exploration_id, kind);
+CREATE INDEX IF NOT EXISTS idx_expnodes_part_state    ON exploration_nodes(exploration_id, kind, state);
+CREATE INDEX IF NOT EXISTS idx_expnodes_part_id_desc  ON exploration_nodes(exploration_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_expnodes_frontier      ON exploration_nodes(exploration_id, priority DESC)
     WHERE kind='intent' AND state='open';
 DROP TRIGGER IF EXISTS trg_expnodes_upd ON exploration_nodes;
 CREATE TRIGGER trg_expnodes_upd BEFORE UPDATE ON exploration_nodes

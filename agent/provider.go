@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -207,14 +208,135 @@ func (c Config) ContextWindowTokens() int {
 	return k * 1000
 }
 
+const (
+	defaultMaxToolOutputChars = 8000
+	defaultMicroCompactRatio  = 0.35
+	defaultMicroCompactBatch  = 4
+	defaultMicroKeepRecent    = 4
+	defaultSummaryMaxTokens   = 4096
+)
+
+func promptCacheEnabled() bool {
+	return !isFalsy(os.Getenv("ARTEX_PROMPT_CACHE"))
+}
+
+func promptCacheTTL() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_PROMPT_CACHE_TTL"))) {
+	case "1h":
+		return "1h"
+	default:
+		return ""
+	}
+}
+
+func openAICacheRetention() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_OPENAI_CACHE_RETENTION"))) {
+	case "24h":
+		return "24h"
+	case "in_memory":
+		return "in_memory"
+	default:
+		return ""
+	}
+}
+
+func openAICacheControlEnabled() bool {
+	return isTruthy(os.Getenv("ARTEX_OPENAI_CACHE_CONTROL"))
+}
+
+func stripOldReasoningEnabled() bool {
+	return isTruthy(os.Getenv("ARTEX_STRIP_OLD_REASONING"))
+}
+
+func maxToolOutputChars() int {
+	raw := strings.TrimSpace(os.Getenv("ARTEX_MAX_TOOL_OUTPUT_CHARS"))
+	if raw == "" {
+		return defaultMaxToolOutputChars
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultMaxToolOutputChars
+	}
+	if n <= 0 {
+		return 0 // explicit 0/negative -> Norma's 30000 default
+	}
+	return n
+}
+
+func compactWindowCapTokens() int {
+	raw := strings.TrimSpace(os.Getenv("ARTEX_COMPACT_WINDOW_CAP_K"))
+	if raw == "" {
+		return 0
+	}
+	k, err := strconv.Atoi(raw)
+	if err != nil || k <= 0 {
+		return 0
+	}
+	if k < minWindowK {
+		k = minWindowK
+	}
+	if k > maxWindowK {
+		k = maxWindowK
+	}
+	return k * 1000
+}
+
+func microCompactRatio() float64 {
+	raw := strings.TrimSpace(os.Getenv("ARTEX_MICRO_COMPACT_RATIO"))
+	if raw == "" {
+		return defaultMicroCompactRatio
+	}
+	r, err := strconv.ParseFloat(raw, 64)
+	if err != nil || r <= 0 || r >= 0.95 {
+		return defaultMicroCompactRatio
+	}
+	return r
+}
+
+func microCompactBatch() int {
+	raw := strings.TrimSpace(os.Getenv("ARTEX_MICRO_COMPACT_BATCH"))
+	if raw == "" {
+		return defaultMicroCompactBatch
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return defaultMicroCompactBatch
+	}
+	return n
+}
+
+func workerCompactOverviewEnabled() bool {
+	return !isFalsy(os.Getenv("ARTEX_WORKER_COMPACT_OVERVIEW"))
+}
+
+func isTruthy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
+}
+
 // compactionConfig builds the agent-core compaction config for a context window
-// in tokens. agentcore.NewSession wires the summarizer (same provider) when this
-// is set on Options.Compaction.
+// in tokens. agentcore.NewSession wires the summarizer when this is set on
+// Options.Compaction.
 func compactionConfig(windowTokens int) *compaction.Config {
 	if windowTokens <= 0 {
 		windowTokens = defaultWindowK * 1000
 	}
-	return &compaction.Config{ContextWindow: windowTokens}
+	if capTok := compactWindowCapTokens(); capTok > 0 && capTok < windowTokens {
+		windowTokens = capTok
+	}
+	return &compaction.Config{
+		ContextWindow:         windowTokens,
+		MicroThresholdRatio:   microCompactRatio(),
+		MicroKeepRecent:       defaultMicroKeepRecent,
+		MicroBatchInterval:    microCompactBatch(),
+		ExtraCompactableTools: artexCompactableTools,
+		CustomSummaryPrompt:   pentestCompactPrompt,
+		SummaryMaxTokens:      defaultSummaryMaxTokens,
+		SpeculativePreCompact: strings.TrimSpace(os.Getenv("ARTEX_SPECULATIVE_COMPACT")) != "0",
+	}
 }
 
 // FromEnv resolves the LLM provider config:
@@ -409,6 +531,17 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if c.RatePerSecond > 0 || c.RatePerMinute > 0 {
 		lc.RateLimit = &llm.RateLimit{PerSecond: c.RatePerSecond, PerMinute: c.RatePerMinute}
 	}
+	if c.Format == FormatOllama {
+		off := false
+		lc.PromptCacheEnabled = &off
+	} else {
+		on := promptCacheEnabled()
+		lc.PromptCacheEnabled = &on
+		lc.PromptCacheTTL = promptCacheTTL()
+		lc.PromptCacheRetention = openAICacheRetention()
+		lc.OpenAICacheControl = openAICacheControlEnabled()
+		lc.StripOldReasoning = stripOldReasoningEnabled()
+	}
 	return llm.NewProvider(lc)
 }
 
@@ -487,7 +620,9 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 	// them: norma builds the request body internally and decodes the SSE response
 	// before either reaches the recorder.
 	capt := llmrec.CaptureFrom(req.Context())
-	capt.SetRequest(requestBodySnapshot(req))
+	if capt != nil {
+		capt.SetRequest(requestBodySnapshot(req))
+	}
 
 	resp, err := t.base.RoundTrip(req)
 	if err != nil || resp == nil {
@@ -536,6 +671,11 @@ func requestBodySnapshot(req *http.Request) string {
 
 func quotaAwareHTTPClient(proxy, sessionHeaderKey, userAgent string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 128
+	transport.MaxIdleConnsPerHost = 32
+	transport.IdleConnTimeout = 120 * time.Second
+	transport.ResponseHeaderTimeout = 60 * time.Second
+	transport.ForceAttemptHTTP2 = true
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
 		transport.Proxy = nil // empty = direct; no fallback to the HTTP_PROXY/HTTPS_PROXY env vars

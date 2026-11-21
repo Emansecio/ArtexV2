@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -159,7 +160,10 @@ type Engine struct {
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
+	deltaHub  *DeltaHub
 }
+
+func (e *Engine) SetDeltaHub(h *DeltaHub) { e.deltaHub = h }
 
 type taskRuntime struct {
 	ctx    context.Context
@@ -168,6 +172,7 @@ type taskRuntime struct {
 }
 
 type workExecution struct {
+	taskID string
 	cancel context.CancelCauseFunc
 	done   chan error
 	action string // user action: pause | cancel
@@ -453,18 +458,43 @@ func (e *Engine) ActiveLLMCalls(taskID string) int64 {
 
 func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
 
+func plannerDebounceDuration() time.Duration {
+	const defaultDebounce = 2000 * time.Millisecond
+	raw := strings.TrimSpace(os.Getenv("ARTEX_PLANNER_DEBOUNCE_MS"))
+	if raw == "" {
+		return defaultDebounce
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return defaultDebounce
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 func NewEngine(m *Manager) *Engine {
-	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
+	return &Engine{m: m, debounce: plannerDebounceDuration(), bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
 		runtimes: map[string]*taskRuntime{}}
 }
 
 // registerWork records the cancel for the work currently running intentID.
-func (e *Engine) registerWork(intentID int64, cancel context.CancelCauseFunc) {
+func (e *Engine) registerWork(taskID string, intentID int64, cancel context.CancelCauseFunc) {
 	e.workMu.Lock()
-	e.work[intentID] = &workExecution{cancel: cancel, done: make(chan error, 1)}
+	e.work[intentID] = &workExecution{taskID: taskID, cancel: cancel, done: make(chan error, 1)}
 	e.workMu.Unlock()
+}
+
+func (e *Engine) activeWorkCount(taskID string) int {
+	e.workMu.Lock()
+	defer e.workMu.Unlock()
+	n := 0
+	for _, w := range e.work {
+		if w.taskID == taskID {
+			n++
+		}
+	}
+	return n
 }
 
 // detachWork removes the live control handle once Execute has returned. complete
@@ -926,16 +956,20 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	heartbeat := time.NewTimer(interval)
 	defer heartbeat.Stop()
 
-	// runRound runs one planning round (with debounce coalescing + the guards). src is only used to tell the trigger source apart in logs.
+	// runRound runs one planning round (with adaptive debounce coalescing + the guards). src is only used to tell the trigger source apart in logs.
 	runRound := func(src string) {
-		// debounce: coalesce a burst of changes into one planning round
-		timer := time.NewTimer(e.debounce)
-	drain:
-		for {
-			select {
-			case <-t.notify:
-			case <-timer.C:
-				break drain
+		// Adaptive debounce: when workers are active, coalesce bursts into one round;
+		// when no worker is running (initial kick or all workers idle waiting on intents),
+		// run immediately with 0ms debounce.
+		if e.debounce > 0 && e.activeWorkCount(t.ID) > 0 {
+			timer := time.NewTimer(e.debounce)
+		drain:
+			for {
+				select {
+				case <-t.notify:
+				case <-timer.C:
+					break drain
+				}
 			}
 		}
 		planner, _ := e.snapshotFor(t)
@@ -1014,6 +1048,14 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		pctx := e.budgetRoundCtx(e.plannerGateContext(ectx, t, intercept.DefaultTargetWaitBound), t, false)
+		if e.deltaHub != nil {
+			pctx = agent.WithDeltaSink(pctx, func(ev agent.DeltaEvent) {
+				e.deltaHub.Publish("task:"+t.ID, DeltaMsg{
+					Event: "delta",
+					Data:  DeltaFrame{Worker: "planner", Kind: ev.Kind, Text: ev.Text},
+				})
+			})
+		}
 		e.BeginLLMCall(t.ID)
 		met, reason, err := planner.Plan(pctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, t.TargetGuard.Hooks(), emit)
 		e.EndLLMCall(t.ID)
@@ -1042,6 +1084,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if e.budgetBlocksClaim(t.ID) {
 			t.Notify() // this round crossed the budget: settle on the next round, not at the next heartbeat
 		}
+		t.WakeWorkers()
 		e.touch(t.ID)
 	}
 
@@ -1162,11 +1205,28 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 		if !e.beginTaskOperation(t.ID) {
 			return
 		}
+		wakeCh := t.wakeSignal()
 		claimed := e.runWorkerStep(ctx, t, name, worker)
 		e.decInflight(t.ID)
-		if !claimed && sleepCtx(ctx, 800*time.Millisecond) {
+		if !claimed && waitWorkerWake(ctx, wakeCh, 800*time.Millisecond) {
 			return
 		}
+	}
+}
+
+func waitWorkerWake(ctx context.Context, wakeCh <-chan struct{}, fallback time.Duration) bool {
+	if wakeCh == nil {
+		return sleepCtx(ctx, fallback)
+	}
+	timer := time.NewTimer(fallback)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return true
+	case <-wakeCh:
+		return false
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -1226,7 +1286,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		return true
 	}
-	e.registerWork(intent.ID, workCancel)
+	e.registerWork(t.ID, intent.ID, workCancel)
 	stopHeartbeat := startClaimHeartbeat(t.Store, db.IntentClaimHeartbeatInterval, name, intent.ID, token, workCancel)
 	// wrap the guard hooks so steer_work can inject a mid-run course-correction
 	// for THIS intent (drained before the worker's next tool call).
@@ -1239,6 +1299,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	label := fmt.Sprintf("%s · #%d", name, iid)
 	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
 	workCtx = intercept.WithTargetScope(workCtx, t.targetScope(intercept.DefaultTargetWaitBound))
+	if e.deltaHub != nil {
+		wid := iid
+		wname := name
+		workCtx = agent.WithDeltaSink(workCtx, func(ev agent.DeltaEvent) {
+			e.deltaHub.Publish("task:"+t.ID, DeltaMsg{
+				Event: "delta",
+				Data:  DeltaFrame{Worker: wname, IntentID: &wid, Kind: ev.Kind, Text: ev.Text},
+			})
+		})
+	}
 	// Run budget (off by default): meter this run's calls; its effective budget is
 	// min(intent budget, task remaining above the wrap-up reserve).
 	workCtx, meter := e.budgetIntent(workCtx, t.ID)

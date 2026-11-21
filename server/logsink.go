@@ -86,30 +86,110 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 			s.mu.Unlock()
 		}
 
-		// Async writer: picks from channel and inserts into server_logs.
-		// Uses os.Stderr directly to report errors and avoids recursive log calls.
+		// Async writer: batches pending DB rows (up to 64 per batch or 50ms) and
+		// inserts via a single multi-row SQL statement, stamping DBIDs back in O(1).
 		go func() {
-			for {
-				select {
-				case req, ok := <-ch:
-					if !ok {
-						return
+			flushBatch := func(batch []dbWriteReq) {
+				if len(batch) == 0 {
+					return
+				}
+				rows := make([]db.DBLog, len(batch))
+				for i, req := range batch {
+					rows[i] = db.DBLog{
+						Level: req.ll.Level,
+						Tag:   req.ll.Tag,
+						Text:  req.ll.Text,
 					}
-					id, err := pg.InsertLog(req.ll.Level, req.ll.Tag, req.ll.Text)
-					if err != nil {
-						_, _ = os.Stderr.Write([]byte("[logsink] db write: " + err.Error() + "\n"))
-						continue
+				}
+				ids, err := pg.InsertLogsBatch(rows)
+				if err != nil {
+					_, _ = os.Stderr.Write([]byte("[logsink] db batch write: " + err.Error() + "\n"))
+					return
+				}
+				s.mu.Lock()
+				n := len(s.ring)
+				for i, req := range batch {
+					if i >= len(ids) {
+						break
 					}
-					// Stamp DBID back into the ring entry so history pagination works.
-					s.mu.Lock()
-					for i := range s.ring {
-						if s.ring[i].Seq == req.seq {
-							s.ring[i].DBID = id
+					id := ids[i]
+					if n > 0 {
+						base := s.ring[0].Seq
+						if idx := int(req.seq - base); idx >= 0 && idx < n && s.ring[idx].Seq == req.seq {
+							s.ring[idx].DBID = id
+							continue
+						}
+					}
+					for j := n - 1; j >= 0; j-- {
+						if s.ring[j].Seq == req.seq {
+							s.ring[j].DBID = id
 							break
 						}
 					}
-					s.mu.Unlock()
+				}
+				s.mu.Unlock()
+			}
+
+			const maxBatch = 64
+			batch := make([]dbWriteReq, 0, maxBatch)
+			timer := time.NewTimer(time.Hour)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			defer timer.Stop()
+
+			for {
+				if len(batch) == 0 {
+					select {
+					case req, ok := <-ch:
+						if !ok {
+							return
+						}
+						batch = append(batch, req)
+						timer.Reset(50 * time.Millisecond)
+					case <-ctx.Done():
+						return
+					}
+				}
+				for len(batch) < maxBatch {
+					select {
+					case req, ok := <-ch:
+						if !ok {
+							flushBatch(batch)
+							return
+						}
+						batch = append(batch, req)
+						continue
+					default:
+					}
+					break
+				}
+				if len(batch) >= maxBatch {
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					flushBatch(batch)
+					batch = batch[:0]
+					continue
+				}
+				select {
+				case req, ok := <-ch:
+					if !ok {
+						flushBatch(batch)
+						return
+					}
+					batch = append(batch, req)
+				case <-timer.C:
+					flushBatch(batch)
+					batch = batch[:0]
 				case <-ctx.Done():
+					flushBatch(batch)
 					return
 				}
 			}

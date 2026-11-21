@@ -143,6 +143,31 @@ export function useSideQuestions(parent: string | null) {
         setError(t("Failed to parse side-question data; please reopen the panel"));
       }
     });
+    stream.addEventListener("delta", (event) => {
+      if (version !== epoch.current) return;
+      try {
+        const delta = JSON.parse((event as MessageEvent).data) as {
+          id: string;
+          sequence: number;
+          append: string;
+          context?: SideExchange["context"];
+        };
+        if (delta.id !== runningID || !delta.append) return;
+        setItems((old) =>
+          old.map((ex) => {
+            if (ex.id !== delta.id || (ex.sequence ?? 0) >= delta.sequence) return ex;
+            return {
+              ...ex,
+              sequence: delta.sequence,
+              answer: (ex.answer ?? "") + delta.append,
+              context: delta.context ?? ex.context,
+            };
+          }),
+        );
+      } catch {
+        /* ignore malformed delta */
+      }
+    });
     stream.addEventListener("cleared", () => {
       stream.close();
       if (version === epoch.current) setItems([]);

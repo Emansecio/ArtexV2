@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -398,6 +399,9 @@ type remoteTool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema"`
+	Annotations *struct {
+		ReadOnlyHint bool `json:"readOnlyHint"`
+	} `json:"annotations,omitempty"`
 }
 
 func (c *Client) wrap(rt remoteTool) actool.CoreTool {
@@ -406,7 +410,9 @@ func (c *Client) wrap(rt remoteTool) actool.CoreTool {
 		schema = map[string]any{"type": "object"}
 	}
 	full := ToolName(c.server, rt.Name)
-	return actool.Build(actool.Spec{
+	readOnly := rt.Annotations != nil && rt.Annotations.ReadOnlyHint
+	concurrent := readOnly || os.Getenv("ARTEX_MCP_CONCURRENT") == "1"
+	spec := actool.Spec{
 		Name:        full,
 		Description: rt.Description,
 		Schema:      schema,
@@ -446,7 +452,14 @@ func (c *Client) wrap(rt remoteTool) actool.CoreTool {
 			// head + pointer, so a large MCP result does not flood the context whole.
 			return actool.Result{Content: []llm.ContentBlock{llm.TextBlock(actool.Capture(tc, text))}, IsError: res.IsError}, nil
 		},
-	})
+	}
+	if readOnly {
+		spec.ReadOnly = func(json.RawMessage) bool { return true }
+	}
+	if concurrent {
+		spec.Concurrent = func(json.RawMessage) bool { return true }
+	}
+	return actool.Build(spec)
 }
 
 // Call invokes one tool and returns the concatenated text of its content blocks

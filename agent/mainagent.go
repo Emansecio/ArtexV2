@@ -34,7 +34,11 @@ type MainAgent struct {
 	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn    func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	summaryProv     llm.Provider
 }
+
+// SetSummaryProvider configures an optional dedicated provider for AutoCompact summarization.
+func (m *MainAgent) SetSummaryProvider(p llm.Provider) { m.summaryProv = p }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
 // context-compression mechanism. nil/unset = off (built-in compaction). Read per
@@ -136,8 +140,10 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	system, boundary := deferredSystem(mainAgentSystem(goal, m.workDir, mainDir), def)
 	opts := agentcore.Options{
 		Provider:        m.prov,
+		SummaryProvider: m.summaryProv,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
+		PromptCacheKey:  fmt.Sprintf("artex-task-%d-main", taskID),
 		Tools:           withWebFetch(ctx, tools, m.proxyAddr, m.proxyCACert), // WebFetch: routed through the recording proxy for tracing; loads the proxy CA to verify MITM-resigned HTTPS certificates; every redirect hop is gated
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
@@ -157,6 +163,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		BashEnv:               proxyEnv(m.proxyAddr, m.proxyCACert), // Bash subcommands go through the proxy + trust the CA by default
 		WorkingDir:            mainDir,                              // the main run directory <workDir>/tasks/<taskID>/main
 		ToolOutputDir:         TaskToolOutputDir(m.workDir, taskID, mainDir),
+		MaxToolOutputChars:    maxToolOutputChars(),
 		MaxTurns:              m.maxTurns,                             // 0 = unlimited (configurable in agent management)
 		Compaction:            compactionConfig(m.compactionWindow()), // long chats stay within the window
 		Todos:                 actool.NewTodoStore(),                  // session-level temporary todos (TodoWrite), planning only, dropped on exit

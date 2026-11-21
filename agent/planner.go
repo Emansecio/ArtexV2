@@ -41,9 +41,11 @@ type Planner struct {
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
 	// lessonsBlock is the raw RSI evidence block. Empty = off. Plan() frames it
-	// with a per-run data envelope (field=lessons) and appends it after the
-	// rendered system prompt. The server renders the text from outcome records.
+	// with a task-stable data envelope (field=lessons) using lessonsNonce and
+	// appends it after the rendered system prompt.
 	lessonsBlock string
+	lessonsNonce string
+	summaryProv  llm.Provider
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -108,7 +110,20 @@ func (p *Planner) SetConstraintInject(fn func() bool) { p.injectConstraints = fn
 // SetLessonsBlock sets the raw RSI evidence block. Empty disables it. Plan()
 // frames it as data. The server renders it from outcome records; it is never
 // editable through the prompt UI.
-func (p *Planner) SetLessonsBlock(block string) { p.lessonsBlock = block }
+func (p *Planner) SetLessonsBlock(block string) {
+	p.lessonsBlock = block
+	if block != "" && p.lessonsNonce == "" {
+		p.lessonsNonce = NewTaskNonce()
+	}
+}
+
+// SetLessonsNonce fixes the task-scoped data-envelope nonce used for the RSI
+// lessons block so successive planner rounds share a cacheable system prompt.
+func (p *Planner) SetLessonsNonce(nonce string) { p.lessonsNonce = nonce }
+
+// SetSummaryProvider configures an optional dedicated provider for AutoCompact
+// summarization. nil falls back to the planner's primary provider.
+func (p *Planner) SetSummaryProvider(prov llm.Provider) { p.summaryProv = prov }
 
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (p *Planner) wantConstraints() bool { return p.injectConstraints == nil || p.injectConstraints() }
@@ -517,7 +532,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// The main run directory <workDir>/tasks/<taskID>/main; create it first.
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
-	sysBody := plannerSystem(goal, p.workDir, taskDir) + frameLessonsBlock(p.lessonsBlock)
+	sysBody := plannerSystem(goal, p.workDir, taskDir) + frameLessonsBlockWithNonce(p.lessonsBlock, p.lessonsNonce)
 	constraints := ""
 	if p.wantConstraints() {
 		constraints = constraintBlock(ts)
@@ -534,8 +549,10 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	}
 	opts := agentcore.Options{
 		Provider:        p.prov,
+		SummaryProvider: p.summaryProv,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
+		PromptCacheKey:  fmt.Sprintf("artex-task-%d-planner", taskID),
 		Tools:           withWebFetch(ctx, tools, p.proxyAddr, p.proxyCACert), // WebFetch: route through the recording proxy for traceability; load the proxy CA to verify MITM-re-signed HTTPS certs; every redirect hop is gated
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
@@ -555,6 +572,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		BashEnv:               proxyEnv(p.proxyAddr, p.proxyCACert), // Bash subcommands go through the proxy + trust its CA by default
 		WorkingDir:            taskDir,                              // the main run directory <workDir>/tasks/<taskID>/main
 		ToolOutputDir:         TaskToolOutputDir(p.workDir, taskID, taskDir),
+		MaxToolOutputChars:    maxToolOutputChars(),
 		MaxTurns:              p.maxTurns, // 0 = unlimited (configurable in agent management)
 		MaxDuration:           maxDur,     // 0=unlimited; with a deadline = time remaining until it
 		Compaction:            compactionConfig(p.compactionWindow()),

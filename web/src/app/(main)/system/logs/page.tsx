@@ -66,16 +66,44 @@ export default function LogsPage() {
       return;
     }
     const es = new EventSource(sseUrl("/api/logs/stream?since=0"));
+    const pending: LogLine[] = [];
+    let rafId = 0;
+    const flush = () => {
+      rafId = 0;
+      if (!pending.length) return;
+      const batch = pending.splice(0, pending.length);
+      setLines((prev) => {
+        const seen = new Set<number>();
+        for (let i = 0; i < prev.length; i++) {
+          const s = prev[i].seq;
+          if (s != null) seen.add(s);
+        }
+        const add: LogLine[] = [];
+        for (let i = 0; i < batch.length; i++) {
+          const l = batch[i];
+          if (l.seq != null && seen.has(l.seq)) continue;
+          if (l.seq != null) seen.add(l.seq);
+          add.push(l);
+        }
+        if (!add.length) return prev;
+        const next = prev.concat(add);
+        return next.length > 3000 ? next.slice(next.length - 3000) : next;
+      });
+    };
     es.onmessage = (e) => {
       if (pausedRef.current) return;
       try {
         const l = JSON.parse(e.data) as LogLine;
-        setLines((prev) => (prev.some((x) => x.seq === l.seq) ? prev : [...prev, l].slice(-3000)));
+        pending.push(l);
+        if (!rafId) rafId = window.requestAnimationFrame(flush);
       } catch {
         /* ignore malformed frame */
       }
     };
-    return () => es.close();
+    return () => {
+      if (rafId) window.cancelAnimationFrame(rafId);
+      es.close();
+    };
   }, []);
 
   // Mark "has more" once we have any db_id in view.
@@ -214,7 +242,11 @@ export default function LogsPage() {
                   ? l.text.slice(l.tag.length + 2).trimStart()
                   : l.text;
               return (
-                <div key={l.seq} className="flex items-start gap-2 px-1 py-0.5 hover:bg-muted/40">
+                <div
+                  key={l.seq}
+                  className="flex items-start gap-2 px-1 py-0.5 hover:bg-muted/40"
+                  style={{ contentVisibility: "auto", containIntrinsicSize: "0 24px" }}
+                >
                   <span className={cn("mt-1.5 size-1.5 shrink-0 rounded-full", levelDot[l.level])} />
                   <span className="shrink-0 tabular-nums text-muted-foreground">{fmtTime(l.ts)}</span>
                   {l.tag && (

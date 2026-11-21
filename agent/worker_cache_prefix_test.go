@@ -54,7 +54,7 @@ func (p *captureReqProvider) last() llm.CompletionRequest {
 	return p.reqs[len(p.reqs)-1]
 }
 
-func TestAssembleWorkerSystemFlagOffAndOnByteExact(t *testing.T) {
+func TestAssembleWorkerSystemFlagOffAndOn(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		caCert      string
@@ -69,38 +69,47 @@ func TestAssembleWorkerSystemFlagOffAndOnByteExact(t *testing.T) {
 				GlobalNames:     tc.globalNames,
 				FindingGuidance: tc.guidance,
 			}
-			buildTail := func(runDir, intentSummary, assetDomain string) (string, string) {
+			taskNonce := NewTaskNonce()
+			buildParts := func(runDir, intentSummary, assetDomain string) (string, string) {
 				staticPart, dynamicTail := workerSystemParts("127.0.0.1:8788", tc.caCert, "/data", runDir)
-				dynamicTail += "\n\n## Prior evidence\n- lesson A"
-				dynamicTail += "\n\n[Constraints]\n- do not touch prod"
+				staticPart += frameLessonsBlockWithNonce("- lesson A", taskNonce)
+				staticPart += "\n\n[Constraints]\n- do not touch prod"
 				dynamicTail += renderIntentTask(&db.Node{ID: 7, Payload: json.RawMessage(`{"summary":"` + intentSummary + `"}`)})
 				dynamicTail += "\n\nThe target assets corresponding to this intent's asset_ids:\n[{\"domain\":\"" + assetDomain + "\"}]"
 				dynamicTail += "\n\nStart executing the intent above: do only it, produce only facts, assets, findings, stop when done."
 				return staticPart, dynamicTail
 			}
 
-			s1, d1 := buildTail("/data/tasks/1/i10", "probe auth", "alpha.example")
-			s2, d2 := buildTail("/data/tasks/1/i20", "probe billing", "beta.example")
+			s1, d1 := buildParts("/data/tasks/1/i10", "probe auth", "alpha.example")
+			s2, d2 := buildParts("/data/tasks/1/i20", "probe billing", "beta.example")
 
-			// Legacy baseline (equivalent to flag off).
-			legacySys1, legacyBound1 := deferredSystem(workerSystem("127.0.0.1:8788", tc.caCert, "/data", "/data/tasks/1/i10")+strings.TrimPrefix(d1, workerArtifactSpec("/data/tasks/1/i10")+noiseProfileBlock()), def)
+			// Flag OFF: delegates to deferredSystem(staticPart+dynamicTail, def).
+			wantOff1, wantOffBound1 := deferredSystem(s1+d1, def)
 			offSys1, offBound1 := assembleWorkerSystem(s1, d1, def, false)
-			if offBound1 != legacyBound1 || !slices.Equal(offSys1, legacySys1) {
-				t.Fatalf("flag off diverged from legacy: got (%d, len=%d) want (%d, len=%d)", offBound1, len(offSys1), legacyBound1, len(legacySys1))
+			if offBound1 != wantOffBound1 || !slices.Equal(offSys1, wantOff1) {
+				t.Fatalf("flag off diverged from deferredSystem: got (%d, len=%d) want (%d, len=%d)", offBound1, len(offSys1), wantOffBound1, len(wantOff1))
 			}
 
-			// Flag ON: split into [static, dynamic] with DynamicBoundary=1.
+			// Flag ON (default in V2): split into [static, dynamic] with DynamicBoundary=1.
 			onSys1, onBound1 := assembleWorkerSystem(s1, d1, def, true)
 			onSys2, onBound2 := assembleWorkerSystem(s2, d2, def, true)
 
 			if onBound1 != 1 || onBound2 != 1 || len(onSys1) != 2 || len(onSys2) != 2 {
 				t.Fatalf("flag on shape = (%d, %d) / (%d, %d), want boundary=1 len=2", onBound1, len(onSys1), onBound2, len(onSys2))
 			}
-			// Static segment identical across sibling workers.
+			// Static segment identical across sibling workers and includes all task-stable blocks.
 			if onSys1[0] != onSys2[0] {
 				t.Fatalf("static prefix differs between sibling workers")
 			}
-			// Dynamic segment differs and carries per-intent data + deferred block.
+			for _, stable := range []string{"- lesson A", "do not touch prod"} {
+				if !strings.Contains(onSys1[0], stable) {
+					t.Errorf("static[0] missing task-stable %q", stable)
+				}
+				if strings.Contains(onSys1[1], stable) {
+					t.Errorf("dynamic[1] unexpectedly contains task-stable %q", stable)
+				}
+			}
+			// Dynamic segment differs and carries only per-intent data.
 			if onSys1[1] == onSys2[1] {
 				t.Fatalf("dynamic segment unexpectedly identical")
 			}
@@ -113,23 +122,15 @@ func TestAssembleWorkerSystemFlagOffAndOnByteExact(t *testing.T) {
 				}
 			}
 			if len(tc.globalNames) > 0 {
-				if !strings.Contains(onSys1[1], "<available-deferred-tools>") || !strings.Contains(onSys1[1], "mcp__zap__scan") {
-					t.Errorf("deferred tools block missing from dynamic segment")
+				if !strings.Contains(onSys1[0], "<available-deferred-tools>") || !strings.Contains(onSys1[0], "mcp__zap__scan") {
+					t.Errorf("deferred tools block missing from static segment")
 				}
-				if strings.Contains(onSys1[0], "<available-deferred-tools>") {
-					t.Errorf("deferred tools block unexpectedly in static segment")
+				if strings.Contains(onSys1[1], "<available-deferred-tools>") {
+					t.Errorf("deferred tools block unexpectedly in dynamic segment")
 				}
 			}
-
-			// Byte-exact visible text: Join(onSys, "\n\n") == Join(offSys, "\n\n").
-			wantVisible1 := strings.Join(offSys1, "\n\n")
-			gotVisible1 := strings.Join(onSys1, "\n\n")
-			if gotVisible1 != wantVisible1 {
-				t.Fatalf("visible text mismatch (len got=%d want=%d)", len(gotVisible1), len(wantVisible1))
-			}
-			offSys2, _ := assembleWorkerSystem(s2, d2, def, false)
-			if strings.Join(onSys2, "\n\n") != strings.Join(offSys2, "\n\n") {
-				t.Fatalf("worker 2 visible text mismatch")
+			if tc.guidance != "" && !strings.Contains(onSys1[0], "[Finding guidance]") {
+				t.Errorf("finding guidance missing from static segment")
 			}
 		})
 	}
@@ -190,11 +191,13 @@ func TestWorkerExecuteCachePrefixEndToEnd(t *testing.T) {
 	t.Cleanup(func() { SetToolAugment(prevAugment) })
 
 	workDir := t.TempDir()
+	sharedNonce := NewTaskNonce()
 	runWorker := func(intent *db.Node, lessons string) llm.CompletionRequest {
 		t.Helper()
 		prov := &captureReqProvider{}
 		w := NewWorker(prov, "test-model", workDir, nil, 0, 2)
 		w.SetProxy("127.0.0.1:8788", "/ca.pem")
+		w.SetLessonsNonce(sharedNonce)
 		w.SetLessonsBlock(lessons)
 		if _, _, err := w.Execute(t.Context(), "work#1", task.ID, as, ts, intent, passHooks{}, nil, nil, nil); err != nil {
 			t.Fatalf("Worker.Execute(intent=%d): %v", intent.ID, err)
@@ -202,11 +205,8 @@ func TestWorkerExecuteCachePrefixEndToEnd(t *testing.T) {
 		return prov.last()
 	}
 
-	// 1. Flag OFF (default): legacy segments and boundary. With a global deferred
-	// tool block, deferredSystem emits [sysText, deferredBlock] with boundary=2,
-	// and norma's UntrustedOutputBoundary (on by default) appends its fixed note as
-	// System[2], giving len=3 and boundary=2.
-	t.Setenv(CachePrefixEnv, "")
+	// 1. Flag explicitly OFF (ARTEX_CACHE_PREFIX=0): legacy unsplit layout.
+	t.Setenv(CachePrefixEnv, "0")
 	req1Off := runWorker(intent1, "")
 	req2Off := runWorker(intent2, "")
 	if req1Off.DynamicBoundary != 2 || len(req1Off.System) != 3 {
@@ -216,10 +216,10 @@ func TestWorkerExecuteCachePrefixEndToEnd(t *testing.T) {
 		t.Fatalf("expected flag-off worker system[0] to differ because runDir/intent are inside it")
 	}
 
-	// 2. Flag ON: static prefix identical across sibling workers, dynamic differs,
-	// visible text byte-identical, tools unchanged, deferred block inside dynamic,
-	// norma's appended untrusted-output note preserved as System[2].
-	t.Setenv(CachePrefixEnv, "1")
+	// 2. Flag ON (default when unset): static prefix identical across sibling workers
+	// and holds all task-stable blocks (constraints, deferred tools, lessons), while
+	// dynamic suffix holds only per-intent volatile data.
+	t.Setenv(CachePrefixEnv, "")
 	req1On := runWorker(intent1, "")
 	req2On := runWorker(intent2, "")
 
@@ -228,7 +228,7 @@ func TestWorkerExecuteCachePrefixEndToEnd(t *testing.T) {
 			req1On.DynamicBoundary, len(req1On.System), req2On.DynamicBoundary, len(req2On.System))
 	}
 	if req1On.System[2] != req1Off.System[2] || req2On.System[2] != req2Off.System[2] {
-		t.Fatalf("norma untrusted-output note segment changed under ARTEX_CACHE_PREFIX=1")
+		t.Fatalf("norma untrusted-output note segment changed under ARTEX_CACHE_PREFIX")
 	}
 	if req1On.System[0] != req2On.System[0] {
 		t.Fatalf("flag on static prefix differs between sibling workers")
@@ -249,7 +249,15 @@ func TestWorkerExecuteCachePrefixEndToEnd(t *testing.T) {
 		{"worker1", req1On, runDir1, "inspect alpha auth", dom1},
 		{"worker2", req2On, runDir2, "inspect beta checkout", dom2},
 	} {
-		for _, needle := range []string{pair.runDir, pair.intent, pair.domain, "stay within test scope", "Start executing the intent above:", "<available-deferred-tools>", "mcp__demo__scanner"} {
+		for _, stable := range []string{"stay within test scope", "<available-deferred-tools>", "mcp__demo__scanner"} {
+			if !strings.Contains(pair.req.System[0], stable) {
+				t.Errorf("%s static segment missing %q", pair.name, stable)
+			}
+			if strings.Contains(pair.req.System[1], stable) {
+				t.Errorf("%s dynamic segment unexpectedly contains %q", pair.name, stable)
+			}
+		}
+		for _, needle := range []string{pair.runDir, pair.intent, pair.domain, "Start executing the intent above:"} {
 			if !strings.Contains(pair.req.System[1], needle) {
 				t.Errorf("%s dynamic segment missing %q", pair.name, needle)
 			}
@@ -259,23 +267,16 @@ func TestWorkerExecuteCachePrefixEndToEnd(t *testing.T) {
 		}
 	}
 
-	if strings.Join(req1On.System, "\n\n") != strings.Join(req1Off.System, "\n\n") {
-		t.Fatalf("worker 1 visible prompt changed under ARTEX_CACHE_PREFIX=1")
-	}
-	if strings.Join(req2On.System, "\n\n") != strings.Join(req2Off.System, "\n\n") {
-		t.Fatalf("worker 2 visible prompt changed under ARTEX_CACHE_PREFIX=1")
-	}
-
-	// With RSI lessons enabled (framed with a per-run random nonce), lessons stay in
-	// System[1] so System[0] remains byte-identical across sibling workers.
+	// With RSI lessons enabled (using shared task nonce), lessons live inside System[0]
+	// and remain byte-identical across sibling workers.
 	const sampleLessons = "- [positive, 1 evidence] sqli: verified"
 	req1Lessons := runWorker(intent1, sampleLessons)
 	req2Lessons := runWorker(intent2, sampleLessons)
-	if req1Lessons.System[0] != req1On.System[0] || req2Lessons.System[0] != req1On.System[0] {
-		t.Fatalf("lessons block leaked into static prefix")
+	if req1Lessons.System[0] != req2Lessons.System[0] {
+		t.Fatalf("lessons static prefix differed between sibling workers")
 	}
-	if !strings.Contains(req1Lessons.System[1], sampleLessons) || !strings.Contains(req2Lessons.System[1], sampleLessons) {
-		t.Fatalf("lessons block missing from dynamic segment")
+	if !strings.Contains(req1Lessons.System[0], sampleLessons) {
+		t.Fatalf("lessons block missing from static segment")
 	}
 
 	toolsOffJSON, _ := json.Marshal(req1Off.Tools)

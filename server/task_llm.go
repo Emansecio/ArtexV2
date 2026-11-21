@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"iter"
 	"log"
+	"math/rand/v2"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -53,6 +54,37 @@ type taskLLMRuntime struct {
 	s        *Server
 	taskID   string
 	agentKey string
+
+	cacheMu  sync.Mutex
+	cachedPT *db.Task
+	cachedAt time.Time
+}
+
+func (r *taskLLMRuntime) getTaskCached(taskNum int64) (*db.Task, error) {
+	r.cacheMu.Lock()
+	if r.cachedPT != nil && time.Since(r.cachedAt) < 1500*time.Millisecond {
+		pt := r.cachedPT
+		r.cacheMu.Unlock()
+		return pt, nil
+	}
+	r.cacheMu.Unlock()
+
+	pt, err := r.s.m.pg.GetTask(taskNum)
+	if err != nil || pt == nil {
+		return pt, err
+	}
+	r.cacheMu.Lock()
+	r.cachedPT = pt
+	r.cachedAt = time.Now()
+	r.cacheMu.Unlock()
+	return pt, nil
+}
+
+func (r *taskLLMRuntime) invalidateCache() {
+	r.cacheMu.Lock()
+	r.cachedPT = nil
+	r.cachedAt = time.Time{}
+	r.cacheMu.Unlock()
 }
 
 type taskLLMError struct {
@@ -210,7 +242,7 @@ func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, erro
 	if err != nil {
 		return taskLLMSelection{}, err
 	}
-	pt, err := r.s.m.pg.GetTask(taskNum)
+	pt, err := r.getTaskCached(taskNum)
 	if err != nil {
 		return taskLLMSelection{}, err
 	}
@@ -265,7 +297,7 @@ func (r *taskLLMRuntime) activeCfg() (agent.Config, bool) {
 	if err != nil {
 		return agent.Config{}, false
 	}
-	pt, err := r.s.m.pg.GetTask(taskNum)
+	pt, err := r.getTaskCached(taskNum)
 	if err != nil || pt == nil {
 		return agent.Config{}, false
 	}
@@ -321,6 +353,7 @@ func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 			}
 		},
 		exhaust: func(selection taskLLMSelection, cause error) (db.TaskLLMTransition, error) {
+			r.invalidateCache()
 			taskNum, _ := parseTaskID(r.taskID)
 			transition, err := r.s.m.pg.MarkTaskLLMProfileQuotaExhaustedAtRevision(taskNum, selection.profileID, selection.revision, cause.Error())
 			if err != nil {
@@ -328,6 +361,10 @@ func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 			}
 			if pt, getErr := r.s.m.pg.GetTask(taskNum); getErr == nil && pt != nil {
 				r.s.syncTaskLLMState(pt)
+				r.cacheMu.Lock()
+				r.cachedPT = pt
+				r.cachedAt = time.Now()
+				r.cacheMu.Unlock()
 			}
 			return transition, nil
 		},
@@ -370,16 +407,17 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 		)
 		// Same-provider safe-window retry: a non-streaming call either succeeds or
 		// fails as a whole — no partially delivered output — so any transient failure can be retried verbatim.
-		retries, backoffOf := sameProviderRetryPolicy(selection.retry)
+		retries, backoffOf := effectiveRetryPolicy(selection)
+		callCtx := callAttemptContext(ctx, selection, retries)
 		for attempt := 0; ; attempt++ {
-			msg, sr, usage, callErr = selection.provider.Complete(ctx, req)
+			msg, sr, usage, callErr = selection.provider.Complete(callCtx, req)
 			total.Add(usage)
 			if hooks.recordHealth != nil {
 				hooks.recordHealth(ctx, selection.healthProfileID, false, false, callErr)
 			}
 			if callErr != nil && ctx.Err() == nil &&
 				attempt < retries && isRetryableStreamError(callErr) {
-				backoff := backoffOf(attempt)
+				backoff := jitteredRetryWait(backoffOf(attempt), callErr, selection.retry.StreamInterval > 0)
 				log.Printf("[task-llm] task %s non-streaming call failed, retrying on the same provider after %v (%d/%d): %v",
 					taskID, backoff, attempt+1, retries, callErr)
 				if sleepCtx(ctx, backoff) {
@@ -470,7 +508,8 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				}
 				return yield(event, nil)
 			}
-			retries, backoffOf := sameProviderRetryPolicy(selection.retry)
+			retries, backoffOf := effectiveRetryPolicy(selection)
+			callCtx := callAttemptContext(ctx, selection, retries)
 			// Same-provider safe-window retry: a transient failure before committed
 			// (nothing delivered to the caller yet) can be replayed verbatim without
 			// duplicating model output or tool executions. After committed, on ctx cancellation, or on deterministic/quota errors it breaks out to the original pass-through/failover logic below.
@@ -479,7 +518,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				pending = nil
 				streamErr = nil
 				attemptUsage = llm.Usage{}
-				for event, err := range selection.provider.Stream(ctx, req) {
+				for event, err := range selection.provider.Stream(callCtx, req) {
 					if err != nil {
 						streamErr = err
 						break
@@ -515,7 +554,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				}
 				if streamErr != nil && !committed && ctx.Err() == nil &&
 					attempt < retries && isRetryableStreamError(streamErr) {
-					backoff := backoffOf(attempt)
+					backoff := jitteredRetryWait(backoffOf(attempt), streamErr, selection.retry.StreamInterval > 0)
 					log.Printf("[task-llm] task %s pre-commit stream failure, retrying on the same provider after %v (%d/%d): %v",
 						taskID, backoff, attempt+1, retries, streamErr)
 					if sleepCtx(ctx, backoff) {
@@ -644,6 +683,42 @@ func sameProviderRetryPolicy(r agent.RetryConfig) (retries int, backoff func(int
 		backoff = func(int) time.Duration { return d }
 	}
 	return retries, backoff
+}
+
+// effectiveRetryPolicy prevents 3-layer retry multiplication when selection is
+// already backed by a multi-member failover Pool (unless StreamAttempts is set).
+func effectiveRetryPolicy(sel taskLLMSelection) (retries int, backoff func(int) time.Duration) {
+	retries, backoff = sameProviderRetryPolicy(sel.retry)
+	if sel.retry.StreamAttempts == 0 {
+		if pool, ok := sel.provider.(*llmpool.Pool); ok && len(pool.Members()) > 1 {
+			retries = 0
+		}
+	}
+	return retries, backoff
+}
+
+// callAttemptContext avoids stacking inner SDK HTTP retries underneath the
+// task-level retry loop when ConnectAttempts was not explicitly overridden.
+func callAttemptContext(ctx context.Context, sel taskLLMSelection, outerRetries int) context.Context {
+	if outerRetries > 0 && sel.retry.ConnectAttempts == 0 {
+		return llm.WithMaxRetries(ctx, 0)
+	}
+	return ctx
+}
+
+func jitteredRetryWait(base time.Duration, err error, fixed bool) time.Duration {
+	wait := base
+	if !fixed && wait > 0 {
+		half := wait / 2
+		if half > 0 {
+			wait = half + time.Duration(rand.Int64N(int64(half)+1))
+		}
+	}
+	var httpErr *llm.HTTPStatusError
+	if errors.As(err, &httpErr) && httpErr.RetryAfter > wait && httpErr.RetryAfter <= 15*time.Second {
+		wait = httpErr.RetryAfter
+	}
+	return wait
 }
 
 // isRetryableStreamError decides whether a "pre-commit stream failure" is worth replaying on the same provider.
@@ -799,6 +874,9 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	mainRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	window := workerRuntime.CompactionWindow()
+	lessonsNonce := agent.NewTaskNonce()
+	summaryProv, summaryModel, hasSummary := agent.SummaryProviderFromEnv()
+
 	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns("worker"))
 	wk.SetFindingRecorder(s.evidenceStore())
 	wk.SetCompactionWindowResolver(workerRuntime.CompactionWindow)
@@ -809,6 +887,10 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // operation-constraint injection into the worker (configurable, on by default)
+	wk.SetLessonsNonce(lessonsNonce)
+	if hasSummary {
+		wk.SetSummaryProvider(summaryProv)
+	}
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
@@ -820,10 +902,16 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // operation-constraint injection into the planner (configurable, on by default)
-	// cold-digest §7: background compaction of cold nodes. This per-task planner set
-	// (agentsForTask) is exactly what the engine actually drives through the authoritative
-	// resolver, so the Compactor must hook in here. The planner provider goes through task routing (§4: same model as the agent, resolved with the task's LLM chain); compaction uses Complete to generate the body in one shot.
-	pl.SetCompactor(agent.NewCompactor(plannerRuntime, "task-router"))
+	pl.SetLessonsNonce(lessonsNonce)
+	if hasSummary {
+		pl.SetSummaryProvider(summaryProv)
+		pl.SetCompactor(agent.NewCompactor(summaryProv, summaryModel))
+	} else {
+		// cold-digest §7: background compaction of cold nodes. This per-task planner set
+		// (agentsForTask) is exactly what the engine actually drives through the authoritative
+		// resolver, so the Compactor must hook in here. The planner provider goes through task routing (§4: same model as the agent, resolved with the task's LLM chain); compaction uses Complete to generate the body in one shot.
+		pl.SetCompactor(agent.NewCompactor(plannerRuntime, "task-router"))
+	}
 	// RSI shadow mode: select evidence-backed lessons for this task. Off by
 	// default; shadow logs what would be shown, inject appends the block.
 	s.wireTaskLessons(t, wk, pl)
@@ -836,6 +924,9 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work: real-time course correction on running work by a human
+	if hasSummary {
+		main.SetSummaryProvider(summaryProv)
+	}
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,

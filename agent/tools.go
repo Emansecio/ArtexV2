@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	acperm "github.com/Autumn-27/norma/permission"
@@ -470,14 +473,126 @@ func (t *ToolSet) graphOverview() actool.CoreTool {
 		})
 }
 
+type overviewCacheEntry struct {
+	fp        string
+	data      map[string]any
+	createdAt time.Time
+}
+
+var overviewCache = struct {
+	mu sync.Mutex
+	m  map[string]overviewCacheEntry
+}{m: map[string]overviewCacheEntry{}}
+
 // graphOverviewData computes the distilled situational snapshot shared by the
-// graph_overview tool and the planner's wake-up prompt (which pre-injects it so
-// the model needn't spend a turn calling the tool — every plan round starts with
-// an empty context and always needs this first).
+// graph_overview tool and the planner's wake-up prompt. Queries execute
+// concurrently and unchanged snapshots are cached briefly for parallel workers.
 func (t *ToolSet) graphOverviewData() map[string]any {
+	var cacheKey, fp string
+	if t.ts != nil {
+		if sfp, ferr := t.ts.OverviewFingerprint(); ferr == nil && sfp != "" {
+			fp = sfp
+			cacheKey = fmt.Sprintf("%d:%d:%v", t.ts.ID(), t.taskID, t.coverageDisabled)
+			overviewCache.mu.Lock()
+			if ent, ok := overviewCache.m[cacheKey]; ok && ent.fp == fp && time.Since(ent.createdAt) < 1500*time.Millisecond {
+				cp := maps.Clone(ent.data)
+				overviewCache.mu.Unlock()
+				return cp
+			}
+			overviewCache.mu.Unlock()
+		}
+	}
+
+	const openIntentsCap = 30
+	const coldDigestsCap = 15
+
+	var (
+		goals      []*db.Node
+		hints      []*db.Node
+		edges      []db.Edge
+		covered    map[int64]int64
+		hotAtRend  map[int64]bool
+		fr         []*db.Node
+		allIntents []*db.Node
+		doneTotal  int
+		hasDoneTot bool
+		openTotal  int
+		hasOpenTot bool
+		vulnNodes  []*db.Node
+		factNodes  []*db.Node
+		cds        []map[string]any
+		cdMore     []int64
+		rootDesc   string
+		rootGoal   string
+		hasRoot    bool
+		related    []map[string]any
+		covStats   *db.Coverage
+		hasCov     bool
+		hosts      []string
+		hasHosts   bool
+		creds      any
+	)
+
+	sem := make(chan struct{}, 6)
+	var wg sync.WaitGroup
+	run := func(fn func()) {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			fn()
+		}()
+	}
+
+	run(func() { goals, _ = t.ts.ListByKind(db.KindGoal, 100) })
+	run(func() { hints, _ = t.ts.ListByKind(db.KindHint, 50) })
+	run(func() { edges, _ = t.ts.Edges(5000) })
+	run(func() { covered, _ = t.ts.CoveredMembers() })
+	run(func() {
+		if cg, _, err := loadColdGraph(t.ts); err == nil {
+			hotAtRend = cg.hotSet()
+		}
+	})
+	run(func() { fr, _ = t.ts.Frontier(openIntentsCap) })
+	run(func() { allIntents, _ = t.ts.ListByKind(db.KindIntent, 300) })
+	run(func() {
+		if dt, err := t.ts.CountFinishedIntents(); err == nil {
+			doneTotal, hasDoneTot = dt, true
+		}
+	})
+	run(func() {
+		if fo, err := t.ts.CountOpenIntents(); err == nil {
+			openTotal, hasOpenTot = fo, true
+		}
+	})
+	run(func() { vulnNodes, _ = t.ts.ListByKind(db.KindFinding, 1000) })
+	run(func() { factNodes, _ = t.ts.ListByKind(db.KindFact, 1000) })
+	run(func() { cds, cdMore = coldDigestsRecent(t.ts, coldDigestsCap) })
+	run(func() {
+		if d, g, err := t.ts.Root(); err == nil {
+			rootDesc, rootGoal, hasRoot = d, g, true
+		}
+	})
+	run(func() { related = t.relatedTaskOverviews() })
+	if t.as != nil && t.ts != nil && t.taskID > 0 {
+		if !t.coverageDisabled {
+			run(func() {
+				if cov, err := t.as.TaskCoverageWithSources(t.taskID); err == nil {
+					covStats, hasCov = cov, true
+				}
+			})
+		}
+		run(func() {
+			if hs, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
+				hosts, hasHosts = hs, true
+			}
+		})
+	}
+	run(func() { creds = t.taskCredentialOverview() })
+	wg.Wait()
+
 	out := map[string]any{}
-	// goals summary folded in so the planner needn't call list_goals each round.
-	goals, _ := t.ts.ListByKind(db.KindGoal, 100)
 	gsum := make([]map[string]any, 0, len(goals))
 	for _, g := range goals {
 		var p map[string]any
@@ -485,16 +600,11 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
 	}
 	out["goals"] = gsum
-	// hints: strategic hints attached to the graph by the human/main agent via
-	// add_hint; folded in so the planner reads them every round when generating
-	// intents (otherwise they'd be write-only).
-	hints, _ := t.ts.ListByKind(db.KindHint, 50)
+
 	hsum := make([]map[string]any, 0, len(hints))
 	for _, h := range hints {
 		var p map[string]any
 		_ = json.Unmarshal(h.Payload, &p)
-		// origin lets the user-message renderers keep the operator's own hints
-		// outside the data envelope (#124, F3).
 		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"], "origin": h.Origin}
 		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
 			hint["traffic_refs"] = p["traffic_refs"]
@@ -502,93 +612,50 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		hsum = append(hsum, hint)
 	}
 	out["hints"] = hsum
-	// lineage from the exploration edges: an intent's parents (what it
-	// derived_from — possibly several facts combined) and its yields (the
-	// facts/findings it produced). factFrom maps a fact → the intent that
-	// produced it. This is the relationship layer the flat lists lacked.
-	edges, _ := t.ts.Edges(5000)
+
 	parentsOf := map[int64][]int64{}
 	yieldsOf := map[int64][]int64{}
 	factFrom := map[int64]int64{}
 	for _, e := range edges {
 		switch e.Rel {
-		case db.RelDerivedFrom, db.RelSpawns: // upstream: derived_from (fact/finding/intent→intent) or spawns (origin fact→goal, legacy begin→intent)
+		case db.RelDerivedFrom, db.RelSpawns:
 			parentsOf[e.To] = append(parentsOf[e.To], e.From)
-		case db.RelYields: // intent --yields--> fact/finding
+		case db.RelYields:
 			yieldsOf[e.From] = append(yieldsOf[e.From], e.To)
 			factFrom[e.To] = e.From
 		}
 	}
-	// cold-digest §6: members folded into an active digest are shown via cold_digests
-	// (below), not the flat recent_* lists. `covered` maps member id → its digest id.
-	// §6 render-time revival check: a covered member that has become hot again (a new
-	// intent derived from it) must reappear this round — so `hidden` folds a member out
-	// only when it is covered AND still cold.
-	covered, _ := t.ts.CoveredMembers()
-	// Render-time hot set (ancestor of a live intent / fact under a live intent).
-	// §6 revival check: a covered member that revived (now hot) must NOT stay folded
-	// — hidden() only folds a member out when it is covered AND still cold. Computed
-	// every round (cheap for real graph sizes); nil map degrades safely.
-	var hotAtRender map[int64]bool
-	if cg, _, err := loadColdGraph(t.ts); err == nil {
-		hotAtRender = cg.hotSet()
-	}
-	hidden := func(id int64) bool { _, c := covered[id]; return c && !hotAtRender[id] }
-	const openIntentsCap = 30
-	fr, _ := t.ts.Frontier(openIntentsCap) // priority DESC, id ASC — the top N by priority; the real total is in frontier_open
+	hidden := func(id int64) bool { _, c := covered[id]; return c && !hotAtRend[id] }
 	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf)
-	all, _ := t.ts.ListByKind(db.KindIntent, 300)
 	var running, recentDone []*db.Node
-	for _, n := range all {
+	for _, n := range allIntents {
 		switch n.State {
 		case "running":
 			running = append(running, n)
 		case "done", "blocked", "exhausted":
 			if hidden(n.ID) {
-				continue // in a cold_digest and still cold — shown via cold_digests (§6.2)
+				continue
 			}
-			recentDone = append(recentDone, n) // newest first (all is id-DESC); folded ones are dropped, output truncated to the latest N
+			recentDone = append(recentDone, n)
 		}
 	}
 	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf)
-	// done_intents_total: the total number of finished intents (done/blocked/exhausted),
-	// named in parallel with recent_done_intents — the latter is just its newest windowed
-	// view. Side by side the two keys are self-describing: "you're seeing N of total", so
-	// the planner doesn't mistake "not shown" for "never dispatched" when deduping, with
-	// no extra explanation needed in the prompt.
-	if dt, err := t.ts.CountFinishedIntents(); err == nil {
-		out["done_intents_total"] = dt
+	if hasDoneTot {
+		out["done_intents_total"] = doneTotal
 	}
-	// frontier_open: the real total of open intents (open_intents is just the top-N-by-priority truncated view).
-	if fo, err := t.ts.CountOpenIntents(); err == nil {
-		out["frontier_open"] = fo
+	if hasOpenTot {
+		out["frontier_open"] = openTotal
 	} else {
 		out["frontier_open"] = len(fr)
 	}
-	// findings (confirmed vulns) and facts (worker exploration results) are
-	// now distinct node kinds. recent_facts surfaces fact summaries (esp.
-	// negative results) so the planner sees them in one call; full content
-	// via node_detail(id).
-	vulnNodes, _ := t.ts.ListByKind(db.KindFinding, 1000)
-	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
-	out["findings_total"] = len(vulnNodes)             // total confirmed findings (goal judgment looks here); details in finding_list (latest window)
-	out["facts"] = len(factNodes)                      // number of exploration facts/conclusions (including negative conclusions)
-	// Stagnation surfacing (#99): repeated finished directions with no findings
-	// since their first attempt. Self-describing payload — the instruction ships
-	// with the data so no prompt-template change is needed on deployed installs.
+	out["findings_total"] = len(vulnNodes)
+	out["facts"] = len(factNodes)
 	if stale := detectStagnation(recentDone, vulnNodes); len(stale) > 0 {
 		out["stagnation_warning"] = map[string]any{
 			"directions":  stale,
 			"instruction": "these directions were dispatched repeatedly with zero findings produced since their first attempt — do NOT re-dispatch the same approach again; open a materially different direction, or judge the goal on the existing evidence instead of grinding",
 		}
 	}
-	// findings are the task's highest-value output → the overview carries the latest
-	// window (≤10 entries; vulnNodes is id-DESC, i.e. newest first) so the planner sees
-	// the recently confirmed findings at a glance each round when judging goals; use
-	// list_findings for the full/older set. Each entry keeps only {id, summary,
-	// from_intent?}: from_intent is the intent that produced this finding.
-	// evidence/assets/vulnclass/severity/state etc. remain available via
-	// list_findings / node_detail(id).
 	const findingListCap = 10
 	findingList := make([]map[string]any, 0, findingListCap)
 	for _, n := range vulnNodes {
@@ -599,16 +666,12 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		_ = json.Unmarshal(n.Payload, &fp)
 		m := map[string]any{"id": n.ID, "summary": fp["summary"]}
 		if from := factFrom[n.ID]; from > 0 {
-			m["from_intent"] = from // which intent produced this finding
+			m["from_intent"] = from
 		}
 		findingList = append(findingList, m)
 	}
 	out["finding_list"] = findingList
-	// recent_facts: the latest window (≤N) of non-folded facts (factNodes is id-DESC,
-	// i.e. newest first). Ones folded into a digest and still cold (hidden) go through
-	// cold_digests and aren't repeated here. Each entry {id, summary, origin?, source?,
-	// from_intent?, confidence?}; details like evidence via node_detail(id). Older ones
-	// via list_facts.
+
 	const recentFactsCap = 20
 	recentFacts := make([]map[string]any, 0, recentFactsCap)
 	for _, n := range factNodes {
@@ -616,15 +679,12 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			break
 		}
 		if hidden(n.ID) {
-			continue // folded into a digest and still cold — see cold_digests
+			continue
 		}
-		m := compactFact(n) // summary capped at factSummaryMax (#124, F3)
+		m := compactFact(n)
 		if from := factFrom[n.ID]; from > 0 {
-			m["from_intent"] = from // which intent produced this fact
+			m["from_intent"] = from
 		}
-		// confidence rides in the overview: lets the planner see at a glance which
-		// conclusion is only inferred (especially negative conclusions — don't treat
-		// them as ironclad); evidence is long, left to node_detail(id).
 		var fp map[string]any
 		if json.Unmarshal(n.Payload, &fp) == nil {
 			if c, ok := fp["confidence"].(string); ok && c != "" {
@@ -634,77 +694,52 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		recentFacts = append(recentFacts, m)
 	}
 	out["recent_facts"] = recentFacts
-	// recent_done_intents: the latest window (≤N) of non-folded finished intents
-	// (recentDone is already id-DESC). For older ones see the done_intents_total count
-	// + node_detail(id).
+
 	const recentDoneCap = 12
 	if len(recentDone) > recentDoneCap {
 		recentDone = recentDone[:recentDoneCap]
 	}
 	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
-	// cold-digest §6.1: the folded cold region's digest bodies, newest-member first,
-	// capped at N; truncated older digests are given as bare ids (still expandable via
-	// expand_digest) so the cold region's only exit doesn't grow without bound.
-	const coldDigestsCap = 15
-	if cds, more := coldDigestsRecent(t.ts, coldDigestsCap); len(cds) > 0 {
-		out["cold_digests"] = cds // [{id, body, member_count}] — read body directly (§6.1)
-		if len(more) > 0 {
-			out["cold_digests_more"] = more // ids of truncated older digests; expand with expand_digest(id)
+	if len(cds) > 0 {
+		out["cold_digests"] = cds
+		if len(cdMore) > 0 {
+			out["cold_digests_more"] = cdMore
 		}
 	}
-	// the original task (root) so the planner always has it, not just the
-	// decomposed goals.
-	if description, goal, err := t.ts.Root(); err == nil {
-		out["task"] = map[string]any{"description": description, "goal": goal}
+	if hasRoot {
+		out["task"] = map[string]any{"description": rootDesc, "goal": rootGoal}
 	}
-	// Direct source tasks are a live, read-only blackboard view. Keep their
-	// summaries in a separate field so their intents never enter this task's
-	// frontier or get mistaken for locally claimable work.
-	out["related_tasks"] = t.relatedTaskOverviews()
-	// coverage: a rough reference for asset test coverage — among the assets inside
-	// the scope (task_scope), the share touched by facts + by_type (total/tested per
-	// type). To see the concrete untested assets, the agent calls list_untested_assets
-	// on demand and judges itself. Only available in a task context.
-	// When the asset-coverage feature is off (coverageDisabled): keep only host_count
-	// (awareness of the target host count) and drop the coverage metrics
-	// denominator/tested/pct/by_type/note — avoids polluting the context and doesn't
-	// invite the hidden add_task_scope/list_untested_assets.
+	out["related_tasks"] = related
 	if t.as != nil && t.ts != nil && t.taskID > 0 {
-		{
-			m := map[string]any{}
-			if !t.coverageDisabled {
-				if cov, err := t.as.TaskCoverageWithSources(t.taskID); err == nil {
-					m["denominator"] = cov.Denominator
-					m["tested"] = cov.Tested
-					m["by_type"] = cov.ByType
-					m["note"] = "coverage = asset test coverage (including endpoints and all kinds of related assets), a rough estimate for reference only: includes the current task's and directly related tasks' scopes and fact anchors; related scopes are read-only. Container-type assets/mass enumeration skew it low — don't take it as fully tested; use add_task_scope to extend this task's scope, list_untested_assets to see untested assets [usually no need to call list_untested_assets; just proceed with the task];"
-					if cov.Denominator == 0 {
-						m["pct"] = nil
-						m["status"] = "scope not anchored"
-					} else {
-						m["pct"] = cov.Pct
-					}
-				}
-			}
-			if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
-				// Only the host count is given; the host list is no longer flattened into
-				// graph_overview (in large-scope tasks that's a lot of repeated strings every
-				// round, of limited value to planning decisions); query concrete hosts via
-				// list_assets on demand.
-				m["host_count"] = len(hosts)
-			}
-			if len(m) > 0 {
-				out["coverage"] = m
+		m := map[string]any{}
+		if !t.coverageDisabled && hasCov && covStats != nil {
+			m["denominator"] = covStats.Denominator
+			m["tested"] = covStats.Tested
+			m["by_type"] = covStats.ByType
+			m["note"] = "coverage = asset test coverage (including endpoints and all kinds of related assets), a rough estimate for reference only: includes the current task's and directly related tasks' scopes and fact anchors; related scopes are read-only. Container-type assets/mass enumeration skew it low — don't take it as fully tested; use add_task_scope to extend this task's scope, list_untested_assets to see untested assets [usually no need to call list_untested_assets; just proceed with the task];"
+			if covStats.Denominator == 0 {
+				m["pct"] = nil
+				m["status"] = "scope not anchored"
+			} else {
+				m["pct"] = covStats.Pct
 			}
 		}
+		if hasHosts {
+			m["host_count"] = len(hosts)
+		}
+		if len(m) > 0 {
+			out["coverage"] = m
+		}
 	}
-	// Task credentials (#3): test accounts for this target — user-declared (e.g. a
-	// program alias) plus accounts recorded by earlier runs. Surfaced every round so
-	// authenticated testing reuses them instead of re-registering, and so accounts
-	// this run registers get saved back (see save_task_credential).
-	if creds := t.taskCredentialOverview(); creds != nil {
+	if creds != nil {
 		out["task_credentials"] = creds
 		out["task_credentials_note"] = "test accounts for this task; use the matching entry for authenticated testing instead of registering a new account; entries with an empty password mean you must register that account first (strong unique password) and record it via save_task_credential; ALWAYS record accounts you register via save_task_credential"
+	}
+
+	if cacheKey != "" && len(related) == 0 {
+		overviewCache.mu.Lock()
+		overviewCache.m[cacheKey] = overviewCacheEntry{fp: fp, data: maps.Clone(out), createdAt: time.Now()}
+		overviewCache.mu.Unlock()
 	}
 	return out
 }

@@ -1,0 +1,89 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-artex_v2}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Please set POSTGRES_PASSWORD in .env.v2}
+      POSTGRES_DB: ${POSTGRES_DB:-artex_v2}
+    volumes:
+      - pgdata_v2:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-artex_v2} -d ${POSTGRES_DB:-artex_v2}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  artex-v2:
+    build:
+      context: .
+      args:
+        ARTEX_VERSION: ${ARTEX_VERSION:-v2-opt}
+    image: artex-v2:local
+    security_opt:
+      - "no-new-privileges:true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ARTEX_PG_DSN: postgres://${POSTGRES_USER:-artex_v2}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-artex_v2}?sslmode=disable
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ARTEX_LLM_PROVIDER: ${ARTEX_LLM_PROVIDER:-}
+      ARTEX_LLM_MODEL: ${ARTEX_LLM_MODEL:-}
+      ARTEX_LLM_BASE_URL: ${ARTEX_LLM_BASE_URL:-}
+      ARTEX_LLM_PROXY: ${ARTEX_LLM_PROXY:-}
+      ARTEX_LLM_PRIVATE_ENDPOINTS: ${ARTEX_LLM_PRIVATE_ENDPOINTS:-}
+      ARTEX_JWT_KEY_DIR: /app/keys
+      ARTEX_SECRET_KEY: ${ARTEX_SECRET_KEY:-}
+      ARTEX_TRUSTED_PROXIES: ${ARTEX_TRUSTED_PROXIES:-}
+      ARTEX_UNTRUSTED_BOUNDARY: ${ARTEX_UNTRUSTED_BOUNDARY:-}
+      ARTEX_UPDATE_CHECK: ${ARTEX_UPDATE_CHECK:-}
+      ARTEX_NOISE_PROFILE: ${ARTEX_NOISE_PROFILE:-}
+      ARTEX_TARGET_USER_AGENT: ${ARTEX_TARGET_USER_AGENT:-}
+      ARTEX_TASK_BUDGET_TOKENS: ${ARTEX_TASK_BUDGET_TOKENS:-}
+      ARTEX_TASK_BUDGET_TURNS: ${ARTEX_TASK_BUDGET_TURNS:-}
+      ARTEX_INTENT_BUDGET_TOKENS: ${ARTEX_INTENT_BUDGET_TOKENS:-}
+      ARTEX_INTENT_BUDGET_TURNS: ${ARTEX_INTENT_BUDGET_TURNS:-}
+
+      # --- ArtexV2 token, prompt-cache, spill, and compaction optimizations ---
+      ARTEX_CONTEXT_TELEMETRY: ${ARTEX_CONTEXT_TELEMETRY:-1}
+      ARTEX_CACHE_PREFIX: ${ARTEX_CACHE_PREFIX:-1}
+      ARTEX_PROMPT_CACHE: ${ARTEX_PROMPT_CACHE:-1}
+      ARTEX_PROMPT_CACHE_TTL: ${ARTEX_PROMPT_CACHE_TTL:-}
+      ARTEX_OPENAI_CACHE_RETENTION: ${ARTEX_OPENAI_CACHE_RETENTION:-}
+      ARTEX_OPENAI_CACHE_CONTROL: ${ARTEX_OPENAI_CACHE_CONTROL:-0}
+      ARTEX_STRIP_OLD_REASONING: ${ARTEX_STRIP_OLD_REASONING:-0}
+      ARTEX_MAX_TOOL_OUTPUT_CHARS: ${ARTEX_MAX_TOOL_OUTPUT_CHARS:-8000}
+      ARTEX_COMPACT_WINDOW_CAP_K: ${ARTEX_COMPACT_WINDOW_CAP_K:-}
+      ARTEX_MICRO_COMPACT_RATIO: ${ARTEX_MICRO_COMPACT_RATIO:-0.35}
+      ARTEX_MICRO_COMPACT_BATCH: ${ARTEX_MICRO_COMPACT_BATCH:-4}
+      ARTEX_WORKER_COMPACT_OVERVIEW: ${ARTEX_WORKER_COMPACT_OVERVIEW:-1}
+      ARTEX_COLD_DIGEST_MIN_NODES: ${ARTEX_COLD_DIGEST_MIN_NODES:-12}
+      ARTEX_COLD_DIGEST_MAJOR_DIGESTS: ${ARTEX_COLD_DIGEST_MAJOR_DIGESTS:-6}
+      ARTEX_PLANNER_DEBOUNCE_MS: ${ARTEX_PLANNER_DEBOUNCE_MS:-2000}
+
+      # --- ArtexV2 latency, streaming, failover & concurrency optimizations ---
+      ARTEX_SPECULATIVE_COMPACT: ${ARTEX_SPECULATIVE_COMPACT:-1}
+      ARTEX_LLM_HEDGE_MS: ${ARTEX_LLM_HEDGE_MS:-}
+      ARTEX_MCP_CONCURRENT: ${ARTEX_MCP_CONCURRENT:-}
+      NORMA_STREAM_IDLE_TIMEOUT_SEC: ${NORMA_STREAM_IDLE_TIMEOUT_SEC:-}
+      NORMA_RESPONSE_HEADER_TIMEOUT_SEC: ${NORMA_RESPONSE_HEADER_TIMEOUT_SEC:-}
+
+      # Optional cheaper/faster LLM dedicated to AutoCompact & cold-digest summarization
+      ARTEX_SUMMARY_LLM_PROVIDER: ${ARTEX_SUMMARY_LLM_PROVIDER:-}
+      ARTEX_SUMMARY_LLM_MODEL: ${ARTEX_SUMMARY_LLM_MODEL:-}
+      ARTEX_SUMMARY_LLM_BASE_URL: ${ARTEX_SUMMARY_LLM_BASE_URL:-}
+      ARTEX_SUMMARY_LLM_API_KEY: ${ARTEX_SUMMARY_LLM_API_KEY:-}
+      ARTEX_SUMMARY_LLM_PROXY: ${ARTEX_SUMMARY_LLM_PROXY:-}
+    ports:
+      - "${ARTEX_BIND_ADDR:-127.0.0.1}:18787:8787"
+      - "127.0.0.1:18788:8788"
+    volumes:
+      - ./data:/app/data
+      - ./keys:/app/keys
+      - ./skills:/app/skills
+    restart: unless-stopped
+
+volumes:
+  pgdata_v2:

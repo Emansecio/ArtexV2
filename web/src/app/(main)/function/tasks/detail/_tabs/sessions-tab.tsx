@@ -31,7 +31,8 @@ import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/
 import { MentionTextarea } from "@/components/mention-textarea";
 import { SideQuestionButton, SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
-import { Transcript } from "@/components/transcript";
+import { type StreamingDeltaView, Transcript } from "@/components/transcript";
+import { mergeActivities } from "@/lib/activity-merge";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -166,11 +167,7 @@ function sessionKeyOf(a: Activity): string {
 // data source — latest page, older page, SSE compensation, live tail — goes through
 // this, so history responses can never clobber live records received meanwhile.
 function mergeBySeq(current: Activity[], incoming: Activity[]): Activity[] {
-  if (!incoming.length) return current;
-  const bySeq = new Map<number, Activity>();
-  for (const a of current) bySeq.set(a.seq, a);
-  for (const a of incoming) bySeq.set(a.seq, a);
-  return [...bySeq.values()].sort((p, q) => p.seq - q.seq);
+  return mergeActivities(current, incoming);
 }
 
 // statusIcon maps a session status to its icon. Worker terminal states are
@@ -489,6 +486,36 @@ function WorkerAssetBadge({ assets }: { assets: IntentAsset[] }) {
   );
 }
 
+const LiveRunDuration = React.memo(function LiveRunDuration({
+  firstTs,
+  lastTs,
+  live,
+  taskPaused,
+}: {
+  firstTs: string;
+  lastTs: string;
+  live: boolean;
+  taskPaused: boolean;
+}) {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    if (!live || taskPaused) return;
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [live, taskPaused]);
+  const min = firstTs ? Date.parse(firstTs) : NaN;
+  const max = lastTs ? Date.parse(lastTs) : NaN;
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+  const end = live && !taskPaused ? now : max;
+  return (
+    <span className="inline-flex items-center gap-1" title={t("Run duration (first step → last step)")}>
+      <ClockIcon className="size-3" />
+      {fmtDuration(Math.max(0, end - min))}
+    </span>
+  );
+});
+
 export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; taskPaused?: boolean }) {
   const approvalFocus = useApprovalFocus({ taskId });
   const [selectedSessionId, setActiveId] = React.useState(MAIN_ID);
@@ -657,6 +684,12 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   const [llmResolutions, setLLMResolutions] = React.useState<TaskLLMResolutions | null>(null);
   // Pending intercept requests for this task — used to show warning icons on sessions.
   const [pendingIntercepts, setPendingIntercepts] = React.useState<InterceptApprovalRow[]>([]);
+  // Ephemeral streaming deltas per session key, cleared when final persisted step lands.
+  const [deltas, setDeltas] = React.useState<Record<string, StreamingDeltaView>>({});
+  const currentSegRef = React.useRef(0);
+  React.useEffect(() => {
+    currentSegRef.current = currentSeg;
+  }, [currentSeg]);
 
   // Refs backing SSE/loading without re-render churn.
   const snapshotRef = React.useRef(0); // task-level snapshot cursor → SSE since=
@@ -879,10 +912,11 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     };
   }, [taskId]);
 
-  // Re-render on a timer so "streaming" liveness recomputes as activity goes stale.
+  // Periodically recompute streaming-stale liveness badge without 1.5s full-tree churn;
+  // elapsed duration ticks independently inside LiveRunDuration below.
   const [, setTick] = React.useState(0);
   React.useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 1500);
+    const id = setInterval(() => setTick((t) => t + 1), 5000);
     return () => clearInterval(id);
   }, []);
 
@@ -894,6 +928,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   // ID) resumes from the DB, so a dropped realtime link self-heals; seq-merge dedups.
   React.useEffect(() => {
     setStore({});
+    setDeltas({});
     setIntents([]);
     setIntentAssets([]);
     setOlderIntents([]);
@@ -907,6 +942,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     setActiveId(MAIN_ID); // a stale worker id from the previous task must not leak in
     setMainSegs([{ seq: 0, created_at: "" }]);
     setCurrentSeg(0);
+    currentSegRef.current = 0;
     snapshotRef.current = 0;
     llmToastSeqRef.current = new Set();
     reqTokenRef.current = {};
@@ -914,6 +950,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     // mount) won't double-load it and pre-empt the SSE opened here.
     loadingKeysRef.current = new Set([mainSessionKey(0)]);
     let alive = true;
+    let cancelFlush: () => void = () => {};
 
     // MOCK demo: no SSE backend — pull one activity snapshot and bucket by session.
     if (MOCK) {
@@ -963,6 +1000,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
         const segs = ms.sessions.length ? ms.sessions : [{ seq: 0, created_at: "" }];
         setMainSegs(segs);
         setCurrentSeg(ms.current);
+        currentSegRef.current = ms.current;
         bootKey = mainSessionKey(ms.current);
         if (bootKey !== mainSessionKey(0)) loadingKeysRef.current.delete(mainSessionKey(0));
         loadingKeysRef.current.add(bootKey);
@@ -985,19 +1023,109 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
             unread: 0,
           };
         });
-        // Open the single task SSE from the snapshot cursor.
+        // Open the single task SSE from the snapshot cursor with rAF batching.
         const es = new EventSource(
           sseUrl(`/api/exploration/activity/stream?task=${encodeURIComponent(taskId)}&since=${snapshotRef.current}`),
         );
         esRef.current = es;
         es.onopen = () => setSseLive(true);
-        es.onerror = () => setSseLive(false); // EventSource auto-reconnects; DB compensates the gap
+        es.onerror = () => setSseLive(false);
+
+        const pendingActs: Activity[] = [];
+        const pendingDeltas: Array<{ key: string; kind: "text" | "thinking"; text: string }> = [];
+        let flushRaf = 0;
+
+        const flushFrame = () => {
+          flushRaf = 0;
+          if (!alive) return;
+          const acts = pendingActs.splice(0, pendingActs.length);
+          const ds = pendingDeltas.splice(0, pendingDeltas.length);
+
+          if (acts.length > 0) {
+            const grouped = new Map<string, Activity[]>();
+            const clearKeys = new Set<string>();
+            for (const a of acts) {
+              const k = sessionKeyOf(a);
+              let arr = grouped.get(k);
+              if (!arr) {
+                arr = [];
+                grouped.set(k, arr);
+              }
+              arr.push(a);
+              if (a.kind === "text" || a.kind === "thinking" || a.kind === "tool_use" || a.kind === "result") {
+                clearKeys.add(k);
+              }
+            }
+            setStore((prev) => {
+              const next = { ...prev };
+              const activeK = activeKeyRef.current;
+              for (const [k, incoming] of grouped) {
+                const cur = next[k] ?? emptyState();
+                const last = incoming[incoming.length - 1];
+                if (!cur.loaded && !cur.loading && k !== activeK) {
+                  const relevant = incoming.filter((x) => x.kind === "usage" || x.kind === "result");
+                  const accountingItems = relevant.length ? mergeBySeq(cur.items, relevant).slice(-4) : cur.items;
+                  next[k] = {
+                    ...cur,
+                    items: accountingItems,
+                    lastTs: last.ts,
+                    unread: cur.unread + incoming.length,
+                  };
+                  continue;
+                }
+                let items = mergeBySeq(cur.items, incoming);
+                let hasMore = cur.hasMore;
+                let earliestSeq = cur.earliestSeq;
+                const trimmable = k !== activeK || atBottomRef.current;
+                if (trimmable && items.length > MAX_KEEP) {
+                  items = items.slice(items.length - MAX_KEEP);
+                  hasMore = true;
+                  earliestSeq = items[0].seq;
+                }
+                const unread = k === activeK ? 0 : cur.unread + incoming.length;
+                next[k] = { ...cur, items, lastTs: last.ts, unread, hasMore, earliestSeq };
+              }
+              return next;
+            });
+            if (clearKeys.size > 0 || ds.length > 0) {
+              setDeltas((prev) => {
+                const next = { ...prev };
+                for (const k of clearKeys) delete next[k];
+                for (const d of ds) {
+                  const cur = next[d.key];
+                  next[d.key] = cur && cur.kind === d.kind ? { kind: d.kind, text: cur.text + d.text } : { kind: d.kind, text: d.text };
+                }
+                return next;
+              });
+            }
+          } else if (ds.length > 0) {
+            setDeltas((prev) => {
+              const next = { ...prev };
+              for (const d of ds) {
+                const cur = next[d.key];
+                next[d.key] = cur && cur.kind === d.kind ? { kind: d.kind, text: cur.text + d.text } : { kind: d.kind, text: d.text };
+              }
+              return next;
+            });
+          }
+        };
+
+        const scheduleFlush = () => {
+          if (!flushRaf) flushRaf = window.requestAnimationFrame(flushFrame);
+        };
+        cancelFlush = () => {
+          if (flushRaf) {
+            window.cancelAnimationFrame(flushRaf);
+            flushRaf = 0;
+          }
+        };
+
         es.onmessage = (e) => {
           let a: Activity;
           try {
             a = JSON.parse(e.data) as Activity;
           } catch {
-            return; // ignore malformed frame
+            return;
           }
           if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
             llmToastSeqRef.current.add(a.seq);
@@ -1015,40 +1143,34 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                 if (alive) setLLMResolutions(value);
               })
               .catch(() => {
-                // The periodic resolver poll will retry if this event-triggered refresh fails.
+                // Periodic resolver poll retries automatically.
               });
           }
-          const k = sessionKeyOf(a);
-          setStore((prev) => {
-            const cur = prev[k] ?? emptyState();
-            const activeK = activeKeyRef.current;
-            // Merge into sessions that are loaded, actively loading, or the current
-            // view (so returning is instant + a frame that lands mid-load isn't lost).
-            // A cold, inactive session also keeps a tiny accounting tail so the
-            // sidebar can add the latest unfinished usage without loading history.
-            if (!cur.loaded && !cur.loading && k !== activeK) {
-              const accountingItems =
-                a.kind === "usage" || a.kind === "result" ? mergeBySeq(cur.items, [a]).slice(-4) : cur.items;
-              return {
-                ...prev,
-                [k]: { ...cur, items: accountingItems, lastTs: a.ts, unread: cur.unread + 1 },
-              };
-            }
-            let items = mergeBySeq(cur.items, [a]);
-            // Memory bound: trim oldest when over cap (older re-fetched on scroll-up),
-            // but never while the user is reading this session's history (scrolled up).
-            let hasMore = cur.hasMore;
-            let earliestSeq = cur.earliestSeq;
-            const trimmable = k !== activeK || atBottomRef.current;
-            if (trimmable && items.length > MAX_KEEP) {
-              items = items.slice(items.length - MAX_KEEP);
-              hasMore = true;
-              earliestSeq = items[0].seq;
-            }
-            const unread = k === activeK ? 0 : cur.unread + 1;
-            return { ...prev, [k]: { ...cur, items, lastTs: a.ts, unread, hasMore, earliestSeq } };
-          });
+          pendingActs.push(a);
+          scheduleFlush();
         };
+
+        es.addEventListener("delta", (e) => {
+          try {
+            const df = JSON.parse((e as MessageEvent).data) as {
+              worker?: string;
+              intent_id?: number;
+              kind?: string;
+              text?: string;
+            };
+            if (!df.text || (df.kind !== "text" && df.kind !== "thinking")) return;
+            const k =
+              df.intent_id != null
+                ? `intent:${df.intent_id}`
+                : df.worker === "planner"
+                  ? "plan"
+                  : mainSessionKey(currentSegRef.current);
+            pendingDeltas.push({ key: k, kind: df.kind, text: df.text });
+            scheduleFlush();
+          } catch {
+            /* ignore malformed delta */
+          }
+        });
       })
       .catch((err) => {
         if (!alive || reqTokenRef.current.mainboot !== token) return;
@@ -1059,6 +1181,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
 
     return () => {
       alive = false;
+      cancelFlush();
       esRef.current?.close();
       esRef.current = null;
     };
@@ -1430,25 +1553,6 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
         activeTokens.cache_write_tokens >
       0,
   };
-
-  // Run duration = span from this session's first step to its last (for a live
-  // session, "now" so it ticks up — the 1.5s setTick above re-renders it).
-  // While the TASK is paused nothing time-derived may advance (#84): sessions
-  // keep state='running' in the store during a pause, so live alone would keep
-  // ticking and misrepresent the frozen budget. Freeze at the last step instead.
-  const runDuration = React.useMemo(() => {
-    let min = Infinity,
-      max = 0;
-    for (const a of activity) {
-      const t = Date.parse(a.ts);
-      if (!Number.isFinite(t)) continue;
-      if (t < min) min = t;
-      if (t > max) max = t;
-    }
-    if (!Number.isFinite(min) || max === 0) return null;
-    const end = active.live && !taskPaused ? Date.now() : max;
-    return Math.max(0, end - min);
-  }, [activity, active.live, taskPaused]);
 
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
   const contentRef = React.useRef<HTMLDivElement | null>(null);
@@ -1860,12 +1964,12 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                     </TooltipContent>
                   </Tooltip>
                 )}
-                {runDuration != null && (
-                  <span className="inline-flex items-center gap-1" title={t("Run duration (first step → last step)")}>
-                    <ClockIcon className="size-3" />
-                    {fmtDuration(runDuration)}
-                  </span>
-                )}
+                <LiveRunDuration
+                  firstTs={activity.length ? activity[0].ts : ""}
+                  lastTs={activity.length ? activity[activity.length - 1].ts : ""}
+                  live={active.live}
+                  taskPaused={taskPaused}
+                />
                 {isMain && <span>{t("Interactive")}</span>}
               </div>
             </div>
@@ -1939,6 +2043,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                     taskId={taskId}
                     chat={isMain}
                     focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
+                    streamingDelta={active.live ? (deltas[activeKey] ?? null) : null}
                   />
                 ) : (
                   <div className="pl-9 text-xs text-muted-foreground">
