@@ -25,8 +25,9 @@ type wsOutbound struct {
 }
 
 var wsUpgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 16384,
+	ReadBufferSize:    4096,
+	WriteBufferSize:   16384,
+	EnableCompression: true,
 	CheckOrigin: func(r *http.Request) bool {
 		orig := strings.TrimSpace(r.Header.Get("Origin"))
 		if orig == "" {
@@ -58,6 +59,7 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	conn.SetReadLimit(64 * 1024)
 
 	outCh := make(chan wsOutbound, 512)
 	doneCh := make(chan struct{})
@@ -108,6 +110,14 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case chName == "logs":
 			lch, lunsub := logSink.subscribe()
+			if recent, cursor := logSink.recent(since, 1000); len(recent) > 0 {
+				for _, l := range recent {
+					enqueue(wsOutbound{Channel: chName, Event: "log", Data: l})
+				}
+				if cursor > since {
+					since = cursor
+				}
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -225,6 +235,7 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		defer shutdown()
 		ping := time.NewTicker(25 * time.Second)
 		defer ping.Stop()
+		lastAuth := time.Now()
 		for {
 			select {
 			case <-doneCh:
@@ -232,8 +243,11 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 			case <-s.ctx.Done():
 				return
 			case msg := <-outCh:
-				if !s.sessionOK(tok) {
-					return
+				if time.Since(lastAuth) >= 25*time.Second {
+					if !s.sessionOK(tok) {
+						return
+					}
+					lastAuth = time.Now()
 				}
 				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				if err := conn.WriteJSON(msg); err != nil {
@@ -243,6 +257,7 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 				if !s.sessionOK(tok) {
 					return
 				}
+				lastAuth = time.Now()
 				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 					return

@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 func TestMaxToolOutputCharsEnv(t *testing.T) {
@@ -43,9 +45,18 @@ func TestCompactionConfigOptimizations(t *testing.T) {
 	if !strings.Contains(cfg.CustomSummaryPrompt, "penetration-testing") {
 		t.Fatalf("expected pentest summary prompt")
 	}
-	for _, tool := range []string{"traffic_query", "list_assets", "graph_overview", "node_detail"} {
+	for _, tool := range []string{
+		"traffic_get", "traffic_search", "traffic_blob", "traffic_messages",
+		"list_assets", "graph_overview", "node_detail",
+		"list_worker_traces", "search_all_worker_traces", "TaskOutput", "shell_read",
+	} {
 		if !slices.Contains(cfg.ExtraCompactableTools, tool) {
 			t.Errorf("ExtraCompactableTools missing %q", tool)
+		}
+	}
+	for _, bogus := range []string{"traffic_query", "search_worker_traces"} {
+		if slices.Contains(cfg.ExtraCompactableTools, bogus) {
+			t.Errorf("ExtraCompactableTools should not contain stale tool name %q", bogus)
 		}
 	}
 }
@@ -134,5 +145,74 @@ func TestCachePrefixDefaultOnAndOptOut(t *testing.T) {
 	t.Setenv(CachePrefixEnv, "0")
 	if cachePrefixEnabled() {
 		t.Fatal("expected ARTEX_CACHE_PREFIX=0 to disable split")
+	}
+}
+
+func TestDeferBuiltinToolsAndPlannerOverviewFacts(t *testing.T) {
+	tools := append(defaultTools(t.TempDir()),
+		(&ToolSet{}).ingestBbot(),
+		(&ToolSet{}).saveTaskCredential(),
+	)
+	def := DeferredInfo{Unlock: actool.NewUnlockSet("mcp__demo__scan")}
+	got := deferBuiltinTools(tools, def, workerDeferredBuiltins)
+	for _, want := range []string{"ingest_bbot", "save_task_credential", "sleep"} {
+		if !slices.Contains(got.Deferred, want) || !slices.Contains(got.GlobalNames, want) {
+			t.Fatalf("expected %q to be deferred and listed in GlobalNames: %+v", want, got)
+		}
+		if !got.Unlock.Has(want) {
+			t.Fatalf("expected %q unlocked in UnlockSet", want)
+		}
+	}
+	if slices.Contains(got.Deferred, "Bash") {
+		t.Fatalf("core tool Bash should not be deferred: %v", got.Deferred)
+	}
+
+	t.Setenv("ARTEX_DEFER_BUILTIN_TOOLS", "0")
+	off := deferBuiltinTools(tools, DeferredInfo{}, workerDeferredBuiltins)
+	if len(off.Deferred) != 0 || len(off.GlobalNames) != 0 {
+		t.Fatalf("expected ARTEX_DEFER_BUILTIN_TOOLS=0 to be no-op, got %+v", off)
+	}
+
+	if overviewHasFacts(nil) || overviewHasFacts(map[string]any{"facts": 0}) {
+		t.Fatal("expected empty overview to report false for overviewHasFacts")
+	}
+	if !overviewHasFacts(map[string]any{"facts": 2}) || !overviewHasFacts(map[string]any{"recent_facts": []map[string]any{{"id": 1}}}) {
+		t.Fatal("expected non-empty facts to report true for overviewHasFacts")
+	}
+}
+
+func TestOnda1CompactionAndReasoningDefaults(t *testing.T) {
+	t.Setenv("ARTEX_COMPACT_WINDOW_CAP_K", "")
+	cfg := compactionConfig(200000)
+	if cfg.ContextWindow != 160000 {
+		t.Fatalf("default ContextWindow=%d, want 160000", cfg.ContextWindow)
+	}
+	t.Setenv("ARTEX_COMPACT_WINDOW_CAP_K", "0")
+	cfgOff := compactionConfig(200000)
+	if cfgOff.ContextWindow != 200000 {
+		t.Fatalf("opt-out ContextWindow=%d, want 200000", cfgOff.ContextWindow)
+	}
+
+	t.Setenv("ARTEX_STRIP_OLD_REASONING", "")
+	if !stripOldReasoningEnabled() {
+		t.Fatal("expected ARTEX_STRIP_OLD_REASONING enabled by default")
+	}
+	t.Setenv("ARTEX_STRIP_OLD_REASONING", "0")
+	if stripOldReasoningEnabled() {
+		t.Fatal("expected ARTEX_STRIP_OLD_REASONING=0 to disable")
+	}
+}
+
+func TestRelatedTasksBudgetCapAndOverride(t *testing.T) {
+	t.Setenv("ARTEX_RELATED_TASKS_BUDGET_RUNES", "")
+	if got := relatedOverviewTotalRunes(); got != 12_000 {
+		t.Fatalf("default total runes=%d, want 12000", got)
+	}
+	if got := relatedOverviewBudgetForSources(3); got != 4_000 {
+		t.Fatalf("3-source budget=%d, want 4000", got)
+	}
+	t.Setenv("ARTEX_RELATED_TASKS_BUDGET_RUNES", "24000")
+	if got := relatedOverviewBudgetForSources(3); got != 8_000 {
+		t.Fatalf("overridden 3-source budget=%d, want 8000", got)
 	}
 }

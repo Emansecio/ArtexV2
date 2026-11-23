@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -380,6 +381,7 @@ func (l *loop) maxTokens() int {
 }
 
 func (l *loop) run() {
+	defer cancelSpeculative(l.in.Compactor)
 	var schemas []llm.ToolSchema
 	if l.in.Tools != nil {
 		schemas = l.in.Tools.Schemas()
@@ -550,7 +552,7 @@ func (l *loop) run() {
 				l.finish(l.settleReason, nil, "")
 				return
 			}
-			if l.beginSettlement(ReasonTimeout, &schemas) {
+			if l.beginSettlement(ReasonTimeout) {
 				l.toolCtx = l.ctx // wrap-up tools run live, bounded only by settleMaxTurns
 				l.lastContinue = ContinueNextTurn
 				continue
@@ -583,7 +585,7 @@ func (l *loop) run() {
 			if hitTime && !hitTurns {
 				reason = ReasonTimeout
 			}
-			if l.beginSettlement(reason, &schemas) {
+			if l.beginSettlement(reason) {
 				l.lastContinue = ContinueNextTurn
 				continue
 			}
@@ -604,10 +606,11 @@ func (l *loop) settleMaxTurns() int {
 }
 
 // beginSettlement enters the wrap-up phase when configured: injects the caller's
-// prompt as a user turn and hides DisabledTools, so a budget-terminated run can
-// checkpoint its findings. Returns false when no settlement is configured (caller
-// then finishes immediately).
-func (l *loop) beginSettlement(reason TerminalReason, schemas *[]llm.ToolSchema) bool {
+// prompt as a user turn so a budget-terminated run can checkpoint its findings.
+// DisabledTools are blocked in execOneWithCtx rather than stripped from schemas,
+// keeping the request tool list identical so provider prompt caches stay warm.
+// Returns false when no settlement is configured (caller then finishes immediately).
+func (l *loop) beginSettlement(reason TerminalReason) bool {
 	s := l.in.Settlement
 	if s == nil {
 		return false
@@ -622,10 +625,22 @@ func (l *loop) beginSettlement(reason TerminalReason, schemas *[]llm.ToolSchema)
 	l.settling = true
 	l.settleReason = reason
 	l.settleTurn = 0
-	if len(s.DisabledTools) > 0 {
-		*schemas = filterToolSchemas(*schemas, s.DisabledTools)
-	}
+	cancelSpeculative(l.in.Compactor)
 	return true
+}
+
+type speculativeCanceler interface {
+	CancelSpeculative()
+}
+
+func cancelSpeculative(c Compactor) {
+	if sc, ok := c.(speculativeCanceler); ok {
+		sc.CancelSpeculative()
+	}
+}
+
+func (l *loop) isDisabledDuringSettlement(settling bool, name string) bool {
+	return settling && l.in.Settlement != nil && slices.Contains(l.in.Settlement.DisabledTools, name)
 }
 
 // filterToolSchemas returns schemas with the named tools removed.
@@ -792,6 +807,13 @@ func (l *loop) requestMessages() []llm.Message {
 	return llm.MessagesForAPI(l.messages)
 }
 
+func (l *loop) reasoningEffort() string {
+	if l.settling || l.lastContinue == ContinueMaxOutputTokensEscalate || l.lastContinue == ContinueMaxOutputTokensRecovery {
+		return "low"
+	}
+	return ""
+}
+
 func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
 	l.maybeInjectTodoReminder()
 	msgs := l.requestMessages()
@@ -805,6 +827,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		Tools:           schemas,
 		MaxTokens:       l.maxTokens(),
 		Temperature:     l.in.Temperature,
+		ReasoningEffort: l.reasoningEffort(),
 		PromptCacheKey:  l.in.PromptCacheKey,
 	}
 	if l.in.NonStreaming {

@@ -428,7 +428,11 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 		delete(s.side.runs, e.ID)
 		s.side.mu.Unlock()
 	}()
-	ctx = transcript.WithSessionID(ctx, fmt.Sprintf("exp%d-btw-%s", parent.ExplorationID, e.ID))
+	sideSess := e.SessionKey
+	if sideSess == "" {
+		sideSess = e.ID
+	}
+	ctx = transcript.WithSessionID(ctx, fmt.Sprintf("exp%d-btw-%s", parent.ExplorationID, sideSess))
 	if parent.TaskID > 0 {
 		ctx = llmrec.WithTaskID(ctx, strconv.FormatInt(parent.TaskID, 10))
 	}
@@ -514,7 +518,8 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 	memory, runErr := s.m.pg.SideMemory(ctx, e)
 	var answer sidequestion.Answer
 	if runErr == nil {
-		answer, e.Context, runErr = (sidequestion.SideQuestionService{Provider: provider}).Respond(ctx, snapshot, agentQuestion, sidequestion.Replay{
+		summaryProv, _, _ := agent.SummaryProviderFromEnv()
+		answer, e.Context, runErr = (sidequestion.SideQuestionService{Provider: provider, SummaryProvider: summaryProv}).Respond(ctx, snapshot, agentQuestion, sidequestion.Replay{
 			Memory: memory,
 			Load: func(ctx context.Context, after int64) ([]sidequestion.Exchange, error) {
 				return s.m.pg.SideReplayPage(ctx, e, after)

@@ -553,7 +553,7 @@ func rawRowCount(raw json.RawMessage) int64 {
 }
 
 func archiveAssetIDsQuery() string {
-	return `SELECT id FROM assets WHERE $1=ANY(task_ids)
+	return `SELECT id FROM assets WHERE task_ids @> ARRAY[$1]::bigint[]
 UNION SELECT link.asset_id FROM task_asset_links link WHERE link.task_id=$1
 UNION SELECT anchor.asset_id FROM exploration_anchors anchor
       JOIN exploration_nodes node ON node.id=anchor.node_id WHERE node.exploration_id=$2
@@ -616,7 +616,7 @@ func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchi
 		{"findings", `SELECT * FROM findings WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"finding_traffic_bindings", `SELECT b.* FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE f.task_id=$1 ORDER BY b.finding_id,b.position,b.id`, []any{taskID}},
 		{"traffic_evidence_snapshots", `SELECT s.* FROM traffic_evidence_snapshots s WHERE EXISTS(SELECT 1 FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE b.snapshot_id=s.id AND f.task_id=$1) ORDER BY s.id`, []any{taskID}},
-		{"llm_records", `SELECT * FROM llm_records WHERE COALESCE(task_id,'')=$1 ORDER BY id`, []any{strconv.FormatInt(taskID, 10)}},
+		{"llm_records", `SELECT * FROM llm_records WHERE task_id=$1 ORDER BY id`, []any{strconv.FormatInt(taskID, 10)}},
 		{"llm_usage", `SELECT * FROM llm_usage WHERE COALESCE(task_id,'')=$1 OR exploration_id=$2 ORDER BY id`, []any{strconv.FormatInt(taskID, 10), expID}},
 		{"skill_usage", `SELECT * FROM skill_usage WHERE task_id=$1 OR exploration_id=$2 ORDER BY id`, []any{taskID, expID}},
 		{"tool_usage", `SELECT * FROM tool_usage WHERE task_id=$1 OR exploration_id=$2 ORDER BY id`, []any{taskID, expID}},

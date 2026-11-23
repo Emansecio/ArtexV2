@@ -4,10 +4,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { toast } from "sonner";
 
-import { t } from "@/i18n";
-import { sseUrl } from "@/lib/api";
 import { isBtwCommand, type SideExchange, type SideHistory, sideAPI } from "@/lib/side-questions";
 import { setVisibleInterval } from "@/lib/polling";
+import { subscribeWS } from "@/lib/ws";
 
 // crypto.randomUUID is only available in secure contexts (https/localhost); it degrades when accessed via IP+http.
 function newSideRequestID(): string {
@@ -130,49 +129,47 @@ export function useSideQuestions(parent: string | null) {
   useEffect(() => {
     if (!runningID) return;
     const version = epoch.current;
-    const stream = new EventSource(sseUrl(`/api/side-questions/${runningID}/events`));
-    stream.addEventListener("snapshot", (event) => {
-      if (version !== epoch.current) return;
-      try {
-        const item = JSON.parse((event as MessageEvent).data) as SideExchange;
-        if (item.id !== runningID) return;
-        setItems((old) => merge(old, [item]));
-        restoreFailedDraft([item]);
-        if (item.status !== "running") stream.close();
-      } catch {
-        setError(t("Failed to parse side-question data; please reopen the panel"));
-      }
+    const unsub = subscribeWS(`side:${runningID}`, {
+      onEvent: (event, data) => {
+        if (version !== epoch.current) return;
+        if (event === "cleared") {
+          unsub();
+          setItems([]);
+          return;
+        }
+        if (event === "side" || event === "snapshot") {
+          const item = data as SideExchange;
+          if (!item || item.id !== runningID) return;
+          setItems((old) => merge(old, [item]));
+          restoreFailedDraft([item]);
+          if (item.status !== "running") unsub();
+          return;
+        }
+        if (event === "delta") {
+          const delta = data as {
+            id?: string;
+            sequence?: number;
+            append?: string;
+            context?: SideExchange["context"];
+          };
+          if (!delta || delta.id !== runningID || !delta.append || delta.sequence == null) return;
+          const seq = delta.sequence;
+          const append = delta.append;
+          setItems((old) =>
+            old.map((ex) => {
+              if (ex.id !== delta.id || (ex.sequence ?? 0) >= seq) return ex;
+              return {
+                ...ex,
+                sequence: seq,
+                answer: (ex.answer ?? "") + append,
+                context: delta.context ?? ex.context,
+              };
+            }),
+          );
+        }
+      },
     });
-    stream.addEventListener("delta", (event) => {
-      if (version !== epoch.current) return;
-      try {
-        const delta = JSON.parse((event as MessageEvent).data) as {
-          id: string;
-          sequence: number;
-          append: string;
-          context?: SideExchange["context"];
-        };
-        if (delta.id !== runningID || !delta.append) return;
-        setItems((old) =>
-          old.map((ex) => {
-            if (ex.id !== delta.id || (ex.sequence ?? 0) >= delta.sequence) return ex;
-            return {
-              ...ex,
-              sequence: delta.sequence,
-              answer: (ex.answer ?? "") + delta.append,
-              context: delta.context ?? ex.context,
-            };
-          }),
-        );
-      } catch {
-        /* ignore malformed delta */
-      }
-    });
-    stream.addEventListener("cleared", () => {
-      stream.close();
-      if (version === epoch.current) setItems([]);
-    });
-    return () => stream.close();
+    return unsub;
   }, [runningID, streamEpoch, restoreFailedDraft]);
 
   const ask = async (input: string) => {

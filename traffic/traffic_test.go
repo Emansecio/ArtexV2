@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
@@ -433,5 +434,69 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 	}
 	if _, err := os.Stat(blobD); !os.IsNotExist(err) {
 		t.Fatalf("stream payload blobD still exists after its exchange was deleted: %v", err)
+	}
+}
+
+func TestAsyncBatchRecordViewsReadYourWritesAndClose(t *testing.T) {
+	tr, err := Open(t.TempDir(), "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var syncMode int
+	if err := tr.DB().QueryRow(`PRAGMA synchronous`).Scan(&syncMode); err != nil {
+		t.Fatalf("PRAGMA synchronous: %v", err)
+	}
+	if syncMode != 1 { // 1 = NORMAL
+		t.Fatalf("PRAGMA synchronous = %d, want 1 (NORMAL)", syncMode)
+	}
+
+	const workers = 6
+	const perWorker = 10
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				u, _ := url.Parse(fmt.Sprintf("https://batch.example/item/%d/%d", w, i))
+				reqHdr := http.Header{"X-Worker": []string{fmt.Sprint(w)}}
+				respHdr := http.Header{"Content-Type": []string{"text/plain"}}
+				tr.recordViews(
+					requestView{method: "GET", url: u, proto: "HTTP/1.1", header: reqHdr, body: []byte("req")},
+					responseView{status: 200, header: respHdr, body: []byte(fmt.Sprintf("resp-%d-%d", w, i))},
+					nil,
+				)
+				// Mutate caller headers right after recordViews to confirm defensive cloning.
+				reqHdr.Set("X-Worker", "mutated")
+				respHdr.Set("X-Extra", "mutated")
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	want := workers * perWorker
+	count, err := tr.Count()
+	if err != nil || count != want {
+		t.Fatalf("Count()=%d err=%v, want %d", count, err, want)
+	}
+	rows, err := tr.Search("batch.example", 0, 100)
+	if err != nil || len(rows) != want {
+		t.Fatalf("Search()=%d err=%v, want %d", len(rows), err, want)
+	}
+	reqText, respText, err := tr.Get(rows[0].ID)
+	if err != nil || strings.Contains(reqText, "mutated") || strings.Contains(respText, "mutated") {
+		t.Fatalf("Get(%s) leaked mutated header or failed: err=%v req=%q resp=%q", rows[0].ID, err, reqText, respText)
+	}
+
+	// Enqueue one more exchange right before Close to ensure shutdown drains cleanly.
+	u, _ := url.Parse("https://batch.example/final")
+	tr.recordViews(
+		requestView{method: "POST", url: u, proto: "HTTP/1.1", header: http.Header{}, body: []byte("final")},
+		responseView{status: 201, header: http.Header{"Content-Type": []string{"text/plain"}}, body: []byte("created")},
+		nil,
+	)
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

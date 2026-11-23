@@ -241,6 +241,10 @@ func (h *healthSync) loop(ctx context.Context) {
 	}
 }
 
+func configUsesThinking(cfg agent.Config) bool {
+	return cfg.ThinkingType == "enabled" || (cfg.ThinkingType != "disabled" && cfg.ReasoningEffort != "" && cfg.ReasoningEffort != "none")
+}
+
 // poolMember builds one chain member from a profile, reusing the per-profile
 // provider cache so every agent pointing at the same profile shares one provider
 // (hence one rate limiter). Returns nil when the profile can't be built.
@@ -255,7 +259,9 @@ func (s *Server) poolMember(p *db.LLMProfile, rank int) *llmpool.Member {
 		// Actual window, not CompactionWindow(): that helper floors at 32K for
 		// compaction math, which would let an 8K profile accept a 16K request
 		// and then 400 without failover.
-		WindowTokens: cfg.ContextWindowTokens(), Prov: prov,
+		WindowTokens: cfg.ContextWindowTokens(),
+		Thinking:     configUsesThinking(cfg),
+		Prov:         prov,
 	}
 }
 
@@ -293,7 +299,7 @@ func (s *Server) poolChain(headID int64, headProv llm.Provider, headCfg agent.Co
 	members := []*llmpool.Member{{
 		ID: head.ID, Name: head.Name, Model: head.Model, Format: head.Format,
 		Priority: head.Priority, Active: head.IsDefault, Rank: llmpool.RankActive,
-		WindowTokens: headCfg.ContextWindowTokens(), Prov: headProv,
+		WindowTokens: headCfg.ContextWindowTokens(), Thinking: configUsesThinking(headCfg), Prov: headProv,
 	}}
 	for _, p := range profs {
 		if p.ID == headID {

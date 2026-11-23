@@ -54,7 +54,8 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Spinner } from "@/components/ui/spinner";
 import { useSideQuestions } from "@/hooks/use-side-questions";
 import { mergeActivities } from "@/lib/activity-merge";
-import { api, sseUrl } from "@/lib/api";
+import { api } from "@/lib/api";
+import { subscribeWS } from "@/lib/ws";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { isBtwCommand } from "@/lib/side-questions";
@@ -595,7 +596,7 @@ function ChatView({
     }
     let live = true;
     let pollTimer: ReturnType<typeof setTimeout> | undefined;
-    let es: EventSource | null = null;
+    let unsubWS: (() => void) | null = null;
     const pendingActs: Activity[] = [];
     const pendingDeltas: Array<{ kind: "text" | "thinking"; text: string }> = [];
     let rafId = 0;
@@ -651,51 +652,38 @@ function ChatView({
       void tick();
     };
 
-    try {
-      es = new EventSource(sseUrl(`/api/conversations/${conv.id}/stream?since=${cursorRef.current}`));
-      es.addEventListener("activity", (e) => {
-        try {
-          pendingActs.push(JSON.parse((e as MessageEvent).data) as Activity);
+    unsubWS = subscribeWS(`conv:${conv.id}`, {
+      since: cursorRef.current,
+      onState: (open) => {
+        if (!live) return;
+        if (!open) startFallbackPoll();
+      },
+      onEvent: (event, data) => {
+        if (!live || !data || typeof data !== "object") return;
+        if (event === "activity") {
+          pendingActs.push(data as Activity);
           schedule();
-        } catch {
-          /* ignore */
-        }
-      });
-      es.addEventListener("delta", (e) => {
-        try {
-          const df = JSON.parse((e as MessageEvent).data) as { kind?: string; text?: string };
+        } else if (event === "delta") {
+          const df = data as { kind?: string; text?: string };
           if (!df.text || (df.kind !== "text" && df.kind !== "thinking")) return;
           pendingDeltas.push({ kind: df.kind, text: df.text });
           schedule();
-        } catch {
-          /* ignore */
-        }
-      });
-      es.addEventListener("status", (e) => {
-        try {
-          const st = JSON.parse((e as MessageEvent).data) as { running?: boolean };
+        } else if (event === "status") {
+          const st = data as { running?: boolean };
           if (st.running === false) {
             setRunning(false);
             setStreamingDelta(null);
             onTitleMaybeChanged();
           }
-        } catch {
-          /* ignore */
         }
-      });
-      es.onerror = () => {
-        if (!live) return;
-        startFallbackPoll();
-      };
-    } catch {
-      startFallbackPoll();
-    }
+      },
+    });
 
     return () => {
       live = false;
       if (rafId) window.cancelAnimationFrame(rafId);
       if (pollTimer) clearTimeout(pollTimer);
-      es?.close();
+      unsubWS?.();
     };
   }, [running, conv.id, onTitleMaybeChanged]);
 

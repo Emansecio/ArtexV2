@@ -4,6 +4,7 @@ package archivestore
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -30,7 +31,7 @@ import (
 type Config struct {
 	Endpoint, Region, Bucket, Prefix, AccessKey, SecretKey string
 	PathStyle                                              bool
-	SessionToken, SSE, KMSKeyID                            string
+	SessionToken, SSE, KMSKeyID, StorageClass              string
 }
 
 type Store struct {
@@ -38,6 +39,7 @@ type Store struct {
 	bucket, prefix string
 	encryption     types.ServerSideEncryption
 	kmsKeyID       string
+	storageClass   string
 }
 
 // FromEnv returns nil for the default local backend. A configured but invalid
@@ -54,6 +56,7 @@ func FromEnv() (*Store, error) {
 			PathStyle:    os.Getenv("ARTEX_ARCHIVE_S3_PATH_STYLE") == "true",
 			SessionToken: os.Getenv("ARTEX_ARCHIVE_S3_SESSION_TOKEN"),
 			SSE:          os.Getenv("ARTEX_ARCHIVE_S3_SSE"), KMSKeyID: os.Getenv("ARTEX_ARCHIVE_S3_KMS_KEY_ID"),
+			StorageClass: os.Getenv("ARTEX_ARCHIVE_S3_STORAGE_CLASS"),
 		})
 	default:
 		return nil, errors.New("ARTEX_ARCHIVE_STORAGE must be local or s3")
@@ -135,7 +138,7 @@ func New(c Config) (*Store, error) {
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 	return &Store{client: client, bucket: c.Bucket, prefix: c.Prefix + "/",
-		encryption: types.ServerSideEncryption(c.SSE), kmsKeyID: c.KMSKeyID}, nil
+		encryption: types.ServerSideEncryption(c.SSE), kmsKeyID: c.KMSKeyID, storageClass: strings.TrimSpace(c.StorageClass)}, nil
 }
 
 func (s *Store) URI(taskID, archiveID int64, checksum string) string {
@@ -159,17 +162,22 @@ func (s *Store) key(uri string) (string, error) {
 
 func (s *Store) Validate(uri string) error { _, err := s.key(uri); return err }
 
-// Upload verifies the entire uploaded object by reading it back, including
-// multipart uploads whose ETag is not a checksum. Callers retain source data
-// until verification succeeds and PostgreSQL commits the remote location.
+// Upload persists the archive and verifies object encryption, size, and SHA-256.
+// For single-part uploads it attaches S3's native SHA-256 checksum header and
+// verifies via HeadObject(ChecksumMode=ENABLED) with zero GET egress when the
+// endpoint returns a full-object checksum; otherwise it falls back to readback.
+// Callers retain source data until verification succeeds and PostgreSQL commits
+// the remote location.
 func (s *Store) Upload(ctx context.Context, uri, filename, checksum string) error {
 	key, err := s.key(uri)
 	if err != nil {
 		return err
 	}
-	if decoded, err := hex.DecodeString(checksum); err != nil || len(decoded) != sha256.Size {
+	decoded, err := hex.DecodeString(checksum)
+	if err != nil || len(decoded) != sha256.Size {
 		return errors.New("invalid archive SHA-256")
 	}
+	b64Checksum := base64.StdEncoding.EncodeToString(decoded)
 	f, err := os.Open(filename)
 	if err != nil {
 		return err
@@ -193,6 +201,13 @@ func (s *Store) Upload(ctx context.Context, uri, filename, checksum string) erro
 	if s.kmsKeyID != "" {
 		input.SSEKMSKeyId = aws.String(s.kmsKeyID)
 	}
+	if s.storageClass != "" {
+		input.StorageClass = types.StorageClass(s.storageClass)
+	}
+	if info.Size() <= 8<<20 {
+		input.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
+		input.ChecksumSHA256 = aws.String(b64Checksum)
+	}
 	result, err := uploader.Upload(ctx, input)
 	if err != nil {
 		uploadErr := fmt.Errorf("upload archive: %w", err)
@@ -209,7 +224,7 @@ func (s *Store) Upload(ctx context.Context, uri, filename, checksum string) erro
 		}
 		return uploadErr
 	}
-	if err := s.readVerified(ctx, key, io.Discard, checksum, info.Size(), true); err != nil {
+	if err := s.verifyUpload(ctx, key, checksum, b64Checksum, info.Size(), true); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		// Versioned buckets require deleting the version just uploaded; an
@@ -225,6 +240,44 @@ func (s *Store) Upload(ctx context.Context, uri, filename, checksum string) erro
 	return nil
 }
 
+func (s *Store) verifyUpload(ctx context.Context, key, checksum, b64Checksum string, expectedSize int64, requireEncryption bool) error {
+	if expectedSize < 0 {
+		return errors.New("invalid archive size")
+	}
+	object, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket:       aws.String(s.bucket),
+		Key:          aws.String(key),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		return fmt.Errorf("inspect archive: %w", err)
+	}
+	if err := s.validateArchiveHead(object, expectedSize, requireEncryption); err != nil {
+		return err
+	}
+	// Composite multipart checksums carry "-<partCount>" and cannot be compared
+	// against the whole-object SHA-256; fall back to streaming readback there.
+	if got := aws.ToString(object.ChecksumSHA256); got != "" && !strings.Contains(got, "-") {
+		if got != b64Checksum {
+			return errors.New("remote archive SHA-256 checksum mismatch; source data retained")
+		}
+		return nil
+	}
+	return s.readVerifiedChunks(ctx, key, io.Discard, checksum, expectedSize, aws.ToString(object.ETag))
+}
+
+func (s *Store) validateArchiveHead(object *s3.HeadObjectOutput, expectedSize int64, requireEncryption bool) error {
+	if requireEncryption && (object.ServerSideEncryption != s.encryption ||
+		(s.encryption == types.ServerSideEncryptionAwsKms && (aws.ToString(object.SSEKMSKeyId) == "" ||
+			(s.kmsKeyID != "" && aws.ToString(object.SSEKMSKeyId) != s.kmsKeyID)))) {
+		return errors.New("remote archive did not confirm the requested server-side encryption; source data retained")
+	}
+	if object.ContentLength == nil || *object.ContentLength != expectedSize || aws.ToString(object.ETag) == "" {
+		return errors.New("remote archive size mismatch or missing ETag; source data retained")
+	}
+	return nil
+}
+
 func (s *Store) readVerified(ctx context.Context, key string, out io.Writer, checksum string, expectedSize int64, requireEncryption bool) error {
 	if decoded, err := hex.DecodeString(checksum); err != nil || len(decoded) != sha256.Size {
 		return errors.New("invalid archive SHA-256")
@@ -236,21 +289,20 @@ func (s *Store) readVerified(ctx context.Context, key string, out io.Writer, che
 	if err != nil {
 		return fmt.Errorf("inspect archive: %w", err)
 	}
-	if requireEncryption && (object.ServerSideEncryption != s.encryption ||
-		(s.encryption == types.ServerSideEncryptionAwsKms && (aws.ToString(object.SSEKMSKeyId) == "" ||
-			(s.kmsKeyID != "" && aws.ToString(object.SSEKMSKeyId) != s.kmsKeyID)))) {
-		return errors.New("remote archive did not confirm the requested server-side encryption; source data retained")
+	if err := s.validateArchiveHead(object, expectedSize, requireEncryption); err != nil {
+		return err
 	}
-	if object.ContentLength == nil || *object.ContentLength != expectedSize || aws.ToString(object.ETag) == "" {
-		return errors.New("remote archive size mismatch or missing ETag; source data retained")
-	}
+	return s.readVerifiedChunks(ctx, key, out, checksum, expectedSize, aws.ToString(object.ETag))
+}
+
+func (s *Store) readVerifiedChunks(ctx context.Context, key string, out io.Writer, checksum string, expectedSize int64, etag string) error {
 	// Commit only complete, validated chunks to the output and hash. A broken
 	// connection can then retry its chunk without duplicating bytes or restarting
 	// a multi-gigabyte read. IfMatch pins every request to the same object.
 	h := sha256.New()
 	for offset := int64(0); offset < expectedSize; {
 		end := offset + min(archiveReadChunkSize, expectedSize-offset) - 1
-		data, err := s.readArchiveChunk(ctx, key, aws.ToString(object.ETag), offset, end, expectedSize)
+		data, err := s.readArchiveChunk(ctx, key, etag, offset, end, expectedSize)
 		if err != nil {
 			return err
 		}

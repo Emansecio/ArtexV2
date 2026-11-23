@@ -214,6 +214,7 @@ const (
 	defaultMicroCompactBatch  = 4
 	defaultMicroKeepRecent    = 4
 	defaultSummaryMaxTokens   = 4096
+	defaultCompactWindowCapK  = 160
 )
 
 func promptCacheEnabled() bool {
@@ -245,7 +246,7 @@ func openAICacheControlEnabled() bool {
 }
 
 func stripOldReasoningEnabled() bool {
-	return isTruthy(os.Getenv("ARTEX_STRIP_OLD_REASONING"))
+	return !isFalsy(os.Getenv("ARTEX_STRIP_OLD_REASONING"))
 }
 
 func maxToolOutputChars() int {
@@ -266,10 +267,13 @@ func maxToolOutputChars() int {
 func compactWindowCapTokens() int {
 	raw := strings.TrimSpace(os.Getenv("ARTEX_COMPACT_WINDOW_CAP_K"))
 	if raw == "" {
-		return 0
+		return defaultCompactWindowCapK * 1000
 	}
 	k, err := strconv.Atoi(raw)
-	if err != nil || k <= 0 {
+	if err != nil {
+		return defaultCompactWindowCapK * 1000
+	}
+	if k <= 0 {
 		return 0
 	}
 	if k < minWindowK {

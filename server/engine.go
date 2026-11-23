@@ -888,6 +888,9 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, name) })
 	}
 	e.startDeadlineCoordinator(ctx, t) // task-level timeout timer (only when timeout>0; deduplicated)
+	if !e.IsPaused(t.ID) && !isTerminalStatus(t.lifecycleSnapshot().Status) {
+		e.kickInitialEnrich(ctx, t)
+	}
 	// Kick the first planning round only when there are no active intents at all
 	// (open+running). For a task with seeded intents: the seed is already open, or the
 	// worker just started above has claimed it as running first — both count as "work
@@ -895,6 +898,29 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	// ⚠️ Do not use Frontier (counts only open): a worker claiming (open→running) races with this check and would kick spuriously. After a restart-driven auto-recovery only running intents may remain — skip then too.
 	if has, _ := t.Store.HasActiveIntent(); !has {
 		t.Notify() // kick the first planning round (acted on once LLM is ready)
+	}
+}
+
+func (e *Engine) kickInitialEnrich(ctx context.Context, t *Task) {
+	if e.m == nil || e.m.enrich == nil || e.m.assets == nil {
+		return
+	}
+	taskID, err := strconv.ParseInt(t.ID, 10, 64)
+	if err != nil || taskID <= 0 {
+		return
+	}
+	assets, err := e.m.assets.QueryByTask(taskID, "", 64, 0)
+	if err != nil || len(assets) == 0 {
+		return
+	}
+	probeCtx := e.plannerGateContext(ctx, t, 0)
+	for _, a := range assets {
+		if a.Domain != "" {
+			e.m.enrich.ResolveDomain(a.ID, a.Domain)
+		}
+		if a.URL != "" {
+			e.m.enrich.ProbeSite(probeCtx, a.ID, a.URL)
+		}
 	}
 }
 
@@ -966,6 +992,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		drain:
 			for {
 				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
 				case <-t.notify:
 				case <-timer.C:
 					break drain
@@ -1567,11 +1596,6 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 }
 
 func (e *Engine) claimNext(t *Task, name string) (*db.Node, string) {
-	fr, _ := t.Store.Frontier(20)
-	for _, in := range fr {
-		if token, _ := t.Store.ClaimIntentToken(in.ID, name); token != "" {
-			return in, token
-		}
-	}
-	return nil, ""
+	n, token, _ := t.Store.ClaimNextIntentToken(name)
+	return n, token
 }

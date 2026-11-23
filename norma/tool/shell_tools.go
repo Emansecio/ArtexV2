@@ -24,7 +24,7 @@ func sessTool(name, desc string, schema map[string]any, readOnly bool, run func(
 	return Build(Spec{
 		Name: name, Description: desc, Schema: schema,
 		ReadOnly:   func(json.RawMessage) bool { return readOnly },
-		Concurrent: func(json.RawMessage) bool { return false },
+		Concurrent: func(json.RawMessage) bool { return readOnly },
 		Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
 			return permission.Allowed()
 		},

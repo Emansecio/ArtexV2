@@ -241,6 +241,19 @@ func NewExecuteExtraTool(reg *Registry, unlock *UnlockSet) CoreTool {
 		Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
 			return permission.Allowed()
 		},
+		Concurrent: func(in json.RawMessage) bool {
+			var args struct {
+				ToolName string          `json:"tool_name"`
+				Params   json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(in, &args) != nil || reg == nil {
+				return false
+			}
+			if t, ok := reg.Get(args.ToolName); ok {
+				return t.IsConcurrencySafe(args.Params)
+			}
+			return false
+		},
 		Run: func(ctx context.Context, in json.RawMessage, tc *ToolContext) (Result, error) {
 			var args struct {
 				ToolName string          `json:"tool_name"`

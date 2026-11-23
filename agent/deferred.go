@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"os"
 
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
@@ -48,4 +49,52 @@ func seedUnlockFromHistory(msgs []llm.Message, unlockSkill func(string)) {
 			}
 		}
 	}
+}
+
+func deferBuiltinToolsEnabled() bool {
+	return !isFalsy(os.Getenv("ARTEX_DEFER_BUILTIN_TOOLS"))
+}
+
+// deferBuiltinTools moves rarely-used built-in tools into the deferred catalog
+// (schemas withheld until discovered via SearchExtraTools / invoked via ExecuteExtraTool)
+// while keeping them registered in Tools and unlocked in def.Unlock.
+func deferBuiltinTools(tools []actool.CoreTool, def DeferredInfo, names []string) DeferredInfo {
+	if !deferBuiltinToolsEnabled() || len(names) == 0 {
+		return def
+	}
+	present := make(map[string]bool, len(tools)+4)
+	for _, t := range tools {
+		present[t.Name()] = true
+	}
+	// Background task tools are appended inside agentcore.NewSession unless disabled.
+	if !actool.BackgroundTasksDisabled() {
+		for _, bg := range []string{"Monitor", "TaskList", "TaskStop", "TaskOutput"} {
+			present[bg] = true
+		}
+	}
+	deferred := make(map[string]bool, len(def.Deferred))
+	for _, n := range def.Deferred {
+		deferred[n] = true
+	}
+	global := make(map[string]bool, len(def.GlobalNames))
+	for _, n := range def.GlobalNames {
+		global[n] = true
+	}
+	for _, name := range names {
+		if !present[name] {
+			continue
+		}
+		if !deferred[name] {
+			def.Deferred = append(def.Deferred, name)
+			deferred[name] = true
+		}
+		if !global[name] {
+			def.GlobalNames = append(def.GlobalNames, name)
+			global[name] = true
+		}
+		if def.Unlock != nil {
+			def.Unlock.Add(name)
+		}
+	}
+	return def
 }

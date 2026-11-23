@@ -27,13 +27,16 @@ func acceptsRawInput(t tool.CoreTool) bool {
 // executor's goroutines (read-only access to loop config; permission/hook
 // callbacks are the host's responsibility to make safe).
 func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo)) (llm.ContentBlock, []llm.Message) {
-	return l.execOneWithCtx(l.toolCtx, use, emitProgress)
+	return l.execOneWithCtx(l.toolCtx, use, l.settling, emitProgress)
 }
 
-func (l *loop) execOneWithCtx(toolCtx context.Context, use llm.ContentBlock, emitProgress func(tool.ProgressInfo)) (llm.ContentBlock, []llm.Message) {
+func (l *loop) execOneWithCtx(toolCtx context.Context, use llm.ContentBlock, settling bool, emitProgress func(tool.ProgressInfo)) (llm.ContentBlock, []llm.Message) {
 	t, ok := l.in.Tools.Get(use.Name)
 	if !ok {
 		return llm.ToolResultText(use.ID, fmt.Sprintf("Error: unknown tool %q", use.Name), true), nil
+	}
+	if l.isDisabledDuringSettlement(settling, use.Name) {
+		return llm.ToolResultText(use.ID, fmt.Sprintf("Error: tool %q is disabled during wrap-up; persist findings and summarize without calling it.", use.Name), true), nil
 	}
 	input := use.Input
 

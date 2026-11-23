@@ -10,8 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -20,7 +22,11 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-const mcpToolsCacheTTL = 5 * time.Minute
+const (
+	mcpToolsCacheTTL   = 5 * time.Minute
+	defaultMCPIdleTTL  = 10 * time.Minute
+	mcpReapMaxInterval = 2 * time.Minute
+)
 
 type pooledMCPEntry struct {
 	id          int64
@@ -28,6 +34,28 @@ type pooledMCPEntry struct {
 	client      mcpClient
 	tools       []actool.CoreTool
 	toolsAt     time.Time
+	lastUsed    atomic.Int64
+}
+
+func (e *pooledMCPEntry) touch() {
+	if e != nil {
+		e.lastUsed.Store(time.Now().UnixNano())
+	}
+}
+
+func mcpIdleTTL() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("ARTEX_MCP_IDLE_TTL_MIN"))
+	if raw == "" {
+		return defaultMCPIdleTTL
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultMCPIdleTTL
+	}
+	if n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Minute
 }
 
 // mcpPool keeps connected MCP clients (stdio subprocesses and HTTP/SSE clients)
@@ -44,9 +72,52 @@ func newMCPPool(ctx context.Context) *mcpPool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return &mcpPool{
+	p := &mcpPool{
 		ctx:     ctx,
 		entries: map[int64]*pooledMCPEntry{},
+	}
+	if ttl := mcpIdleTTL(); ttl > 0 {
+		interval := ttl
+		if interval > mcpReapMaxInterval {
+			interval = mcpReapMaxInterval
+		}
+		go p.reapLoop(interval, ttl)
+	}
+	return p
+}
+
+func (p *mcpPool) reapLoop(interval, ttl time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			p.reapIdle(ttl)
+		}
+	}
+}
+
+func (p *mcpPool) reapIdle(ttl time.Duration) {
+	cutoff := time.Now().Add(-ttl).UnixNano()
+	var stale []*pooledMCPEntry
+	p.mu.Lock()
+	for id, ent := range p.entries {
+		if ent == nil {
+			delete(p.entries, id)
+			continue
+		}
+		if last := ent.lastUsed.Load(); last > 0 && last < cutoff {
+			stale = append(stale, ent)
+			delete(p.entries, id)
+		}
+	}
+	p.mu.Unlock()
+	for _, ent := range stale {
+		if ent.client != nil {
+			_ = ent.client.Close()
+		}
 	}
 }
 
@@ -79,6 +150,7 @@ func (p *mcpPool) Acquire(ctx context.Context, m *db.MCPServer, priv ExecPrivile
 	p.mu.Lock()
 	ent := p.entries[m.ID]
 	if ent != nil && ent.fingerprint == fp && time.Since(ent.toolsAt) < mcpToolsCacheTTL {
+		ent.touch()
 		wrapped := wrapPooledTools(p, m.ID, ent, ent.tools)
 		p.mu.Unlock()
 		return wrapped, nil
@@ -134,6 +206,7 @@ func (p *mcpPool) Acquire(ctx context.Context, m *db.MCPServer, priv ExecPrivile
 			tools:       ts,
 			toolsAt:     time.Now(),
 		}
+		next.touch()
 		p.mu.Lock()
 		old := p.entries[m.ID]
 		p.entries[m.ID] = next
@@ -205,6 +278,7 @@ type pooledMCPTool struct {
 }
 
 func (t pooledMCPTool) Call(ctx context.Context, input json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
+	t.ent.touch()
 	res, err := t.CoreTool.Call(ctx, input, tc)
 	if err != nil {
 		t.pool.evictIfMatch(t.id, t.ent)

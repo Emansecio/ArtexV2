@@ -100,6 +100,7 @@ type Worker struct {
 	lessonsBlock string
 	lessonsNonce string
 	summaryProv  llm.Provider
+	probeCache   *TaskProbeCache
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -171,6 +172,9 @@ func (w *Worker) SetLessonsNonce(nonce string) { w.lessonsNonce = nonce }
 // summarization. nil falls back to the worker's primary provider.
 func (w *Worker) SetSummaryProvider(p llm.Provider) { w.summaryProv = p }
 
+// SetProbeCache configures an optional shared task-scoped WebFetch cache.
+func (w *Worker) SetProbeCache(c *TaskProbeCache) { w.probeCache = c }
+
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (w *Worker) wantConstraints() bool { return w.injectConstraints == nil || w.injectConstraints() }
 
@@ -190,21 +194,47 @@ func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, w
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
 }
 
-// defaultToolsExcept returns defaultTools(base) minus the named tools (by
-// CoreTool.Name()). Used to trim SDK default tools an agent shouldn't have.
-func defaultToolsExcept(base string, exclude ...string) []actool.CoreTool {
-	drop := make(map[string]bool, len(exclude))
-	for _, n := range exclude {
-		drop[n] = true
+// filterDefaultTools returns defaultTools(base) matching keep (keep=true keeps only
+// names; keep=false excludes names).
+func filterDefaultTools(base string, keep bool, names ...string) []actool.CoreTool {
+	set := make(map[string]bool, len(names))
+	for _, n := range names {
+		set[n] = true
 	}
 	all := defaultTools(base)
 	out := make([]actool.CoreTool, 0, len(all))
 	for _, t := range all {
-		if !drop[t.Name()] {
+		if set[t.Name()] == keep {
 			out = append(out, t)
 		}
 	}
 	return out
+}
+
+// defaultToolsExcept returns defaultTools(base) minus the named tools (by
+// CoreTool.Name()). Used to trim SDK default tools an agent shouldn't have.
+func defaultToolsExcept(base string, exclude ...string) []actool.CoreTool {
+	return filterDefaultTools(base, false, exclude...)
+}
+
+// defaultToolsOnly returns only the named tools from defaultTools(base).
+func defaultToolsOnly(base string, allow ...string) []actool.CoreTool {
+	return filterDefaultTools(base, true, allow...)
+}
+
+var workerDeferredBuiltins = []string{
+	"ingest_bbot",
+	"ingest_scan_output",
+	"record_coverage",
+	"save_task_credential",
+	"list_task_credentials",
+	"traffic_blob",
+	"traffic_messages",
+	"Monitor",
+	"TaskList",
+	"TaskStop",
+	"TaskOutput",
+	"sleep",
 }
 
 func (w *Worker) SetCompactionWindowResolver(fn func() int) { w.windowFn = fn }
@@ -614,6 +644,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
 	tools, def, cleanup := AugmentTools(WithToolQuery(ctx, nodeSummary(intent)), "worker", base)
 	defer cleanup()
+	def = deferBuiltinTools(tools, def, workerDeferredBuiltins)
 
 	// The intent is the worker's [sole duty, an invariant across the whole run] → it
 	// goes into the system prompt together with the launch instruction and the raw
@@ -678,7 +709,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
 		PromptCacheKey:  fmt.Sprintf("artex-task-%d-worker", taskID),
-		Tools:           withWebFetch(ctx, tools, w.proxyAddr, w.proxyCACert),
+		Tools:           wrapCachedWebFetch(withWebFetch(ctx, tools, w.proxyAddr, w.proxyCACert), w.probeCache),
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,

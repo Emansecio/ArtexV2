@@ -53,6 +53,7 @@ func NewBash() CoreTool {
 			"properties": props,
 			"required":   []any{"command"},
 		},
+		Concurrent:  bashConcurrencySafe,
 		Permissions: bashPermissions,
 		Run:         runBash,
 	})
@@ -129,12 +130,12 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 			if strings.TrimSpace(output) == "" {
 				output = "(no output)"
 			}
-			return Errorf(fmt.Sprintf("%s\n\n[exit code %d]", Capture(tc, output), info.ExitCode)), nil
+			return Errorf(fmt.Sprintf("%s\n\n[exit code %d]", Capture(tc, CollapseRepeatedLines(output)), info.ExitCode)), nil
 		}
 		if strings.TrimSpace(output) == "" {
 			output = "(command produced no output)"
 		}
-		return Text(Capture(tc, output)), nil
+		return Text(Capture(tc, CollapseRepeatedLines(output))), nil
 	}
 
 	// Timed out while still running.
@@ -147,7 +148,7 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 	out, _ := tc.Tasks.Output(t.ID, 0)
 	tc.Tasks.Kill(t.ID)
 	tc.Tasks.Forget(t.ID)
-	return Errorf(Capture(tc, out) + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
+	return Errorf(Capture(tc, CollapseRepeatedLines(out)) + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
 }
 
 // runBashSync is the original blocking implementation, used when no task manager
@@ -169,7 +170,7 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 	cmd.Stderr = &buf
 	err := cmd.Run()
 
-	out := Capture(tc, buf.String())
+	out := Capture(tc, CollapseRepeatedLines(buf.String()))
 	if cctx.Err() == context.DeadlineExceeded {
 		return Errorf(out + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
 	}
@@ -203,6 +204,203 @@ func autoBackgroundAllowed(command string) bool {
 	for _, d := range disallowedAutoBackground {
 		if base == d {
 			return false
+		}
+	}
+	return true
+}
+
+// bashConcurrencySafe reports whether a Bash call is strictly single-line
+// read-only (no shell control operators/redirections/subshells and every pipe
+// stage is a whitelisted read-only command), safe to execute concurrently.
+func bashConcurrencySafe(input json.RawMessage) bool {
+	var in struct {
+		Command         string `json:"command"`
+		RunInBackground bool   `json:"run_in_background"`
+	}
+	if json.Unmarshal(input, &in) != nil || in.RunInBackground {
+		return false
+	}
+	cmd := strings.TrimSpace(in.Command)
+	if cmd == "" || strings.ContainsAny(cmd, "\n\r><;&`") || strings.Contains(cmd, "$(") {
+		return false
+	}
+	stages, ok := splitUnquotedPipes(cmd)
+	if !ok || len(stages) == 0 {
+		return false
+	}
+	for _, st := range stages {
+		words, ok := splitShellWords(st)
+		if !ok || len(words) == 0 || !isReadOnlyStage(words) {
+			return false
+		}
+	}
+	return true
+}
+
+func splitUnquotedPipes(s string) ([]string, bool) {
+	var stages []string
+	var quote byte
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == '\\' && quote == '"' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			quote = c
+			continue
+		}
+		if c == '|' {
+			part := strings.TrimSpace(s[start:i])
+			if part == "" {
+				return nil, false
+			}
+			stages = append(stages, part)
+			start = i + 1
+		}
+	}
+	if quote != 0 {
+		return nil, false
+	}
+	last := strings.TrimSpace(s[start:])
+	if last == "" {
+		return nil, false
+	}
+	return append(stages, last), true
+}
+
+func splitShellWords(s string) ([]string, bool) {
+	var words []string
+	var cur strings.Builder
+	var quote byte
+	inTok := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == '\\' && quote == '"' && i+1 < len(s) {
+				i++
+				cur.WriteByte(s[i])
+				continue
+			}
+			if c == quote {
+				quote = 0
+				continue
+			}
+			cur.WriteByte(c)
+			continue
+		}
+		if c == '\'' || c == '"' {
+			quote = c
+			inTok = true
+			continue
+		}
+		if c == '\\' && i+1 < len(s) {
+			i++
+			cur.WriteByte(s[i])
+			inTok = true
+			continue
+		}
+		if c == ' ' || c == '\t' {
+			if inTok {
+				words = append(words, cur.String())
+				cur.Reset()
+				inTok = false
+			}
+			continue
+		}
+		cur.WriteByte(c)
+		inTok = true
+	}
+	if quote != 0 {
+		return nil, false
+	}
+	if inTok {
+		words = append(words, cur.String())
+	}
+	return words, true
+}
+
+func isReadOnlyStage(words []string) bool {
+	base := words[0]
+	if strings.HasPrefix(base, "$") || strings.Contains(base, "=") {
+		return false
+	}
+	if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
+		base = base[i+1:]
+	}
+	switch base {
+	case "dig", "nslookup", "host", "whois", "grep", "rg", "head", "tail",
+		"cat", "wc", "jq", "ls", "stat", "file", "uname", "id", "whoami", "pwd",
+		"sort", "uniq", "cut":
+		return true
+	case "awk":
+		for _, a := range words[1:] {
+			if a == "-i" || strings.HasPrefix(a, "-i") && strings.Contains(a, "inplace") {
+				return false
+			}
+		}
+		return true
+	case "sed":
+		for _, a := range words[1:] {
+			if a == "-i" || strings.HasPrefix(a, "-i") || strings.HasPrefix(a, "--in-place") {
+				return false
+			}
+		}
+		return true
+	case "openssl":
+		return len(words) > 1 && (words[1] == "s_client" || words[1] == "x509")
+	case "curl":
+		return isReadOnlyCurl(words[1:])
+	default:
+		return false
+	}
+}
+
+func isReadOnlyCurl(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch a {
+		case "-o", "-O", "--output", "-d", "--data", "--data-raw", "--data-binary",
+			"--data-urlencode", "--json", "-F", "--form", "-T", "--upload-file",
+			"-D", "--dump-header", "--trace", "--trace-ascii", "-K", "--config":
+			return false
+		case "-X", "--request":
+			if i+1 >= len(args) {
+				return false
+			}
+			i++
+			switch strings.ToUpper(args[i]) {
+			case "GET", "HEAD", "OPTIONS":
+			default:
+				return false
+			}
+		default:
+			for _, pfx := range []string{"-o", "--output=", "-d", "--data=", "--data-raw=", "--data-binary=", "--json=", "-F", "--form=", "-T", "--upload-file=", "-D", "--dump-header="} {
+				if strings.HasPrefix(a, pfx) {
+					return false
+				}
+			}
+			if strings.HasPrefix(a, "-X") && len(a) > 2 {
+				switch strings.ToUpper(a[2:]) {
+				case "GET", "HEAD", "OPTIONS":
+				default:
+					return false
+				}
+			}
+			if strings.HasPrefix(a, "--request=") {
+				switch strings.ToUpper(strings.TrimPrefix(a, "--request=")) {
+				case "GET", "HEAD", "OPTIONS":
+				default:
+					return false
+				}
+			}
 		}
 	}
 	return true

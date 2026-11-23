@@ -876,6 +876,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	window := workerRuntime.CompactionWindow()
 	lessonsNonce := agent.NewTaskNonce()
 	summaryProv, summaryModel, hasSummary := agent.SummaryProviderFromEnv()
+	probeCache := agent.NewTaskProbeCache()
 
 	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns("worker"))
 	wk.SetFindingRecorder(s.evidenceStore())
@@ -888,6 +889,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // operation-constraint injection into the worker (configurable, on by default)
 	wk.SetLessonsNonce(lessonsNonce)
+	wk.SetProbeCache(probeCache)
 	if hasSummary {
 		wk.SetSummaryProvider(summaryProv)
 	}
@@ -899,6 +901,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // experimental: noa context compaction (platform-level switch, read every run)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
+	pl.SetOnIntentCreated(t.WakeWorkers)
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // operation-constraint injection into the planner (configurable, on by default)

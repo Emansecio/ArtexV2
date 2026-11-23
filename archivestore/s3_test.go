@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -416,5 +417,86 @@ func TestS3MultipartFailureAbortsUpload(t *testing.T) {
 	}
 	if info, err := os.Stat(filename); err != nil || info.Size() != int64(len(data)) {
 		t.Fatal("source was not retained", err)
+	}
+}
+
+func TestS3UploadVerifiedByNativeChecksumZeroGets(t *testing.T) {
+	data := []byte("native checksum archive payload")
+	sum := sha256.Sum256(data)
+	checksum := hex.EncodeToString(sum[:])
+	b64Checksum := base64.StdEncoding.EncodeToString(sum[:])
+
+	for _, tc := range []struct {
+		name         string
+		headChecksum string
+		wantErr      bool
+	}{
+		{name: "valid", headChecksum: b64Checksum, wantErr: false},
+		{name: "mismatch", headChecksum: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xaa}, sha256.Size)), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gets, deletes atomic.Int32
+			var sawPutChecksum, sawHeadChecksumMode, sawStorageClass atomic.Bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"native-etag"`)
+				switch r.Method {
+				case "PUT":
+					if r.Header.Get("X-Amz-Checksum-Sha256") == b64Checksum {
+						sawPutChecksum.Store(true)
+					}
+					if r.Header.Get("X-Amz-Storage-Class") == "STANDARD_IA" {
+						sawStorageClass.Store(true)
+					}
+					_, _ = io.Copy(io.Discard, r.Body)
+				case "HEAD":
+					if strings.EqualFold(r.Header.Get("X-Amz-Checksum-Mode"), "ENABLED") {
+						sawHeadChecksumMode.Store(true)
+						w.Header().Set("X-Amz-Checksum-Sha256", tc.headChecksum)
+					}
+					w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
+					w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				case "GET":
+					gets.Add(1)
+					w.WriteHeader(500)
+				case "DELETE":
+					deletes.Add(1)
+					w.WriteHeader(204)
+				default:
+					t.Errorf("unexpected method %s", r.Method)
+					w.WriteHeader(400)
+				}
+			}))
+			defer srv.Close()
+
+			store, err := New(Config{
+				Endpoint: srv.URL, Bucket: "test-bucket", Prefix: "test/tasks",
+				AccessKey: "test", SecretKey: "test", PathStyle: true, StorageClass: "STANDARD_IA",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			filename := filepath.Join(t.TempDir(), "archive.tar.zst")
+			if err := os.WriteFile(filename, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			err = store.Upload(context.Background(), store.URI(1, 2, checksum), filename, checksum)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "SHA-256") {
+					t.Fatalf("expected SHA-256 mismatch error, got %v", err)
+				}
+				if deletes.Load() != 1 {
+					t.Fatalf("expected unverified upload deletion, deletes=%d", deletes.Load())
+				}
+			} else if err != nil {
+				t.Fatalf("Upload: %v", err)
+			}
+			if gets.Load() != 0 {
+				t.Fatalf("expected zero GET readbacks when native checksum is verified, got %d", gets.Load())
+			}
+			if !sawPutChecksum.Load() || !sawHeadChecksumMode.Load() || !sawStorageClass.Load() {
+				t.Fatalf("missing S3 headers: putChecksum=%v headMode=%v storageClass=%v",
+					sawPutChecksum.Load(), sawHeadChecksumMode.Load(), sawStorageClass.Load())
+			}
+		})
 	}
 }

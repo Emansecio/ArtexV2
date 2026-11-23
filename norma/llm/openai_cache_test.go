@@ -153,3 +153,82 @@ func TestOpenAIResponsesCacheKeyAndRetention(t *testing.T) {
 		t.Fatalf("cache fields should be omitted when disabled: %s", rawOff)
 	}
 }
+
+func TestStripOldReasoningAcrossToolLoop(t *testing.T) {
+	msgs := []Message{
+		UserText("single initial user prompt"),
+		{Role: RoleAssistant, Content: []ContentBlock{
+			{Type: BlockThinking, Thinking: "step 1 huge reasoning"},
+			{Type: BlockToolUse, ID: "c1", Name: "Bash", Input: []byte(`{"command":"echo 1"}`)},
+		}},
+		{Role: RoleUser, Content: []ContentBlock{ToolResultText("c1", "1", false)}},
+		{Role: RoleAssistant, Content: []ContentBlock{
+			{Type: BlockThinking, Thinking: "step 2 huge reasoning"},
+			{Type: BlockToolUse, ID: "c2", Name: "Bash", Input: []byte(`{"command":"echo 2"}`)},
+		}},
+		{Role: RoleUser, Content: []ContentBlock{ToolResultText("c2", "2", false)}},
+		{Role: RoleAssistant, Content: []ContentBlock{
+			{Type: BlockThinking, Thinking: "step 3 active reasoning"},
+			{Type: BlockToolUse, ID: "c3", Name: "Bash", Input: []byte(`{"command":"echo 3"}`)},
+		}},
+		{Role: RoleUser, Content: []ContentBlock{ToolResultText("c3", "3", false)}},
+	}
+
+	p := &openaiProvider{cfg: Config{
+		Format:            FormatOpenAI,
+		Model:             "deepseek-reasoner",
+		ThinkingType:      "enabled",
+		StripOldReasoning: true,
+	}}
+	raw, err := p.buildBody(CompletionRequest{Messages: msgs}, false)
+	if err != nil {
+		t.Fatalf("buildBody: %v", err)
+	}
+	s := string(raw)
+	if strings.Contains(s, "step 1 huge reasoning") || strings.Contains(s, "step 2 huge reasoning") {
+		t.Fatalf("old reasoning inside tool loop should be stripped: %s", s)
+	}
+	if !strings.Contains(s, "step 3 active reasoning") {
+		t.Fatalf("latest assistant turn reasoning should be preserved: %s", s)
+	}
+	if !strings.Contains(s, reasoningElidedPlaceholder) {
+		t.Fatalf("strict thinking tool_calls should carry elided placeholder: %s", s)
+	}
+}
+
+func TestPerRequestReasoningEffortOverride(t *testing.T) {
+	req := CompletionRequest{Messages: []Message{UserText("hi")}, ReasoningEffort: "low"}
+
+	ap := &anthropicProvider{cfg: Config{Format: FormatAnthropic, Model: "claude-sonnet-4", ThinkingType: "enabled", ReasoningEffort: "high"}}
+	rawA, err := ap.buildBody(req, false)
+	if err != nil {
+		t.Fatalf("anthropic buildBody: %v", err)
+	}
+	var docA map[string]any
+	_ = json.Unmarshal(rawA, &docA)
+	if oc, _ := docA["output_config"].(map[string]any); oc["effort"] != "low" {
+		t.Fatalf("anthropic effort=%v, want low", docA["output_config"])
+	}
+
+	op := &openaiProvider{cfg: Config{Format: FormatOpenAI, Model: "gpt-5", ReasoningEffort: "high"}}
+	rawO, err := op.buildBody(req, false)
+	if err != nil {
+		t.Fatalf("openai buildBody: %v", err)
+	}
+	var docO map[string]any
+	_ = json.Unmarshal(rawO, &docO)
+	if docO["reasoning_effort"] != "low" {
+		t.Fatalf("openai reasoning_effort=%v, want low", docO["reasoning_effort"])
+	}
+
+	rp := &openaiResponsesProvider{cfg: Config{Format: FormatOpenAIResponses, Model: "gpt-5", ReasoningEffort: "high"}}
+	rawR, err := rp.buildBody(req, false)
+	if err != nil {
+		t.Fatalf("responses buildBody: %v", err)
+	}
+	var docR map[string]any
+	_ = json.Unmarshal(rawR, &docR)
+	if r, _ := docR["reasoning"].(map[string]any); r["effort"] != "low" {
+		t.Fatalf("responses reasoning=%v, want low", docR["reasoning"])
+	}
+}

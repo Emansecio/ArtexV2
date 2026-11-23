@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -201,8 +202,12 @@ type ToolSet struct {
 	// overview. origin is the ToolSet's worker (human, orchestrator, or an agent name).
 	// Wired for the main agent + cross-task orchestration; nil elsewhere → falls back
 	// to the bare notify.
-	notifyHint func(origin string, texts []string)
+	notifyHint      func(origin string, texts []string)
+	onIntentCreated func()
 }
+
+// SetOnIntentCreated wires a worker-wake callback fired as soon as add_intent writes open intents.
+func (t *ToolSet) SetOnIntentCreated(fn func()) { t.onIntentCreated = fn }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
 // by the main-agent chat, so runtime-added goals are announced to the planner by name.
@@ -737,8 +742,19 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	}
 
 	if cacheKey != "" && len(related) == 0 {
+		now := time.Now()
 		overviewCache.mu.Lock()
-		overviewCache.m[cacheKey] = overviewCacheEntry{fp: fp, data: maps.Clone(out), createdAt: time.Now()}
+		if len(overviewCache.m) >= 128 {
+			for k, ent := range overviewCache.m {
+				if now.Sub(ent.createdAt) >= 1500*time.Millisecond {
+					delete(overviewCache.m, k)
+				}
+			}
+			if len(overviewCache.m) >= 128 {
+				clear(overviewCache.m)
+			}
+		}
+		overviewCache.m[cacheKey] = overviewCacheEntry{fp: fp, data: maps.Clone(out), createdAt: now}
 		overviewCache.mu.Unlock()
 	}
 	return out
@@ -751,7 +767,7 @@ func inheritedMap(m map[string]any, sourceTaskID int64) map[string]any {
 }
 
 const (
-	relatedOverviewTotalTextRunes      = 48_000
+	relatedOverviewTotalTextRunes      = 12_000
 	relatedOverviewMaxTextPerSource    = 8_000
 	relatedOverviewMaxGoalsPerSource   = 8
 	relatedOverviewMaxHintsPerSource   = 6
@@ -770,6 +786,18 @@ type overviewTextBudget struct {
 	truncated bool
 }
 
+func relatedOverviewTotalRunes() int {
+	raw := strings.TrimSpace(os.Getenv("ARTEX_RELATED_TASKS_BUDGET_RUNES"))
+	if raw == "" {
+		return relatedOverviewTotalTextRunes
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return relatedOverviewTotalTextRunes
+	}
+	return n
+}
+
 func relatedOverviewBudgetForSources(sourceCount int) int {
 	if sourceCount <= 0 {
 		return 0
@@ -777,7 +805,7 @@ func relatedOverviewBudgetForSources(sourceCount int) int {
 	if sourceCount > db.MaxTaskSourceCount {
 		sourceCount = db.MaxTaskSourceCount
 	}
-	perSource := relatedOverviewTotalTextRunes / sourceCount
+	perSource := relatedOverviewTotalRunes() / sourceCount
 	if perSource > relatedOverviewMaxTextPerSource {
 		perSource = relatedOverviewMaxTextPerSource
 	}
@@ -1342,6 +1370,9 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			// so it won't be misjudged as drained on revival.
 			if createdAny && t.resumeTask != nil {
 				t.resumeTask()
+			}
+			if createdAny && t.onIntentCreated != nil {
+				t.onIntentCreated()
 			}
 
 			if !batch { // single: keep the original return

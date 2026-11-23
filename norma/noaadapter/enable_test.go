@@ -58,6 +58,33 @@ func TestEnableAttachesAllThreePieces(t *testing.T) {
 	}
 }
 
+func TestEnablePreservesStaticDynamicSplit(t *testing.T) {
+	opts := agentcore.Options{
+		SystemPrompt:    []string{"static-prefix", "dynamic-tail"},
+		DynamicBoundary: 1,
+		Tools:           []tool.CoreTool{},
+		Compaction:      &compaction.Config{ContextWindow: 200000},
+	}
+	if err := Enable(&opts, Options{ArchiveBaseDir: t.TempDir(), SessionID: "s-split"}); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	if opts.DynamicBoundary != 2 {
+		t.Fatalf("DynamicBoundary = %d, want 2", opts.DynamicBoundary)
+	}
+	if len(opts.SystemPrompt) != 3 {
+		t.Fatalf("len(SystemPrompt) = %d, want 3", len(opts.SystemPrompt))
+	}
+	if opts.SystemPrompt[0] != "static-prefix" {
+		t.Fatalf("SystemPrompt[0] = %q", opts.SystemPrompt[0])
+	}
+	if !strings.Contains(opts.SystemPrompt[1], noa.SystemPromptHeader) {
+		t.Fatalf("SystemPrompt[1] missing NOA header: %q", opts.SystemPrompt[1])
+	}
+	if opts.SystemPrompt[2] != "dynamic-tail" {
+		t.Fatalf("SystemPrompt[2] = %q, want dynamic-tail after boundary", opts.SystemPrompt[2])
+	}
+}
+
 // Not calling Enable is the off switch: Options must be untouched.
 func TestNotEnablingLeavesOptionsUntouched(t *testing.T) {
 	opts := baseOptions()

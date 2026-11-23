@@ -135,3 +135,79 @@ func TestSpeculativeHedgingPicksFasterBackupAndCancelsSlowPrimary(t *testing.T) 
 		t.Fatal(fmt.Sprintf("expected slow primary context to be cancelled, count=%d", slowPrimary.cancelled.Load()))
 	}
 }
+
+func TestPromptCacheKeyStickyAffinityAndFailover(t *testing.T) {
+	reg := NewRegistry(nil, nil)
+	// Even when member 3 has >500ms lower EWMA TTFT, sticky PromptCacheKey must
+	// not ping-pong healthy sessions off their assigned profile.
+	reg.RecordTTFT(2, 2*time.Second)
+	reg.RecordTTFT(3, 50*time.Millisecond)
+
+	p := New([]*Member{
+		member(2, "m2", 5, okProv("m2", "M2")),
+		member(3, "m3", 5, okProv("m3", "M3")),
+		member(4, "m4", 5, okProv("m4", "M4")),
+	}, reg)
+
+	req := llm.CompletionRequest{PromptCacheKey: "artex-task-99-worker"}
+	first, err := drain(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("first call err=%v", err)
+	}
+	for i := 0; i < 8; i++ {
+		got, err := drain(p.Stream(context.Background(), req))
+		if err != nil {
+			t.Fatalf("call %d err=%v", i, err)
+		}
+		if got != first {
+			t.Fatalf("call %d drifted from %q to %q", i, first, got)
+		}
+	}
+
+	// Open the sticky member's circuit breaker and confirm failover moves cleanly.
+	var stickyID int64 = 2
+	if first == "M3" {
+		stickyID = 3
+	} else if first == "M4" {
+		stickyID = 4
+	}
+	reg.Restore(stickyID, State{Trips: 1, OpenUntil: time.Now().Add(time.Minute)})
+	fallback, err := drain(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("fallback err=%v", err)
+	}
+	if fallback == first {
+		t.Fatalf("expected failover away from tripped member %q", first)
+	}
+}
+
+func TestThinkingSkipsSpeculativeHedge(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		memberThink   bool
+		reqThinking   string
+		wantBackupHit int32
+	}{
+		{name: "member_thinking", memberThink: true, wantBackupHit: 0},
+		{name: "request_thinking_enabled", reqThinking: "enabled", wantBackupHit: 0},
+		{name: "request_thinking_disabled_overrides_member", memberThink: true, reqThinking: "disabled", wantBackupHit: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			slowPrimary := &slowProv{text: "PRIMARY", delay: 60 * time.Millisecond}
+			fastBackup := &slowProv{text: "BACKUP", delay: 5 * time.Millisecond}
+			m0 := member(1, "primary", 10, slowPrimary)
+			m0.Thinking = tc.memberThink
+			m1 := member(2, "backup", 5, fastBackup)
+			p := New([]*Member{m0, m1}, NewRegistry(nil, nil))
+			p.SetHedgeDelay(15 * time.Millisecond)
+
+			got, err := drain(p.Stream(context.Background(), llm.CompletionRequest{Thinking: tc.reqThinking}))
+			if err != nil {
+				t.Fatalf("Stream err=%v", err)
+			}
+			if fastBackup.calls.Load() != tc.wantBackupHit {
+				t.Fatalf("backup calls=%d, want %d (got=%q)", fastBackup.calls.Load(), tc.wantBackupHit, got)
+			}
+		})
+	}
+}

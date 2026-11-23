@@ -67,7 +67,7 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 	if _, err := tx.Exec(`DELETE FROM intercept_pending WHERE COALESCE(task_id,'')=$1`, strconv.FormatInt(taskID, 10)); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'')=$1`, strconv.FormatInt(taskID, 10)); err != nil {
+	if _, err := tx.Exec(`DELETE FROM llm_records WHERE task_id=$1`, strconv.FormatInt(taskID, 10)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM llm_usage WHERE COALESCE(task_id,'')=$1 OR exploration_id=$2`, strconv.FormatInt(taskID, 10), expID); err != nil {
@@ -100,7 +100,7 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 			return err
 		}
 	}
-	if _, err := tx.Exec(`UPDATE assets SET task_ids=array_remove(task_ids,$1) WHERE $1=ANY(task_ids)`, taskID); err != nil {
+	if _, err := tx.Exec(`UPDATE assets SET task_ids=array_remove(task_ids,$1) WHERE task_ids @> ARRAY[$1]::bigint[]`, taskID); err != nil {
 		return err
 	}
 	if len(snapshot.ExclusiveAssetIDs) > 0 {

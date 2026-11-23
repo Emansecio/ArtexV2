@@ -189,10 +189,9 @@ export default function DashboardPage() {
       if (loading) return;
       loading = true;
       try {
-        const [findings, stats, settings, pending, activity, tokens, conversationTokens] = await Promise.all([
+        const [findings, stats, pending, activity, tokens, conversationTokens] = await Promise.all([
           api.findings(),
           api.stats(),
-          api.settings(),
           api.interceptPending(),
           api.activity(undefined, { limit: 30 }),
           api.tokenStats(),
@@ -201,7 +200,6 @@ export default function DashboardPage() {
         if (!alive) return;
         setFindings(findings);
         setStats(stats);
-        setSettings(settings);
         setPending(pending);
         setActivity(activity.items);
         setTokens(tokens.total ?? null);
@@ -220,29 +218,47 @@ export default function DashboardPage() {
     };
   }, []);
 
-  // slow poll: traffic, assets, system-static (every 15s)
+  // Static / slow-changing configuration loaded once on mount (no polling loop).
   React.useEffect(() => {
     let alive = true;
-    const load = async () => {
-      try {
-        const [traf, counts, agentList, mcpList, skillList, toolList, profileList, usage] = await Promise.all([
-          api.traffic(0, 50),
-          api.assetCounts(),
-          api.agents(),
-          api.mcpServers(),
-          api.skills(),
-          api.tools(),
-          api.llmProfiles(),
-          api.usageStats(365),
-        ]);
+    void Promise.all([
+      api.settings(),
+      api.agents(),
+      api.mcpServers(),
+      api.skills(),
+      api.tools(),
+      api.llmProfiles(),
+    ])
+      .then(([settings, agentList, mcpList, skillList, toolList, profileList]) => {
         if (!alive) return;
-        setTraffic(traf.exchanges ?? []);
-        setAssetCounts(counts ?? {});
+        setSettings(settings);
         setAgents(agentList);
         setMcpServers(mcpList);
         setSkills(skillList);
         setTools(toolList);
         setLLMProfiles(profileList);
+      })
+      .catch(() => {
+        /* non-critical static metadata */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // slow poll: live traffic, asset counts, usage (every 15s)
+  React.useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const [traf, counts, usage] = await Promise.all([
+          api.traffic(0, 50),
+          api.assetCounts(),
+          api.usageStats(365),
+        ]);
+        if (!alive) return;
+        setTraffic(traf.exchanges ?? []);
+        setAssetCounts(counts ?? {});
         setUsageStats(usage);
       } catch {
         /* transient errors */

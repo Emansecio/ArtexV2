@@ -30,6 +30,7 @@ func (t *Traffic) ReadEvidence(ctx context.Context, ids []string, consume func(E
 	if t == nil {
 		return errors.New("traffic recording store unavailable")
 	}
+	t.flushPending()
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 	for _, id := range ids {

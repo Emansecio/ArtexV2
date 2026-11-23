@@ -118,7 +118,7 @@ func (t *ToolSet) resolveDigest(id int64) (*db.Node, *db.ExplorationStore, int64
 // a distinct tool from node_detail because it returns a LIST of members, not one
 // node's full detail.
 func (t *ToolSet) expandDigest() actool.CoreTool {
-	return t.writeExpTool("expand_digest",
+	return t.readExpTool("expand_digest",
 		"Expand a cold digest: returns the compact list of its folded members (id/summary/state/confidence), same shape as the overview's recent_facts/recent_done_intents. For a member's full detail/evidence use node_detail(member_id).",
 		map[string]any{
 			"type": "object",

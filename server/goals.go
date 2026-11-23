@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/norma/llm"
 )
 
 type goalSpec struct {
@@ -388,7 +390,19 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	s.engine.BeginLLMCall(t.ID)
 	goalRuntime := s.agentsForTask(t).runtime
-	decomposed := agent.DecomposeGoalsWithProvider(ctx, goalRuntime, s.m.dir, t.Goal, t.Description, as, t.Store, taskID, goalRuntime.nonStreaming(), goalRuntime.maxTokens(), emit)
+	var goalProv llm.Provider = goalRuntime
+	goalNonStream := goalRuntime.nonStreaming()
+	goalMaxTok := goalRuntime.maxTokens()
+	if strings.TrimSpace(os.Getenv("ARTEX_GOALS_USE_SUMMARY_LLM")) != "0" {
+		if _, _, _, bound := s.agentBindingProvider("goals"); !bound {
+			if sp, _, ok := agent.SummaryProviderFromEnv(); ok && sp != nil {
+				goalProv = sp
+				goalNonStream = true
+				goalMaxTok = 0
+			}
+		}
+	}
+	decomposed := agent.DecomposeGoalsWithProvider(ctx, goalProv, s.m.dir, t.Goal, t.Description, as, t.Store, taskID, goalNonStream, goalMaxTok, emit)
 	s.engine.EndLLMCall(t.ID)
 	for _, g := range decomposed {
 		if strings.TrimSpace(g.Text) != "" {

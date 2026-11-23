@@ -51,7 +51,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSideQuestions } from "@/hooks/use-side-questions";
-import { api, sseUrl } from "@/lib/api";
+import { api } from "@/lib/api";
+import { subscribeWS } from "@/lib/ws";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { MOCK } from "@/lib/mock/enabled";
 import { isBtwCommand } from "@/lib/side-questions";
@@ -693,7 +694,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
 
   // Refs backing SSE/loading without re-render churn.
   const snapshotRef = React.useRef(0); // task-level snapshot cursor → SSE since=
-  const esRef = React.useRef<EventSource | null>(null);
+  const wsUnsubRef = React.useRef<(() => void) | null>(null);
   const activeKeyRef = React.useRef(mainSessionKey(0)); // current session key (for SSE dispatch/unread)
   const atBottomRef = React.useRef(true); // transcript pinned to bottom?
   const llmToastSeqRef = React.useRef<Set<number>>(new Set());
@@ -1023,14 +1024,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
             unread: 0,
           };
         });
-        // Open the single task SSE from the snapshot cursor with rAF batching.
-        const es = new EventSource(
-          sseUrl(`/api/exploration/activity/stream?task=${encodeURIComponent(taskId)}&since=${snapshotRef.current}`),
-        );
-        esRef.current = es;
-        es.onopen = () => setSseLive(true);
-        es.onerror = () => setSseLive(false);
-
+        // Subscribe to the multiplexed WS task channel from the snapshot cursor with rAF batching.
         const pendingActs: Activity[] = [];
         const pendingDeltas: Array<{ key: string; kind: "text" | "thinking"; text: string }> = [];
         let flushRaf = 0;
@@ -1120,56 +1114,55 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
           }
         };
 
-        es.onmessage = (e) => {
-          let a: Activity;
-          try {
-            a = JSON.parse(e.data) as Activity;
-          } catch {
-            return;
-          }
-          if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
-            llmToastSeqRef.current.add(a.seq);
-            const transition = a.metadata?.llm_transition;
-            if (transition?.mode === "exhausted" || a.is_error) {
-              toast.error(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
-            } else if (transition?.mode === "automatic") {
-              toast.success(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
-            } else {
-              toast.info(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+        wsUnsubRef.current?.();
+        wsUnsubRef.current = subscribeWS(`task:${taskId}`, {
+          since: snapshotRef.current,
+          onState: (open) => {
+            if (alive) setSseLive(open);
+          },
+          onEvent: (event, data) => {
+            if (!alive || !data || typeof data !== "object") return;
+            if (event === "activity") {
+              const a = data as Activity;
+              if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
+                llmToastSeqRef.current.add(a.seq);
+                const transition = a.metadata?.llm_transition;
+                if (transition?.mode === "exhausted" || a.is_error) {
+                  toast.error(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+                } else if (transition?.mode === "automatic") {
+                  toast.success(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+                } else {
+                  toast.info(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+                }
+                void api
+                  .taskLLMResolution(taskId)
+                  .then((value) => {
+                    if (alive) setLLMResolutions(value);
+                  })
+                  .catch(() => {
+                    // Periodic resolver poll retries automatically.
+                  });
+              }
+              pendingActs.push(a);
+              scheduleFlush();
+            } else if (event === "delta") {
+              const df = data as {
+                worker?: string;
+                intent_id?: number;
+                kind?: string;
+                text?: string;
+              };
+              if (!df.text || (df.kind !== "text" && df.kind !== "thinking")) return;
+              const k =
+                df.intent_id != null
+                  ? `intent:${df.intent_id}`
+                  : df.worker === "planner"
+                    ? "plan"
+                    : mainSessionKey(currentSegRef.current);
+              pendingDeltas.push({ key: k, kind: df.kind, text: df.text });
+              scheduleFlush();
             }
-            void api
-              .taskLLMResolution(taskId)
-              .then((value) => {
-                if (alive) setLLMResolutions(value);
-              })
-              .catch(() => {
-                // Periodic resolver poll retries automatically.
-              });
-          }
-          pendingActs.push(a);
-          scheduleFlush();
-        };
-
-        es.addEventListener("delta", (e) => {
-          try {
-            const df = JSON.parse((e as MessageEvent).data) as {
-              worker?: string;
-              intent_id?: number;
-              kind?: string;
-              text?: string;
-            };
-            if (!df.text || (df.kind !== "text" && df.kind !== "thinking")) return;
-            const k =
-              df.intent_id != null
-                ? `intent:${df.intent_id}`
-                : df.worker === "planner"
-                  ? "plan"
-                  : mainSessionKey(currentSegRef.current);
-            pendingDeltas.push({ key: k, kind: df.kind, text: df.text });
-            scheduleFlush();
-          } catch {
-            /* ignore malformed delta */
-          }
+          },
         });
       })
       .catch((err) => {
@@ -1182,8 +1175,8 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     return () => {
       alive = false;
       cancelFlush();
-      esRef.current?.close();
-      esRef.current = null;
+      wsUnsubRef.current?.();
+      wsUnsubRef.current = null;
     };
   }, [taskId, patchStore]);
 

@@ -47,18 +47,19 @@ const captureNoticeSlack = 4096
 // boundaries, so a bounded result never carries a half-encoded character.
 func Capture(tc *ToolContext, s string) string {
 	max := maxOut(tc)
-	if len(s) <= max {
-		return s
+	clean := SanitizeToolOutput(s)
+	if len(clean) <= max {
+		return clean
 	}
 	if tc != nil && tc.OutputDir != "" {
 		if path, err := spillOutput(tc.OutputDir, s); err == nil {
 			lines := strings.Count(s, "\n") + 1
-			return cutHeadTail(s, max) + fmt.Sprintf(
+			return cutHeadTail(clean, max) + fmt.Sprintf(
 				"\n\n... <persisted-output>[Output too large: full %d bytes / %d lines.Full output saved to  %s </persisted-output>",
 				len(s), lines, path)
 		}
 	}
-	return truncate(s, max)
+	return truncate(clean, max)
 }
 
 const spillMiddleSep = "\n\n... [middle omitted; see persisted-output file] ...\n\n"

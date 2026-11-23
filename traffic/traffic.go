@@ -291,6 +291,11 @@ type Traffic struct {
 	// via StartTransparentTCP (P4.1b).
 	transparentMu sync.Mutex
 	transparent   *transparentServer
+
+	// Async batched exchange writer (decouples SQLite/blob I/O from proxy response path).
+	recCh      chan recItem
+	recPending atomic.Int64
+	recWg      sync.WaitGroup
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
@@ -310,13 +315,20 @@ func Open(dir, addr string) (*Traffic, error) {
 	index := filepath.Join(dir, "_index", "index.sqlite")
 	dsn := index
 	if !strings.ContainsRune(index, '?') {
-		dsn = "file:" + index + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+		dsn = "file:" + index + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-32000)"
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{}), snaps: newSnapTable()}
+	t := &Traffic{
+		dir:    dir,
+		addr:   addr,
+		db:     db,
+		closed: make(chan struct{}),
+		snaps:  newSnapTable(),
+		recCh:  make(chan recItem, recordQueueSize),
+	}
 	if err := t.initIndex(); err != nil {
 		db.Close()
 		return nil, err
@@ -356,6 +368,7 @@ func Open(dir, addr string) (*Traffic, error) {
 	})
 	p.AddAddon(&sink{t: t})
 	t.proxy = p
+	t.recWg.Go(t.recordLoop)
 	t.sweeping.Go(t.sweepSnapshots) // stops on t.closed; Close waits for it
 	return t, nil
 }
@@ -385,7 +398,13 @@ func (t *Traffic) initIndex() error {
 	// Re-applied rather than left to the DSN so the bare-DSN fallback in Open is
 	// still correct: journal_mode persists in the file header, which is what every
 	// later connection reads.
-	for _, p := range []string{`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`} {
+	for _, p := range []string{
+		`PRAGMA journal_mode=WAL`,
+		`PRAGMA synchronous=NORMAL`,
+		`PRAGMA temp_store=MEMORY`,
+		`PRAGMA cache_size=-32000`,
+		`PRAGMA busy_timeout=5000`,
+	} {
 		if _, err := conn.ExecContext(ctx, p); err != nil {
 			return err
 		}
@@ -575,6 +594,7 @@ func (t *Traffic) Close() error {
 	if tsrv != nil {
 		_ = tsrv.Close()
 	}
+	t.recWg.Wait()
 	t.reaping.Wait()
 	t.sweeping.Wait()
 	return t.db.Close()
@@ -590,7 +610,10 @@ func (t *Traffic) stopping() bool {
 		return false
 	}
 }
-func (t *Traffic) DB() *sql.DB { return t.db }
+func (t *Traffic) DB() *sql.DB {
+	t.flushPending()
+	return t.db
+}
 
 // sink is the go-mitmproxy addon that records completed exchanges, and paces
 // the requests of client connections marked for pacing (see pace.go).
@@ -700,114 +723,264 @@ func flowResponseView(r *mproxy.Response) responseView {
 // original was not kept (see rewrite_flow.go).
 const unavailableMarker = "[original request unavailable]\n"
 
-// recordViews writes one exchange from explicit views, with its rewrite trace,
-// in one transaction: the exchange row, its bodies, blob references, the trace
-// and the full-text index of the views only. A failure rolls everything back,
-// so there is never a rewritten exchange without its trace. Without trace
-// lines this is exactly what record always wrote.
+const (
+	recordQueueSize = 512
+	recordBatchMax  = 32
+)
+
+type pendingRecord struct {
+	rq    requestView
+	rs    responseView
+	lines []rewrite.TraceLine
+	now   time.Time
+}
+
+type recItem struct {
+	rec   *pendingRecord
+	flush chan struct{}
+}
+
+type preparedRecord struct {
+	id        string
+	ts        int64
+	host      string
+	method    string
+	tmpl      string
+	url       string
+	status    int
+	ct        string
+	reqLen    int
+	respLen   int
+	reqHead   string
+	respHead  string
+	reqB      storedBody
+	respB     storedBody
+	lines     []rewrite.TraceLine
+	trace     []storedBody
+	rewritten bool
+	ruleIDs   []int64
+}
+
+func cloneRequestView(rq requestView) requestView {
+	if rq.url != nil {
+		u := *rq.url
+		rq.url = &u
+	}
+	rq.header = rq.header.Clone()
+	return rq
+}
+
+func cloneResponseView(rs responseView) responseView {
+	rs.header = rs.header.Clone()
+	return rs
+}
+
+// recordViews enqueues one exchange to the background batch writer when the proxy
+// store is open, keeping SQLite transactions and blob writes off the MITM response path.
 func (t *Traffic) recordViews(rq requestView, rs responseView, lines []rewrite.TraceLine) {
-	// The write lock covers blob + index writes, so DeleteHost (and its blob GC)
-	// can run under the same lock without racing a concurrent record.
+	rec := pendingRecord{
+		rq:    cloneRequestView(rq),
+		rs:    cloneResponseView(rs),
+		lines: slices.Clone(lines),
+		now:   time.Now(),
+	}
+	if t.recCh == nil || t.stopping() {
+		t.writeBatch([]pendingRecord{rec})
+		return
+	}
+	t.recPending.Add(1)
+	select {
+	case t.recCh <- recItem{rec: &rec}:
+	case <-t.closed:
+		t.recPending.Add(-1)
+		t.writeBatch([]pendingRecord{rec})
+	}
+}
+
+func (t *Traffic) flushPending() {
+	if t == nil || t.recCh == nil || t.recPending.Load() == 0 {
+		return
+	}
+	done := make(chan struct{})
+	select {
+	case t.recCh <- recItem{flush: done}:
+	case <-t.closed:
+		t.recWg.Wait()
+		return
+	}
+	select {
+	case <-done:
+	case <-t.closed:
+		t.recWg.Wait()
+	}
+}
+
+func (t *Traffic) recordLoop() {
+	for {
+		select {
+		case item := <-t.recCh:
+			t.drainAndWrite(item)
+		case <-t.closed:
+			for {
+				select {
+				case item := <-t.recCh:
+					t.drainAndWrite(item)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (t *Traffic) drainAndWrite(first recItem) {
+	batch := make([]pendingRecord, 0, recordBatchMax)
+	var flushes []chan struct{}
+	collect := func(it recItem) {
+		if it.rec != nil {
+			batch = append(batch, *it.rec)
+		}
+		if it.flush != nil {
+			flushes = append(flushes, it.flush)
+		}
+	}
+	collect(first)
+drainLoop:
+	for len(batch) < recordBatchMax {
+		select {
+		case it := <-t.recCh:
+			collect(it)
+		default:
+			break drainLoop
+		}
+	}
+	if len(batch) > 0 {
+		t.writeBatch(batch)
+		t.recPending.Add(-int64(len(batch)))
+	}
+	for _, ch := range flushes {
+		close(ch)
+	}
+}
+
+func (t *Traffic) prepareRecord(rec pendingRecord) preparedRecord {
+	var host, tmpl, rawURL, uri string
+	if rec.rq.url != nil {
+		host = rec.rq.url.Hostname()
+		tmpl = db.TemplatePath(rec.rq.url.EscapedPath())
+		rawURL = rec.rq.url.String()
+		uri = rec.rq.url.RequestURI()
+	}
+	ct := rec.rs.header.Get("Content-Type")
+	rewritten, ruleIDs := appliedRules(rec.lines)
+	return preparedRecord{
+		id:        t.newExchangeID(rec.now),
+		ts:        rec.now.Unix(),
+		host:      host,
+		method:    rec.rq.method,
+		tmpl:      tmpl,
+		url:       rawURL,
+		status:    rec.rs.status,
+		ct:        ct,
+		reqLen:    len(rec.rq.body),
+		respLen:   len(rec.rs.body),
+		reqHead:   requestHead(rec.rq, uri),
+		respHead:  fmt.Sprintf("HTTP %d\n%s", rec.rs.status, headerLines(rec.rs.header)),
+		reqB:      t.spill(rec.rq.body, rec.rq.header.Get("Content-Type")),
+		respB:     t.spill(rec.rs.body, ct),
+		lines:     rec.lines,
+		trace:     t.spillTrace(rec.lines),
+		rewritten: rewritten,
+		ruleIDs:   ruleIDs,
+	}
+}
+
+func logBatchFail(items []preparedRecord, step string, err error) {
+	for _, it := range items {
+		if it.rewritten {
+			log.Printf("[traffic] failed to record a rewritten exchange of %s (%s; rules %v)", it.host, step, it.ruleIDs)
+			continue
+		}
+		log.Printf("[traffic] failed to record %s (%s): %v", it.url, step, err)
+	}
+}
+
+// writeBatch writes one batch of exchanges in a single SQLite transaction under
+// wmu (serializing blob spills + index writes against DeleteHost and gcBlobs).
+func (t *Traffic) writeBatch(batch []pendingRecord) {
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
-	var host, tmpl, url, uri string
-	if rq.url != nil {
-		host = rq.url.Hostname()
-		tmpl = db.TemplatePath(rq.url.EscapedPath())
-		url = rq.url.String()
-		uri = rq.url.RequestURI()
-	}
-	method := rq.method
-	now := time.Now()
-	id := t.newExchangeID(now)
 
-	ct := rs.header.Get("Content-Type")
-	reqHead := requestHead(rq, uri)
-	respHead := fmt.Sprintf("HTTP %d\n%s", rs.status, headerLines(rs.header))
-	// Bodies are spilled before the transaction opens: blob writes are filesystem
-	// work and must not sit inside the SQLite write lock.
-	reqB := t.spill(rq.body, rq.header.Get("Content-Type"))
-	respB := t.spill(rs.body, ct)
-	trace := t.spillTrace(lines)
-
-	// A rewritten exchange is logged by host, step and rule ids only: its URL
-	// and the error text may carry a value a rule wrote.
-	rewritten, ruleIDs := appliedRules(lines)
-	fail := func(step string, err error) {
-		if rewritten {
-			log.Printf("[traffic] failed to record a rewritten exchange of %s (%s; rules %v)", host, step, ruleIDs)
-			return
-		}
-		log.Printf("[traffic] failed to record %s (%s): %v", url, step, err)
+	items := make([]preparedRecord, 0, len(batch))
+	for _, rec := range batch {
+		items = append(items, t.prepareRecord(rec))
 	}
 
 	tx, err := t.db.Begin()
 	if err != nil {
-		fail("beginning transaction", err)
+		logBatchFail(items, "beginning transaction", err)
 		return
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
+	for _, item := range items {
+		if step, err := t.insertPreparedRecord(tx, item); err != nil {
+			logBatchFail([]preparedRecord{item}, step, err)
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		logBatchFail(items, "committing", err)
+	}
+}
+
+func (t *Traffic) insertPreparedRecord(tx *sql.Tx, it preparedRecord) (string, error) {
 	// An id can repeat (seconds plus a rolling counter); the trace of the
 	// exchange it replaces must not stay attached to this one.
-	if _, err := tx.Exec(`DELETE FROM exchange_rewrites WHERE exchange_id=?`, id); err != nil {
-		fail("clearing rewrite trace", err)
-		return
+	if _, err := tx.Exec(`DELETE FROM exchange_rewrites WHERE exchange_id=?`, it.id); err != nil {
+		return "clearing rewrite trace", err
 	}
 	// path stays empty for db-resident exchanges; a non-empty path marks a legacy
 	// row whose bodies still live in the old on-disk tree (see Get).
 	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
 VALUES(?,?,?,?,?,?,?,?,?,?,'')`,
-		id, now.Unix(), host, method, tmpl, url, rs.status, ct,
-		len(rq.body), len(rs.body))
+		it.id, it.ts, it.host, it.method, it.tmpl, it.url, it.status, it.ct,
+		it.reqLen, it.respLen)
 	if err != nil {
-		fail("writing index", err)
-		return
+		return "writing index", err
 	}
 	rowid, err := res.LastInsertId()
 	if err != nil {
-		fail("fetching rowid", err)
-		return
+		return "fetching rowid", err
 	}
-
 	if _, err := tx.Exec(`INSERT OR REPLACE INTO exchange_bodies(id,req_head,req_body,req_blob,resp_head,resp_body,resp_blob)
 VALUES(?,?,?,?,?,?,?)`,
-		id, reqHead, reqB.inline, nullIfEmpty(reqB.hash), respHead, respB.inline, nullIfEmpty(respB.hash)); err != nil {
-		fail("writing body", err)
-		return
+		it.id, it.reqHead, it.reqB.inline, nullIfEmpty(it.reqB.hash), it.respHead, it.respB.inline, nullIfEmpty(it.respB.hash)); err != nil {
+		return "writing body", err
 	}
-
-	for _, h := range []string{reqB.hash, respB.hash} {
+	for _, h := range []string{it.reqB.hash, it.respB.hash} {
 		if h == "" {
 			continue
 		}
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO blob_refs(hash,exchange_id) VALUES(?,?)`, h, id); err != nil {
-			fail("registering blob reference", err)
-			return
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO blob_refs(hash,exchange_id) VALUES(?,?)`, h, it.id); err != nil {
+			return "registering blob reference", err
 		}
 	}
-
-	if err := writeTrace(tx, id, lines, trace); err != nil {
+	if err := writeTrace(tx, it.id, it.lines, it.trace); err != nil {
 		var re *recordError
 		errors.As(err, &re)
-		fail(re.step, re.err)
-		return
+		return re.step, re.err
 	}
-
 	if t.fts {
 		// The index is fed from memory, so a body that spilled to _blobs is still
 		// fully searchable even though only its preview is stored inline. Only the
 		// recorded views are indexed, never a value a rule wrote.
-		idx := strings.Join([]string{url, reqHead, reqB.index, respHead, respB.index}, "\n")
+		idx := strings.Join([]string{it.url, it.reqHead, it.reqB.index, it.respHead, it.respB.index}, "\n")
 		if _, err := tx.Exec(`INSERT INTO ex_fts(rowid,content) VALUES(?,?)`, rowid, idx); err != nil {
-			fail("writing full-text index", err)
-			return
+			return "writing full-text index", err
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		fail("committing", err)
-	}
+	return "", nil
 }
 
 // appliedRules reports whether a trace rewrote its exchange, with the ids of
@@ -1129,6 +1302,7 @@ const rewrittenExistsSQL = `EXISTS(SELECT 1 FROM exchange_rewrites r WHERE r.exc
 
 // Search returns paged exchange metadata (never bodies).
 func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
+	t.flushPending()
 	if size <= 0 || size > 500 {
 		size = 100
 	}
@@ -1299,6 +1473,7 @@ func (t *Traffic) pageWhere(f PageQuery) (where string, args []any) {
 // Also returns the total number of rows matching the filter (for the UI's
 // pagination). Bodies are never included in the rows.
 func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
+	t.flushPending()
 	if size <= 0 || size > 500 {
 		size = 100
 	}
@@ -1342,6 +1517,7 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 // path and are read from the legacy on-disk tree instead, so history stays
 // readable without being migrated.
 func (t *Traffic) Get(id string) (req, resp string, err error) {
+	t.flushPending()
 	var reqHead, respHead string
 	var reqBody, respBody []byte
 	var reqBlob, respBlob sql.NullString
@@ -1391,6 +1567,7 @@ type HostCount struct {
 // Hosts returns distinct recorded hosts with exchange counts, most recent
 // activity first — powers the page's target picker.
 func (t *Traffic) Hosts() ([]HostCount, error) {
+	t.flushPending()
 	rows, err := t.db.Query(`SELECT host, COUNT(*) AS n, MAX(ts) AS last FROM exchanges GROUP BY host ORDER BY last DESC`)
 	if err != nil {
 		return nil, err
@@ -1410,6 +1587,7 @@ func (t *Traffic) Hosts() ([]HostCount, error) {
 
 // Count returns total recorded exchanges.
 func (t *Traffic) Count() (int, error) {
+	t.flushPending()
 	var n int
 	err := t.db.QueryRow(`SELECT COUNT(*) FROM exchanges`).Scan(&n)
 	return n, err
@@ -1422,6 +1600,7 @@ func (t *Traffic) Count() (int, error) {
 // blobs are shared across hosts and so are garbage-collected afterwards rather
 // than deleted by host. Returns rows deleted.
 func (t *Traffic) DeleteHost(host string) (int64, error) {
+	t.flushPending()
 	like := "%" + host + "%"
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
@@ -1475,9 +1654,10 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 // Returns the number of exchanges deleted and how many bytes of index the
 // compaction handed back.
 func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
+	t.flushPending()
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
-	before := t.indexBytes()
+	before := t.indexBytesLocked()
 	trees, err := t.allHostTrees()
 	if err != nil {
 		return 0, 0, err
@@ -1509,7 +1689,7 @@ func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
 		log.Printf("[traffic] failed to compact index: %v", err)
 		return deleted, 0, nil
 	}
-	return deleted, before - t.indexBytes(), nil
+	return deleted, before - t.indexBytesLocked(), nil
 }
 
 // allHostTrees lists every host directory left by the pre-SQLite layout. Unlike
@@ -1822,6 +2002,7 @@ func (t *Traffic) StageDeleteHostsExactForArchive(hosts []string, archiveID, tas
 }
 
 func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64) (*HostDeleteStage, error) {
+	t.flushPending()
 	t.wmu.Lock()
 	stage := &HostDeleteStage{traffic: t}
 	fail := func(cause error) (*HostDeleteStage, error) {
@@ -2076,6 +2257,11 @@ func (s *HostDeleteStage) Commit() error {
 // write-ahead log and shared-memory file, since those are what an operator sees
 // the data directory holding.
 func (t *Traffic) indexBytes() int64 {
+	t.flushPending()
+	return t.indexBytesLocked()
+}
+
+func (t *Traffic) indexBytesLocked() int64 {
 	base := filepath.Join(t.dir, "_index", "index.sqlite")
 	var total int64
 	for _, p := range []string{base, base + "-wal", base + "-shm"} {
@@ -2295,6 +2481,7 @@ func (t *Traffic) legacyBlobRefs(refs map[string]struct{}) error {
 // substring. Default page size is intentionally small (3) to keep tool results
 // lightweight and capped at 10; page is 0-based (page*limit offset).
 func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([]ExchangeMeta, error) {
+	t.flushPending()
 	if limit <= 0 {
 		limit = 3
 	}

@@ -251,6 +251,7 @@ CREATE INDEX IF NOT EXISTS idx_expnodes_part_state    ON exploration_nodes(explo
 CREATE INDEX IF NOT EXISTS idx_expnodes_part_id_desc  ON exploration_nodes(exploration_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_expnodes_frontier      ON exploration_nodes(exploration_id, priority DESC)
     WHERE kind='intent' AND state='open';
+CREATE INDEX IF NOT EXISTS idx_exp_nodes_updated        ON exploration_nodes(exploration_id, updated_at DESC);
 DROP TRIGGER IF EXISTS trg_expnodes_upd ON exploration_nodes;
 CREATE TRIGGER trg_expnodes_upd BEFORE UPDATE ON exploration_nodes
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -1209,6 +1210,8 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pend
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_findings_task_sev ON findings(task_id, created_at DESC) INCLUDE (severity);
+CREATE INDEX IF NOT EXISTS idx_findings_node_id ON findings(node_id) WHERE node_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);
 -- The "by asset" view looks findings up via asset_ids @> '[<id>]'; without this GIN index that is a full table scan.

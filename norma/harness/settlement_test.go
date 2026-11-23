@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"iter"
+	"slices"
 	"strings"
 	"testing"
 
@@ -12,10 +13,11 @@ import (
 )
 
 // On hitting MaxTurns with a Settlement configured, the loop injects the wrap-up
-// prompt, hides DisabledTools during wrap-up, and finishes with the ORIGINAL
-// budget reason (not ReasonCompleted).
+// prompt, keeps tool schemas identical during wrap-up to preserve prompt cache,
+// blocks DisabledTools at execution time, and finishes with the ORIGINAL budget reason.
 func TestSettlementOnBudgetHit(t *testing.T) {
 	var toolsSeen [][]string
+	var effortsSeen []string
 	turns := [][]llm.StreamEvent{
 		toolTurn("a", "Bash", `{"command":"echo 1"}`), // turn 1 → hits MaxTurns=1
 		textTurn("已写回事实并总结"),                          // settlement turn → natural stop
@@ -27,6 +29,7 @@ func TestSettlementOnBudgetHit(t *testing.T) {
 		}
 		i := len(toolsSeen)
 		toolsSeen = append(toolsSeen, names)
+		effortsSeen = append(effortsSeen, req.ReasoningEffort)
 		evs := turns[i]
 		return func(yield func(llm.StreamEvent, error) bool) {
 			for _, ev := range evs {
@@ -66,8 +69,48 @@ func TestSettlementOnBudgetHit(t *testing.T) {
 	if !contains(toolsSeen[0], "Bash") {
 		t.Fatalf("主阶段应能看到 Bash: %v", toolsSeen[0])
 	}
-	if contains(toolsSeen[1], "Bash") {
-		t.Fatalf("收尾阶段应屏蔽 Bash: %v", toolsSeen[1])
+	if !slices.Equal(toolsSeen[0], toolsSeen[1]) {
+		t.Fatalf("收尾阶段应保持 tool schemas 不变以命中 prompt cache: main=%v settle=%v", toolsSeen[0], toolsSeen[1])
+	}
+	if effortsSeen[0] != "" || effortsSeen[1] != "low" {
+		t.Fatalf("expected ReasoningEffort ['', 'low'], got %v", effortsSeen)
+	}
+}
+
+func TestSettlementBlocksDisabledToolExecution(t *testing.T) {
+	m := &scriptedModel{turns: [][]llm.StreamEvent{
+		toolTurn("a", "Bash", `{"command":"echo main"}`),
+		toolTurn("b", "Bash", `{"command":"echo should-not-run"}`),
+		textTurn("wrapped up"),
+	}}
+	in := QueryInput{
+		Messages:       []llm.Message{llm.UserText("go")},
+		Tools:          tool.NewRegistry(tool.NewBash()),
+		PermissionMode: permission.ModeBypass,
+		WorkingDir:     t.TempDir(),
+		MaxTurns:       1,
+		Settlement:     &Settlement{Prompt: "SETTLE_NOW", DisabledTools: []string{"Bash"}},
+	}
+	term := drain(t, in, QueryDeps{CallModel: m.call})
+	if term.Reason != ReasonMaxTurns {
+		t.Fatalf("reason=%v, want ReasonMaxTurns", term.Reason)
+	}
+	var blocked bool
+	for _, msg := range term.Messages {
+		for _, c := range msg.Content {
+			if c.Type == llm.BlockToolResult && c.ToolUseID == "b" {
+				if !c.IsError || len(c.Content) == 0 || !strings.Contains(c.Content[0].Text, "disabled during wrap-up") {
+					t.Fatalf("expected wrap-up block error for call b, got %+v", c)
+				}
+				if strings.Contains(c.Content[0].Text, "should-not-run") {
+					t.Fatalf("disabled tool should not have executed: %+v", c)
+				}
+				blocked = true
+			}
+		}
+	}
+	if !blocked {
+		t.Fatal("expected blocked tool_result for settlement call b")
 	}
 }
 

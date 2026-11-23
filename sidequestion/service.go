@@ -11,7 +11,17 @@ import (
 // SideQuestionService has no harness, tool executor, transcript writer or model
 // failover chain. Answer is one completion; Respond adds bounded preparation
 // and at most one context-overflow recovery around that completion.
-type SideQuestionService struct{ Provider llm.Provider }
+type SideQuestionService struct {
+	Provider        llm.Provider
+	SummaryProvider llm.Provider // optional cheaper/faster model for history & snapshot summarization
+}
+
+func (s SideQuestionService) summaryProvider() llm.Provider {
+	if s.SummaryProvider != nil {
+		return s.SummaryProvider
+	}
+	return s.Provider
+}
 
 type Answer struct {
 	Text    string

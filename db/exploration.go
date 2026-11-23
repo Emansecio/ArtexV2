@@ -1152,27 +1152,24 @@ ORDER BY id`, s.expID, nodeID)
 		return nil, nil, err
 	}
 	nodes, err := scanNodes(nodeRows)
+	_ = nodeRows.Close()
 	if err != nil {
 		return nil, nil, err
 	}
 	if len(nodes) == 0 {
 		return nil, nil, nil
 	}
+	ids := make([]int64, len(nodes))
+	for i, n := range nodes {
+		ids[i] = n.ID
+	}
 	// edges among the ancestor set only (the lineage's internal relations).
 	edgeRows, err := s.db.Query(`
-WITH RECURSIVE anc(id) AS (
-    SELECT $2::bigint
-  UNION
-    SELECT e.src_id
-    FROM exploration_edges e
-    JOIN anc ON e.dst_id = anc.id
-    WHERE e.exploration_id = $1
-)
 SELECT src_id, rel, dst_id
 FROM exploration_edges
 WHERE exploration_id = $1
-  AND src_id IN (SELECT id FROM anc)
-  AND dst_id IN (SELECT id FROM anc)`, s.expID, nodeID)
+  AND src_id = ANY($2::bigint[])
+  AND dst_id = ANY($2::bigint[])`, s.expID, ids)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1342,6 +1339,32 @@ WHERE id=$1 AND exploration_id=$2 AND kind='intent' AND state='paused'`, id, s.e
 		return "", nil
 	}
 	return token, nil
+}
+
+// ClaimNextIntentToken atomically claims the highest-priority open intent using
+// FOR UPDATE SKIP LOCKED so concurrent workers do not contend on the frontier.
+func (s *ExplorationStore) ClaimNextIntentToken(owner string) (*Node, string, error) {
+	token, err := newUnclaimToken()
+	if err != nil {
+		return nil, "", err
+	}
+	n, err := scanNode(s.db.QueryRow(`UPDATE exploration_nodes
+SET state='running', owner=$1, unclaim_token=$2, last_heartbeat_at=now()
+WHERE id = (
+	SELECT id FROM exploration_nodes
+	WHERE exploration_id=$3 AND kind='intent' AND state='open'
+	ORDER BY priority DESC, id ASC
+	FOR UPDATE SKIP LOCKED
+	LIMIT 1
+)
+RETURNING `+nodeCols, owner, token, s.expID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	return n, token, nil
 }
 
 // HeartbeatIntentClaim renews the lease of the claim identified by token. It

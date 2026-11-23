@@ -3,7 +3,7 @@
 import * as React from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { sseUrl } from "@/lib/api";
+import { subscribeWS } from "@/lib/ws";
 import { MOCK } from "@/lib/mock/enabled";
 import type { LogLine } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -58,14 +58,13 @@ export default function LogsPage() {
     return min;
   }, [lines]);
 
-  // Live tail via SSE. on connect, replays whatever is in the ring (includes
+  // Live tail via multiplexed WS. on subscribe, replays ring history (includes
   // DB-restored history from the last 100 rows written before restart).
   React.useEffect(() => {
     if (MOCK) {
       setLines(MOCK_LOGS);
       return;
     }
-    const es = new EventSource(sseUrl("/api/logs/stream?since=0"));
     const pending: LogLine[] = [];
     let rafId = 0;
     const flush = () => {
@@ -90,19 +89,17 @@ export default function LogsPage() {
         return next.length > 3000 ? next.slice(next.length - 3000) : next;
       });
     };
-    es.onmessage = (e) => {
-      if (pausedRef.current) return;
-      try {
-        const l = JSON.parse(e.data) as LogLine;
-        pending.push(l);
+    const unsub = subscribeWS("logs", {
+      since: 0,
+      onEvent: (ev, data) => {
+        if (ev !== "log" || pausedRef.current || !data || typeof data !== "object") return;
+        pending.push(data as LogLine);
         if (!rafId) rafId = window.requestAnimationFrame(flush);
-      } catch {
-        /* ignore malformed frame */
-      }
-    };
+      },
+    });
     return () => {
       if (rafId) window.cancelAnimationFrame(rafId);
-      es.close();
+      unsub();
     };
   }, []);
 

@@ -35,9 +35,10 @@ REMINDER: Do NOT call any tools. Output only <analysis>...</analysis> followed b
 // artexCompactableTools lists ARTEX domain read tools whose older tool_result
 // payloads are safe for MicroCompact to clear (they can always be re-queried).
 var artexCompactableTools = []string{
-	"traffic_query",
 	"traffic_get",
 	"traffic_search",
+	"traffic_blob",
+	"traffic_messages",
 	"list_assets",
 	"graph_overview",
 	"node_detail",
@@ -47,7 +48,10 @@ var artexCompactableTools = []string{
 	"expand_digest",
 	"get_worker_trace",
 	"get_worker_output",
-	"search_worker_traces",
+	"list_worker_traces",
+	"search_all_worker_traces",
 	"list_task_credentials",
 	"list_companies",
+	"TaskOutput",
+	"shell_read",
 }

@@ -15,11 +15,12 @@ import (
 // blocks every tool queued behind it until it finishes. Results are yielded in
 // arrival order; progress is yielded as soon as it arrives.
 type streamExec struct {
-	l       *loop
-	toolCtx context.Context
-	mu      sync.Mutex
-	tools   []*tracked
-	notify  chan struct{} // pinged when a tool completes or emits progress
+	l        *loop
+	toolCtx  context.Context
+	settling bool
+	mu       sync.Mutex
+	tools    []*tracked
+	notify   chan struct{} // pinged when a tool completes or emits progress
 }
 
 type toolStatus int
@@ -41,7 +42,7 @@ type tracked struct {
 }
 
 func newStreamExec(l *loop) *streamExec {
-	return &streamExec{l: l, toolCtx: l.toolCtx, notify: make(chan struct{}, 1)}
+	return &streamExec{l: l, toolCtx: l.toolCtx, settling: l.settling, notify: make(chan struct{}, 1)}
 }
 
 func (e *streamExec) ping() {
@@ -98,7 +99,7 @@ func (e *streamExec) processQueue() {
 func (e *streamExec) run(t *tracked) {
 	e.l.sem <- struct{}{} // bound concurrent tool execution
 	defer func() { <-e.l.sem }()
-	res, extra := e.l.execOneWithCtx(e.toolCtx, t.block, func(p tool.ProgressInfo) {
+	res, extra := e.l.execOneWithCtx(e.toolCtx, t.block, e.settling, func(p tool.ProgressInfo) {
 		e.mu.Lock()
 		t.prog = append(t.prog, p.Message)
 		e.mu.Unlock()

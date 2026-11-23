@@ -396,13 +396,25 @@ func (s *Server) buildCustomTool(t *db.Tool) actool.CoreTool {
 			return actool.Errorf("unknown custom tool kind: " + kind), nil
 		}
 	}
-	return actool.Build(actool.Spec{
+	spec := actool.Spec{
 		Name: key, Description: t.Description, Schema: schema,
 		Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
 			return permission.Allowed()
 		},
 		Run: run,
-	})
+	}
+	if kind == "http" {
+		var hx httpExec
+		if json.Unmarshal(execRaw, &hx) == nil {
+			m := strings.ToUpper(strings.TrimSpace(hx.Method))
+			if m == "" || m == "GET" || m == "HEAD" {
+				ro := func(json.RawMessage) bool { return true }
+				spec.ReadOnly = ro
+				spec.Concurrent = ro
+			}
+		}
+	}
+	return actool.Build(spec)
 }
 
 // hasSchemaProps reports whether raw is a JSON-Schema object with ≥1 property.
@@ -636,6 +648,12 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 	if proxyStr == "" {
 		return nil
 	}
+	cacheKey := proxyStr + "\x00" + caFile
+	if s != nil {
+		if cached, ok := s.httpProxyTr.Load(cacheKey); ok {
+			return cached.(*http.Transport)
+		}
+	}
 	pu, err := url.Parse(proxyStr)
 	if err != nil {
 		return nil
@@ -648,6 +666,10 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 				tr.TLSClientConfig = &tls.Config{RootCAs: pool}
 			}
 		}
+	}
+	if s != nil {
+		actual, _ := s.httpProxyTr.LoadOrStore(cacheKey, tr)
+		return actual.(*http.Transport)
 	}
 	return tr
 }

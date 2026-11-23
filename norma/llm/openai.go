@@ -267,15 +267,22 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	if req.Thinking != "" {
 		thinkingType = req.Thinking
 	}
+	effort := p.cfg.ReasoningEffort
+	if req.ReasoningEffort != "" {
+		effort = req.ReasoningEffort
+	}
+	if req.Thinking == "disabled" {
+		effort = ""
+	}
 	// The request is in thinking mode when either a thinking type is set (a
 	// `thinking` body field goes out) or a reasoning effort is configured — the
 	// same providers that then demand reasoning_content be echoed back.
-	thinking := thinkingType != "" || p.cfg.ReasoningEffort != ""
+	thinking := thinkingType != "" || effort != ""
 
 	msgs := toOpenAIMessages(joinSystem(req.System), req.Messages)
 	msgs = sanitizeOpenAIMessages(msgs, thinking)
 	if p.cfg.StripOldReasoning {
-		stripOldOAReasoning(msgs)
+		stripOldOAReasoning(msgs, thinking)
 	}
 
 	useCache := p.cfg.promptCacheEnabled()
@@ -311,7 +318,7 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	if thinkingType != "" {
 		body.Thinking = &oaThinking{Type: thinkingType}
 	}
-	body.ReasoningEffort = p.cfg.ReasoningEffort // omitempty drops it when unset
+	body.ReasoningEffort = effort // omitempty drops it when unset
 	for _, t := range req.Tools {
 		var ot oaTool
 		ot.Type = "function"
@@ -323,20 +330,31 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	return json.Marshal(body)
 }
 
-func stripOldOAReasoning(msgs []oaMessage) {
+func stripOldOAReasoning(msgs []oaMessage, thinking bool) {
+	lastAssistant := -1
 	lastUser := -1
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == "user" {
+	for i, m := range msgs {
+		switch m.Role {
+		case "assistant":
+			lastAssistant = i
+		case "user":
 			lastUser = i
-			break
 		}
 	}
-	if lastUser <= 0 {
+	if lastAssistant < 0 {
 		return
 	}
-	for i := 0; i < lastUser; i++ {
-		if msgs[i].Role == "assistant" {
-			msgs[i].ReasoningContent = ""
+	cutoff := lastAssistant
+	if lastUser > lastAssistant {
+		cutoff = len(msgs)
+	}
+	for i := 0; i < cutoff; i++ {
+		if msgs[i].Role == "assistant" && msgs[i].ReasoningContent != "" {
+			if thinking && len(msgs[i].ToolCalls) > 0 {
+				msgs[i].ReasoningContent = reasoningElidedPlaceholder
+			} else {
+				msgs[i].ReasoningContent = ""
+			}
 		}
 	}
 }

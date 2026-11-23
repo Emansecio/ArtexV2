@@ -1,6 +1,8 @@
 package noaadapter
 
 import (
+	"slices"
+
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/noa"
 	"github.com/Autumn-27/norma/tool"
@@ -42,10 +44,17 @@ func Enable(opts *agentcore.Options, o Options) error {
 
 	opts.Compactor = &Compactor{sess: sess}
 	opts.Tools = append(opts.Tools, newCompressTool(sess))
-	opts.AppendSystemPrompt = append(opts.AppendSystemPrompt, noa.BuildSystemPrompt(noa.Sections{}))
+	noaPrompt := noa.BuildSystemPrompt(noa.Sections{})
 	// The prompt section is fully static, so it belongs in the cacheable prefix.
-	// Left past the boundary it would be re-billed every single request.
-	opts.DynamicBoundary = len(opts.SystemPrompt) + len(opts.AppendSystemPrompt)
+	// When the host already split SystemPrompt into [static..., dynamic...],
+	// insert before DynamicBoundary so dynamic segments remain uncached after it.
+	if opts.DynamicBoundary > 0 && opts.DynamicBoundary < len(opts.SystemPrompt) {
+		opts.SystemPrompt = slices.Insert(opts.SystemPrompt, opts.DynamicBoundary, noaPrompt)
+		opts.DynamicBoundary++
+	} else {
+		opts.AppendSystemPrompt = append(opts.AppendSystemPrompt, noaPrompt)
+		opts.DynamicBoundary = len(opts.SystemPrompt) + len(opts.AppendSystemPrompt)
+	}
 	return nil
 }
 

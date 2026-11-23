@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -169,6 +170,7 @@ type Server struct {
 
 	agentCacheMu sync.Mutex
 	agentCache   map[string]cachedAgentEntry
+	httpProxyTr  sync.Map // key: proxyStr+"\x00"+caFile -> *http.Transport
 }
 
 type cachedAgentEntry struct {
@@ -1260,7 +1262,7 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		s.applyTaskMetrics(&dto, t, metrics[t.ExpID])
 		dtos = append(dtos, dto)
 	}
-	writeJSON(w, 200, map[string]any{"tasks": dtos, "active": active})
+	writeJSONETag(w, r, map[string]any{"tasks": dtos, "active": active})
 }
 
 // applyTaskMetrics fills the aggregate DTO fields (tokens, goal progress,
@@ -2289,7 +2291,7 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 			for _, f := range fs {
 				out = append(out, findingFromDB(f, assets))
 			}
-			writeJSON(w, 200, out)
+			writeJSONETag(w, r, out)
 			return
 		}
 		page := findingPaginationParam(q.Get("page"), 1, 0)
@@ -2362,7 +2364,7 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 			s.resolveAssetIDs(sourceAssetIDs),
 		)...)
 	}
-	writeJSON(w, 200, out)
+	writeJSONETag(w, r, out)
 }
 
 // normFilter maps the frontend's "all" sentinel (and empty) to "" so the DB layer
@@ -4619,6 +4621,26 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONETag(w http.ResponseWriter, r *http.Request, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	etag := fmt.Sprintf(`W/"%x"`, h.Sum64())
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "no-cache")
+	if strings.TrimSpace(r.Header.Get("If-None-Match")) == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
 }
 
 func writeErr(w http.ResponseWriter, code int, msg string) {

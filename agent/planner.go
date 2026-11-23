@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -43,9 +44,10 @@ type Planner struct {
 	// lessonsBlock is the raw RSI evidence block. Empty = off. Plan() frames it
 	// with a task-stable data envelope (field=lessons) using lessonsNonce and
 	// appends it after the rendered system prompt.
-	lessonsBlock string
-	lessonsNonce string
-	summaryProv  llm.Provider
+	lessonsBlock    string
+	lessonsNonce    string
+	summaryProv     llm.Provider
+	onIntentCreated func()
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -124,6 +126,9 @@ func (p *Planner) SetLessonsNonce(nonce string) { p.lessonsNonce = nonce }
 // SetSummaryProvider configures an optional dedicated provider for AutoCompact
 // summarization. nil falls back to the planner's primary provider.
 func (p *Planner) SetSummaryProvider(prov llm.Provider) { p.summaryProv = prov }
+
+// SetOnIntentCreated wires a worker-wake callback triggered when add_intent creates intents.
+func (p *Planner) SetOnIntentCreated(fn func()) { p.onIntentCreated = fn }
 
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (p *Planner) wantConstraints() bool { return p.injectConstraints == nil || p.injectConstraints() }
@@ -496,12 +501,20 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tsx.SetCoverageEnabled(coverageOn(as, taskID))
 	tsx.killWork = p.killWork   // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork // enable steer_work tool (nil = unavailable)
+	tsx.SetOnIntentCreated(p.onIntentCreated)
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
 	}
-	// Domain tools + the basic default tool set (Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash).
-	// When the asset-coverage feature is off, drop add_task_scope/list_untested_assets (not in the prompt).
-	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), defaultTools(p.workDir)...)
+	overview := tsx.graphOverviewData()
+	pruned := plannerPruneToolsEnabled() && overviewHasFacts(overview)
+	// Domain tools + default tool set. Once facts > 0, plannerDefaultTmpl forbids
+	// probing by the planner itself, so drop Bash/Write/Edit/MultiEdit/Glob/Grep/Sleep/WebFetch.
+	var base []actool.CoreTool
+	if pruned {
+		base = append(tsx.DropCoverageTools(tsx.PlannerTools()), defaultToolsOnly(p.workDir, "Read", "LS")...)
+	} else {
+		base = append(tsx.DropCoverageTools(tsx.PlannerTools()), defaultTools(p.workDir)...)
+	}
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(WithToolQuery(ctx, plannerToolQuery(goal, triggers)), "planner", base)
 	defer cleanup()
@@ -513,7 +526,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// risk). situational is spliced into input below.
 	// One envelope (one fresh nonce) per user message (#124, F3).
 	env := newDataEnvelope()
-	situational := plannerSituational(triggers, storeTriggerLookup(ts), tsx.graphOverviewData(), env)
+	situational := plannerSituational(triggers, storeTriggerLookup(ts), overview, env)
 	// Task-level deadline / endgame mode (injected via ctx, see taskclock.go). On the
 	// endgame round, the task-timeout planner wrap-up prompt is spliced into this
 	// round's user input (along with situational) as [this round's operating
@@ -547,19 +560,24 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("planner", nil, clamped)
 	}
+	plannerTools := tools
+	if !pruned {
+		plannerTools = withWebFetch(ctx, tools, p.proxyAddr, p.proxyCACert) // WebFetch: route through the recording proxy for traceability; load the proxy CA to verify MITM-re-signed HTTPS certs; every redirect hop is gated
+	}
 	opts := agentcore.Options{
-		Provider:        p.prov,
-		SummaryProvider: p.summaryProv,
-		SystemPrompt:    system,
-		DynamicBoundary: boundary,
-		PromptCacheKey:  fmt.Sprintf("artex-task-%d-planner", taskID),
-		Tools:           withWebFetch(ctx, tools, p.proxyAddr, p.proxyCACert), // WebFetch: route through the recording proxy for traceability; load the proxy CA to verify MITM-re-signed HTTPS certs; every redirect hop is gated
-		DeferredTools:   def.Deferred,
-		UnlockSet:       def.Unlock,
-		PermissionMode:  permission.ModeBypass,
+		Provider:               p.prov,
+		SummaryProvider:        p.summaryProv,
+		SystemPrompt:           system,
+		DynamicBoundary:        boundary,
+		PromptCacheKey:         fmt.Sprintf("artex-task-%d-planner", taskID),
+		Tools:                  plannerTools,
+		DeferredTools:          def.Deferred,
+		UnlockSet:              def.Unlock,
+		DisableBackgroundTasks: pruned,
+		PermissionMode:         permission.ModeBypass,
 		// Web search (optional). ddgs needs no key; brave-free needs BraveKey; tavily needs TavilyKey.
 		// WebSearchProxy is a dedicated egress proxy (http/https/socks5), unrelated to the traffic-recording MITM proxy; empty = direct.
-		EnableWebSearch:       p.webSearch.Enabled,
+		EnableWebSearch:       p.webSearch.Enabled && !pruned,
 		WebSearchBackend:      p.webSearch.Backend,
 		BraveSearchAPIKey:     p.webSearch.BraveKey,
 		TavilySearchAPIKey:    p.webSearch.TavilyKey,
@@ -636,4 +654,35 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 			}
 		})
 	return tsx.GoalMet, tsx.Reason, err
+}
+
+func plannerPruneToolsEnabled() bool {
+	return !isFalsy(os.Getenv("ARTEX_PLANNER_PRUNE_TOOLS"))
+}
+
+func overviewHasFacts(overview map[string]any) bool {
+	if overview == nil {
+		return false
+	}
+	switch v := overview["facts"].(type) {
+	case int:
+		if v > 0 {
+			return true
+		}
+	case int64:
+		if v > 0 {
+			return true
+		}
+	case float64:
+		if v > 0 {
+			return true
+		}
+	}
+	switch rf := overview["recent_facts"].(type) {
+	case []map[string]any:
+		return len(rf) > 0
+	case []any:
+		return len(rf) > 0
+	}
+	return false
 }

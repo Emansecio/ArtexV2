@@ -198,7 +198,7 @@ func (d *DB) ListLLMRecords(model, session, task string, page, size int) ([]LLMR
 		argN++
 	}
 	if task != "" {
-		where += fmt.Sprintf(` AND COALESCE(task_id,'') = $%d`, argN)
+		where += fmt.Sprintf(` AND task_id = $%d`, argN)
 		args = append(args, task)
 		argN++
 	}
@@ -273,7 +273,11 @@ WHERE COALESCE(task_id,'') <> '' GROUP BY task_id ORDER BY MAX(id) DESC`)
 // DeleteLLMRecords removes every LLM record for one exact task_id — the same
 // match the page's task picker/filter uses. Returns rows deleted.
 func (d *DB) DeleteLLMRecords(task string) (int64, error) {
-	res, err := d.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'') = $1`, task)
+	q := `DELETE FROM llm_records WHERE COALESCE(task_id,'') = $1`
+	if task != "" {
+		q = `DELETE FROM llm_records WHERE task_id = $1`
+	}
+	res, err := d.Exec(q, task)
 	if err != nil {
 		return 0, err
 	}

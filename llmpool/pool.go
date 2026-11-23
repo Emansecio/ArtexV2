@@ -35,7 +35,10 @@ type Member struct {
 	// WindowTokens is the profile's context window in tokens. A member whose
 	// window can't hold the request is skipped rather than made to fail on it.
 	WindowTokens int
-	Prov         llm.Provider
+	// Thinking reports whether this profile defaults to thinking/reasoning mode
+	// (so speculative TTFT hedging avoids double-billing reasoning latency).
+	Thinking bool
+	Prov     llm.Provider
 }
 
 // RankActive is the Rank the caller gives the chain head (the active profile, or
@@ -110,7 +113,8 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 		defer releaseProbes()
 		var lastErr error
 		startIdx := 0
-		if p.hedgeDelay > 0 && len(order) >= 2 {
+		thinking := req.Thinking == "enabled" || (req.Thinking == "" && len(order) > 0 && (order[0].Thinking || (req.ReasoningEffort != "" && req.ReasoningEffort != "none")))
+		if p.hedgeDelay > 0 && !thinking && len(order) >= 2 {
 			done, err := p.streamHedgedFirstTwo(ctx, req, order[0], order[1], len(order) > 2, yield)
 			if done {
 				return
@@ -410,13 +414,22 @@ func (p *Pool) order(req llm.CompletionRequest) ([]*Member, func()) {
 	if len(open) == 0 {
 		return p.members[:1], release // last resort: probe the head rather than stall
 	}
-	return rotateGroups(open, p.rr.Add(1)-1, p.health), release
+	if req.PromptCacheKey != "" {
+		return orderGroups(open, req.PromptCacheKey, 0, p.health), release
+	}
+	return orderGroups(open, "", p.rr.Add(1)-1, p.health), release
 }
 
-// rotateGroups rotates each run of equal-ranked members by n, so profiles sharing
-// a priority take turns going first, and moves clearly faster (>500ms lower EWMA
-// TTFT when all members are measured) ahead within the equal-rank group.
-func rotateGroups(in []*Member, n uint64, health *Registry) []*Member {
+// orderGroups orders each run of equal-ranked members. When cacheKey is set it
+// pins the head deterministically via rendezvous hashing so repeated turns hit
+// provider prompt caches instead of ping-ponging. Otherwise it rotates round-robin
+// by n and promotes clearly faster (>500ms lower EWMA TTFT) members.
+func orderGroups(in []*Member, cacheKey string, n uint64, health *Registry) []*Member {
+	sticky := cacheKey != ""
+	var keyHash uint64
+	if sticky {
+		keyHash = fnv1aString(cacheKey)
+	}
 	out := make([]*Member, 0, len(in))
 	for i := 0; i < len(in); {
 		j := i + 1
@@ -426,11 +439,16 @@ func rotateGroups(in []*Member, n uint64, health *Registry) []*Member {
 		g := in[i:j]
 		if len(g) > 1 {
 			rotated := make([]*Member, len(g))
-			off := int(n % uint64(len(g)))
+			var off int
+			if sticky {
+				off = stickyStartOffset(g, keyHash)
+			} else {
+				off = int(n % uint64(len(g)))
+			}
 			for k := range g {
 				rotated[k] = g[(k+off)%len(g)]
 			}
-			if health != nil {
+			if !sticky && health != nil {
 				bestIdx := -1
 				var bestTTFT time.Duration
 				allMeasured := true
@@ -459,6 +477,35 @@ func rotateGroups(in []*Member, n uint64, health *Registry) []*Member {
 		i = j
 	}
 	return out
+}
+
+func fnv1aString(s string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	var h uint64 = offset64
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime64
+	}
+	return h
+}
+
+func stickyStartOffset(g []*Member, keyHash uint64) int {
+	bestIdx := 0
+	var bestScore uint64
+	for k, m := range g {
+		score := keyHash ^ (uint64(m.ID)*0x9e3779b97f4a7c15 + 0x517cc1b727220a95)
+		score ^= score >> 30
+		score *= 0xbf58476d1ce4e5b9
+		score ^= score >> 27
+		if k == 0 || score > bestScore {
+			bestScore = score
+			bestIdx = k
+		}
+	}
+	return bestIdx
 }
 
 // statusRe pulls the HTTP status out of the SDK's error text, which is formatted

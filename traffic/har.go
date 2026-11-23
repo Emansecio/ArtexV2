@@ -676,6 +676,7 @@ func (t *Traffic) ExportHAR(f PageQuery, opts HARExportOptions) (HAR, HARExportM
 	if t == nil {
 		return HAR{}, HARExportMeta{}, errors.New("traffic store is not available")
 	}
+	t.flushPending()
 	if opts.MaxEntries <= 0 {
 		opts.MaxEntries = DefaultHARMaxExportEntries
 	}

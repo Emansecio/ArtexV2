@@ -6,7 +6,6 @@
 import { t } from "@/i18n";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
-import { mockHandle } from "@/lib/mock/handler";
 import type {
   ActiveFindingRetest,
   Activity,
@@ -140,40 +139,63 @@ export class ApiError extends Error {
   }
 }
 
+const inflightGets = new Map<string, Promise<unknown>>();
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
-  if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
-  const token = getToken();
-  const r = await fetch(`/api${path}`, {
-    ...init,
-    headers: {
-      ...(init?.body ? { "Content-Type": "application/json" } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(init?.headers as Record<string, string> | undefined),
-    },
-  });
-  if (r.status === 401) {
-    if (typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
-      window.location.href = "/login";
-    }
-    throw new Error(t("Unauthorized"));
+  if (MOCK) {
+    const { mockHandle } = await import("@/lib/mock/handler");
+    return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   }
-  if (!r.ok) {
-    const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
-    let message = fallback;
-    try {
-      const payload = (await r.json()) as { error?: unknown };
-      if (typeof payload.error === "string" && payload.error.trim()) {
-        message = payload.error.trim();
+  const canDedupe =
+    (!init?.method || init.method.toUpperCase() === "GET") &&
+    !init?.signal &&
+    !init?.body &&
+    !init?.headers;
+  if (canDedupe) {
+    const existing = inflightGets.get(path);
+    if (existing) return existing as Promise<T>;
+  }
+  const reqPromise = (async () => {
+    const token = getToken();
+    const r = await fetch(`/api${path}`, {
+      ...init,
+      headers: {
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(init?.headers as Record<string, string> | undefined),
+      },
+    });
+    if (r.status === 401) {
+      if (typeof window !== "undefined") {
+        localStorage.removeItem("artex_token");
+        document.cookie = "artex_token=; path=/; max-age=0";
+        window.location.href = "/login";
       }
-    } catch {
-      // Keep the status-based fallback for empty or non-JSON error responses.
+      throw new Error(t("Unauthorized"));
     }
-    throw new ApiError(message, r.status);
+    if (!r.ok) {
+      const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
+      let message = fallback;
+      try {
+        const payload = (await r.json()) as { error?: unknown };
+        if (typeof payload.error === "string" && payload.error.trim()) {
+          message = payload.error.trim();
+        }
+      } catch {
+        // Keep the status-based fallback for empty or non-JSON error responses.
+      }
+      throw new ApiError(message, r.status);
+    }
+    if (r.status === 204) return undefined as T;
+    return r.json() as Promise<T>;
+  })();
+  if (!canDedupe) return reqPromise;
+  inflightGets.set(path, reqPromise);
+  try {
+    return await reqPromise;
+  } finally {
+    inflightGets.delete(path);
   }
-  if (r.status === 204) return undefined as T;
-  return r.json();
 }
 
 // sseUrl builds a URL for Server-Sent Events streams.

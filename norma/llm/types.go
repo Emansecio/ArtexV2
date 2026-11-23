@@ -212,6 +212,10 @@ type CompletionRequest struct {
 	// tokens on reasoning and never replays thinking blocks (which Anthropic
 	// rejects when thinking is off).
 	Thinking string
+	// ReasoningEffort overrides the provider's reasoning effort for THIS request
+	// only: "" inherits Config.ReasoningEffort; e.g. "low"/"medium"/"high".
+	// Ignored when Thinking resolves to "disabled".
+	ReasoningEffort string
 	// PromptCacheKey is an optional stable cache routing key (used as
 	// prompt_cache_key on OpenAI Chat Completions and Responses APIs).
 	PromptCacheKey string

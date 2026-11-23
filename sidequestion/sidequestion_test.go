@@ -176,7 +176,7 @@ func TestServiceNoToolsAndUsageOnFailure(t *testing.T) {
 			}}
 			before := fixture()
 			req, _ := CloneRequest(before)
-			out, err := (SideQuestionService{p}).Answer(t.Context(), req, streaming, nil)
+			out, err := (SideQuestionService{Provider: p}).Answer(t.Context(), req, streaming, nil)
 			if err != nil || calls != 1 || !out.ToolUse || !strings.Contains(out.Text, "cannot execute tool") || out.Usage.InputTokens != 11 {
 				t.Fatalf("answer %+v calls=%d err=%v", out, calls, err)
 			}
@@ -192,7 +192,7 @@ func TestServiceNoToolsAndUsageOnFailure(t *testing.T) {
 			y(llm.StreamEvent{}, errors.New("broken"))
 		}
 	}}
-	out, err := (SideQuestionService{p}).Answer(t.Context(), fixture(), true, nil)
+	out, err := (SideQuestionService{Provider: p}).Answer(t.Context(), fixture(), true, nil)
 	if err == nil || out.Text != "partial" || out.Usage.InputTokens != 12 {
 		t.Fatalf("lost failure usage/partial: %+v %v", out, err)
 	}
@@ -223,7 +223,7 @@ func TestMainSideConcurrencyAndIndependentCancellation(t *testing.T) {
 				for range deps.CallModel(mainCtx, fixture()) {
 				}
 			}()
-			go func() { a, _ := (SideQuestionService{bound}).Answer(sideCtx, fixture(), true, nil); sideDone <- a }()
+			go func() { a, _ := (SideQuestionService{Provider: bound}).Answer(sideCtx, fixture(), true, nil); sideDone <- a }()
 			for i := 0; i < 2; i++ {
 				select {
 				case <-started:

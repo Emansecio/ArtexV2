@@ -93,6 +93,7 @@ const (
 
 type speculativeJob struct {
 	done     chan struct{}
+	cancel   context.CancelFunc
 	start    int
 	tail     int
 	sumCount int
@@ -280,8 +281,10 @@ func (c *Compactor) maybeStartSpeculative(ctx context.Context, msgs []llm.Messag
 		c.specMu.Unlock()
 		return
 	}
+	sctx, cancel := context.WithCancel(ctx)
 	job := &speculativeJob{
 		done:     make(chan struct{}),
+		cancel:   cancel,
 		start:    start,
 		tail:     tailStart,
 		sumCount: len(snap),
@@ -291,10 +294,23 @@ func (c *Compactor) maybeStartSpeculative(ctx context.Context, msgs []llm.Messag
 
 	go func() {
 		defer close(job.done)
-		summary, err := c.summarize(ctx, snap)
+		defer cancel()
+		summary, err := c.summarize(sctx, snap)
 		job.summary = summary
 		job.err = err
 	}()
+}
+
+// CancelSpeculative aborts any in-flight speculative pre-compaction summary
+// and drops any cached speculative job.
+func (c *Compactor) CancelSpeculative() {
+	c.specMu.Lock()
+	job := c.spec
+	c.spec = nil
+	c.specMu.Unlock()
+	if job != nil && job.cancel != nil {
+		job.cancel()
+	}
 }
 
 func (c *Compactor) tryTakeSpeculative(ctx context.Context, start, tailStart int) (summary string, chosenTail, sumCount int, ok bool) {
