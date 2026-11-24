@@ -8,7 +8,6 @@ import (
 	"iter"
 	"log"
 	"math/rand/v2"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,7 +18,6 @@ import (
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/transcript"
 )
 
 type taskAgentBundle struct {
@@ -872,7 +870,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	plannerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "planner"}
 	workerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "worker"}
 	mainRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
-	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
+	tx := s.sharedTranscriptStore()
 	window := workerRuntime.CompactionWindow()
 	lessonsNonce := agent.NewTaskNonce()
 	summaryProv, summaryModel, hasSummary := agent.SummaryProviderFromEnv()

@@ -179,23 +179,79 @@ func (s *Store) runWriter() {
 		return nil
 	}
 
-	tick := time.NewTicker(100 * time.Millisecond)
-	defer tick.Stop()
-	idleCheck := time.NewTicker(5 * time.Second)
-	defer idleCheck.Stop()
+	var (
+		flushTimer *time.Timer
+		flushC     <-chan time.Time
+		idleTimer  *time.Timer
+		idleC      <-chan time.Time
+	)
+	stopFlush := func() {
+		if flushTimer != nil {
+			if !flushTimer.Stop() {
+				select {
+				case <-flushTimer.C:
+				default:
+				}
+			}
+			flushC = nil
+		}
+	}
+	armFlush := func() {
+		if flushC != nil {
+			return
+		}
+		if flushTimer == nil {
+			flushTimer = time.NewTimer(100 * time.Millisecond)
+		} else {
+			flushTimer.Reset(100 * time.Millisecond)
+		}
+		flushC = flushTimer.C
+	}
+	stopIdle := func() {
+		if idleTimer != nil {
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleC = nil
+		}
+	}
+	armIdle := func() {
+		if idleC != nil {
+			return
+		}
+		if idleTimer == nil {
+			idleTimer = time.NewTimer(5 * time.Second)
+		} else {
+			idleTimer.Reset(5 * time.Second)
+		}
+		idleC = idleTimer.C
+	}
+	defer func() {
+		stopFlush()
+		stopIdle()
+	}()
 
 	handleReq := func(req txWriteReq) bool {
 		if len(req.data) > 0 {
 			if err := writePath(req.path, req.data); err != nil {
 				s.recordErr(err)
+			} else {
+				armFlush()
+				armIdle()
 			}
 		}
 		if req.flushCh != nil {
 			var err error
 			if req.closeAll {
 				err = closeAll()
+				stopFlush()
+				stopIdle()
 			} else {
 				err = flushAll()
+				stopFlush()
 			}
 			if prev := s.popErr(); err == nil && prev != nil {
 				err = prev
@@ -212,11 +268,13 @@ func (s *Store) runWriter() {
 			if handleReq(req) {
 				return
 			}
-		case <-tick.C:
+		case <-flushC:
+			flushC = nil
 			if err := flushAll(); err != nil {
 				s.recordErr(err)
 			}
-		case now := <-idleCheck.C:
+		case now := <-idleC:
+			idleC = nil
 			for path, h := range handles {
 				if now.Sub(h.lastUsed) >= 15*time.Second {
 					if err := flushHandle(h); err != nil {
@@ -227,6 +285,9 @@ func (s *Store) runWriter() {
 					}
 					delete(handles, path)
 				}
+			}
+			if len(handles) > 0 {
+				armIdle()
 			}
 		case <-s.stopCh:
 			// Drain queued requests before shutting down.

@@ -2705,5 +2705,11 @@
   "Hashes": "哈希",
   "Masked (HMAC)": "已脱敏 (HMAC)",
   "Resulting request": "结果请求",
-  "Resulting response": "结果响应"
+  "Resulting response": "结果响应",
+  "Operations": "运营",
+  "Exploration": "探索",
+  "Traces": "追踪",
+  "AI & Governance": "AI 与治理",
+  "AI Engine": "AI 引擎",
+  "Interception": "拦截控制"
 }

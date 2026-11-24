@@ -108,6 +108,26 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		var wg sync.WaitGroup
 
 		switch {
+		case chName == "global":
+			dch, dunsub := s.deltaHub.Subscribe("global")
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer dunsub()
+				for {
+					select {
+					case <-doneCh:
+						return
+					case <-subStop:
+						return
+					case msg, ok := <-dch:
+						if !ok {
+							return
+						}
+						enqueue(wsOutbound{Channel: chName, Event: msg.Event, Data: msg.Data})
+					}
+				}
+			}()
 		case chName == "logs":
 			lch, lunsub := logSink.subscribe()
 			if recent, cursor := logSink.recent(since, 1000); len(recent) > 0 {

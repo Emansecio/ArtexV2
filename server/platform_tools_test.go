@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,5 +56,83 @@ func TestSkillTools(t *testing.T) {
 	evil, _ := json.Marshal(map[string]any{"name": "my-skill", "file": "../escape.txt", "content": "x"})
 	if r, _ := s.toolUpdateSkillFile().Call(context.Background(), evil, nil); !r.IsError {
 		t.Fatal("path traversal should be rejected")
+	}
+
+	// create_skill safely quotes YAML special chars (": ") and writes mcps.
+	colonIn, _ := json.Marshal(map[string]any{
+		"name":         "graphql-audit",
+		"description":  "GraphQL pentest: introspection, batching, IDOR",
+		"mcps":         []string{"browser"},
+		"instructions": "## Steps\n1. Check introspection",
+	})
+	if r, err := s.toolCreateSkill().Call(context.Background(), colonIn, nil); err != nil || r.IsError {
+		t.Fatalf("create_skill with colon/mcps: err=%v result=%+v", err, r)
+	}
+	if err := verifySkillFile(filepath.Join(dir, "graphql-audit"), "graphql-audit", []string{"browser"}); err != nil {
+		t.Fatalf("verifySkillFile failed: %v", err)
+	}
+}
+
+func TestInstallSkillTool(t *testing.T) {
+	const validSkill = "---\nname: remote-skill\ndescription: \"Remote skill: test\"\n---\n## Usage\n1. Run\n"
+	const updatedSkill = "---\nname: remote-skill\ndescription: \"Remote skill: updated\"\n---\n## Usage\n1. Run v2\n"
+	const invalidSkill = "---\nname: broken\n---\nmissing description\n"
+
+	body := validSkill
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/valid":
+			_, _ = w.Write([]byte(body))
+		case "/invalid":
+			_, _ = w.Write([]byte(invalidSkill))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	s := &Server{skillDir: dir}
+	tool := s.toolInstallSkill()
+
+	// Non-HTTP scheme rejected.
+	badScheme, _ := json.Marshal(map[string]any{"url": "file:///etc/passwd"})
+	if r, _ := tool.Call(context.Background(), badScheme, nil); !r.IsError {
+		t.Fatal("expected non-HTTP URL to be rejected")
+	}
+
+	// Invalid SKILL.md (missing description) rejected and not left on disk.
+	badSkill, _ := json.Marshal(map[string]any{"url": srv.URL + "/invalid"})
+	if r, _ := tool.Call(context.Background(), badSkill, nil); !r.IsError {
+		t.Fatal("expected invalid SKILL.md to be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "broken")); !os.IsNotExist(err) {
+		t.Fatalf("invalid skill should not be left on disk")
+	}
+
+	// Valid install succeeds.
+	okIn, _ := json.Marshal(map[string]any{"url": srv.URL + "/valid"})
+	if r, err := tool.Call(context.Background(), okIn, nil); err != nil || r.IsError {
+		t.Fatalf("install_skill failed: err=%v result=%+v", err, r)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "remote-skill", "SKILL.md"))
+	if err != nil || string(got) != validSkill {
+		t.Fatalf("installed SKILL.md mismatch: err=%v got=%q", err, got)
+	}
+
+	// Duplicate install without overwrite is rejected.
+	if r, _ := tool.Call(context.Background(), okIn, nil); !r.IsError {
+		t.Fatal("expected duplicate install without overwrite to fail")
+	}
+
+	// Overwrite=true updates SKILL.md.
+	body = updatedSkill
+	owIn, _ := json.Marshal(map[string]any{"url": srv.URL + "/valid", "overwrite": true})
+	if r, err := tool.Call(context.Background(), owIn, nil); err != nil || r.IsError {
+		t.Fatalf("install_skill overwrite failed: err=%v result=%+v", err, r)
+	}
+	got2, err := os.ReadFile(filepath.Join(dir, "remote-skill", "SKILL.md"))
+	if err != nil || string(got2) != updatedSkill {
+		t.Fatalf("overwritten SKILL.md mismatch: err=%v got=%q", err, got2)
 	}
 }

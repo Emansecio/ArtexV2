@@ -337,7 +337,7 @@ func isReadOnlyStage(words []string) bool {
 	}
 	switch base {
 	case "dig", "nslookup", "host", "whois", "grep", "rg", "head", "tail",
-		"cat", "wc", "jq", "ls", "stat", "file", "uname", "id", "whoami", "pwd",
+		"cat", "wc", "jq", "gojq", "ls", "stat", "file", "uname", "id", "whoami", "pwd",
 		"sort", "uniq", "cut":
 		return true
 	case "awk":

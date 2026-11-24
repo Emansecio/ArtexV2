@@ -211,14 +211,20 @@ func (s *logSinkT) add(l LogLine) {
 	s.mu.Lock()
 	s.seq++
 	l.Seq = s.seq
-	s.ring = append(s.ring, l)
-	if len(s.ring) > s.cap {
-		s.ring = s.ring[len(s.ring)-s.cap:]
+	if len(s.ring) < s.cap {
+		s.ring = append(s.ring, l)
+	} else if s.cap > 0 {
+		// Shift in place so the backing array never grows or retains stale strings.
+		copy(s.ring, s.ring[1:])
+		s.ring[s.cap-1] = l
 	}
 	ch := s.dbCh
-	subs := make([]chan LogLine, 0, len(s.subs))
-	for sub := range s.subs {
-		subs = append(subs, sub)
+	var subs []chan LogLine
+	if len(s.subs) > 0 {
+		subs = make([]chan LogLine, 0, len(s.subs))
+		for sub := range s.subs {
+			subs = append(subs, sub)
+		}
 	}
 	s.mu.Unlock()
 

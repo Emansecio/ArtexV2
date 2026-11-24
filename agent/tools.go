@@ -499,7 +499,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			fp = sfp
 			cacheKey = fmt.Sprintf("%d:%d:%v", t.ts.ID(), t.taskID, t.coverageDisabled)
 			overviewCache.mu.Lock()
-			if ent, ok := overviewCache.m[cacheKey]; ok && ent.fp == fp && time.Since(ent.createdAt) < 1500*time.Millisecond {
+			if ent, ok := overviewCache.m[cacheKey]; ok && ent.fp == fp && time.Since(ent.createdAt) < 15*time.Second {
 				cp := maps.Clone(ent.data)
 				overviewCache.mu.Unlock()
 				return cp
@@ -550,17 +550,44 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		}()
 	}
 
-	run(func() { goals, _ = t.ts.ListByKind(db.KindGoal, 100) })
-	run(func() { hints, _ = t.ts.ListByKind(db.KindHint, 50) })
-	run(func() { edges, _ = t.ts.Edges(5000) })
-	run(func() { covered, _ = t.ts.CoveredMembers() })
+	// Single-pass load of nodes + edges: avoids 6 separate ListByKind/Edges
+	// queries plus a duplicate full-graph read inside loadColdGraph.
 	run(func() {
-		if cg, _, err := loadColdGraph(t.ts); err == nil {
+		if cg, _, rawNodes, rawEdges, err := loadColdGraphWithRaw(t.ts); err == nil {
 			hotAtRend = cg.hotSet()
+			if len(rawEdges) > 5000 {
+				edges = rawEdges[:5000]
+			} else {
+				edges = rawEdges
+			}
+			for _, n := range rawNodes {
+				switch n.Kind {
+				case db.KindGoal:
+					if len(goals) < 100 {
+						goals = append(goals, n)
+					}
+				case db.KindHint:
+					if len(hints) < 50 {
+						hints = append(hints, n)
+					}
+				case db.KindIntent:
+					if len(allIntents) < 300 {
+						allIntents = append(allIntents, n)
+					}
+				case db.KindFinding:
+					if len(vulnNodes) < 1000 {
+						vulnNodes = append(vulnNodes, n)
+					}
+				case db.KindFact:
+					if len(factNodes) < 1000 {
+						factNodes = append(factNodes, n)
+					}
+				}
+			}
 		}
 	})
+	run(func() { covered, _ = t.ts.CoveredMembers() })
 	run(func() { fr, _ = t.ts.Frontier(openIntentsCap) })
-	run(func() { allIntents, _ = t.ts.ListByKind(db.KindIntent, 300) })
 	run(func() {
 		if dt, err := t.ts.CountFinishedIntents(); err == nil {
 			doneTotal, hasDoneTot = dt, true
@@ -571,8 +598,6 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			openTotal, hasOpenTot = fo, true
 		}
 	})
-	run(func() { vulnNodes, _ = t.ts.ListByKind(db.KindFinding, 1000) })
-	run(func() { factNodes, _ = t.ts.ListByKind(db.KindFact, 1000) })
 	run(func() { cds, cdMore = coldDigestsRecent(t.ts, coldDigestsCap) })
 	run(func() {
 		if d, g, err := t.ts.Root(); err == nil {
@@ -753,6 +778,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			if len(overviewCache.m) >= 128 {
 				clear(overviewCache.m)
 			}
+		}
+		if len(overviewCache.m) >= 32 {
+			clear(overviewCache.m)
 		}
 		overviewCache.m[cacheKey] = overviewCacheEntry{fp: fp, data: maps.Clone(out), createdAt: now}
 		overviewCache.mu.Unlock()

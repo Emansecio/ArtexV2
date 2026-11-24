@@ -56,6 +56,8 @@ func renderNoiseProfile(p egress.Profile) string {
 	fmt.Fprintf(&b, "%s%s. Operator setting, not a target fact.]\n", noiseProfileHeader, p.Name)
 	b.WriteString("Scan at a reduced rate. When you run one of these scanners, use the flags exactly:\n")
 	fmt.Fprintf(&b, "- nmap: %s --max-rate %d --max-retries %s\n", timing, rps, retries)
+	fmt.Fprintf(&b, "- naabu: -s c -rate %d -c %d\n", rps, conc)
+	fmt.Fprintf(&b, "- dnsx / tlsx: -rl %d -t %d\n", rps, conc)
 	fmt.Fprintf(&b, "- nuclei: -rate-limit %d -c %d\n", rps, conc)
 	fmt.Fprintf(&b, "- httpx: -rl %d -t %d\n", rps, conc)
 	fmt.Fprintf(&b, "- katana: -rl %d -c %d\n", rps, conc)

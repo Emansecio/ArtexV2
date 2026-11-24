@@ -67,26 +67,35 @@ export default function LogsPage() {
     }
     const pending: LogLine[] = [];
     let rafId = 0;
+    const seenSeq = new Set<number>();
     const flush = () => {
       rafId = 0;
       if (!pending.length) return;
       const batch = pending.splice(0, pending.length);
+      const add: LogLine[] = [];
+      for (let i = 0; i < batch.length; i++) {
+        const l = batch[i];
+        if (l.seq != null) {
+          if (seenSeq.has(l.seq)) continue;
+          seenSeq.add(l.seq);
+        }
+        add.push(l);
+      }
+      if (!add.length) return;
       setLines((prev) => {
-        const seen = new Set<number>();
-        for (let i = 0; i < prev.length; i++) {
-          const s = prev[i].seq;
-          if (s != null) seen.add(s);
-        }
-        const add: LogLine[] = [];
-        for (let i = 0; i < batch.length; i++) {
-          const l = batch[i];
-          if (l.seq != null && seen.has(l.seq)) continue;
-          if (l.seq != null) seen.add(l.seq);
-          add.push(l);
-        }
-        if (!add.length) return prev;
         const next = prev.concat(add);
-        return next.length > 3000 ? next.slice(next.length - 3000) : next;
+        if (next.length > 3000) {
+          const trimmed = next.slice(next.length - 3000);
+          if (seenSeq.size > 6000) {
+            seenSeq.clear();
+            for (let i = 0; i < trimmed.length; i++) {
+              const s = trimmed[i].seq;
+              if (s != null) seenSeq.add(s);
+            }
+          }
+          return trimmed;
+        }
+        return next;
       });
     };
     const unsub = subscribeWS("logs", {

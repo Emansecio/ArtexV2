@@ -14,7 +14,7 @@ interface SubEntry {
 
 const channels = new Map<string, Set<SubEntry>>();
 const connListeners = new Set<(connected: boolean) => void>();
-const dirtyListeners = new Set<(channel: string) => void>();
+const dirtyListeners = new Set<(channel: string, topic?: string) => void>();
 
 let socket: WebSocket | null = null;
 let connected = false;
@@ -22,6 +22,7 @@ let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 let reconnectMs = 1000;
 let dirtyTimer: ReturnType<typeof setTimeout> | undefined;
 let lastDirtyChannel = "";
+let lastDirtyTopic: string | undefined;
 
 function buildWSUrl(): string {
   const raw = sseUrl("/api/ws");
@@ -47,13 +48,15 @@ function notifyConnection(next: boolean) {
   }
 }
 
-function notifyDirty(channel: string) {
+function notifyDirty(channel: string, topic?: string) {
   lastDirtyChannel = channel;
+  lastDirtyTopic = topic;
   if (dirtyTimer !== undefined) return;
   dirtyTimer = setTimeout(() => {
     dirtyTimer = undefined;
     const ch = lastDirtyChannel;
-    for (const fn of dirtyListeners) fn(ch);
+    const tp = lastDirtyTopic;
+    for (const fn of dirtyListeners) fn(ch, tp);
   }, 600);
 }
 
@@ -104,7 +107,10 @@ function ensureSocket() {
     if (subs) {
       for (const s of subs) s.onEvent(event, msg.data);
     }
-    if (event === "activity" || event === "status" || event === "side") {
+    if (ch === "global" && event === "topic") {
+      const tp = msg.data && typeof msg.data === "object" ? (msg.data as { topic?: string }).topic : undefined;
+      notifyDirty(ch, tp);
+    } else if (event === "activity" || event === "status" || event === "side") {
       notifyDirty(ch);
     }
   };
@@ -148,7 +154,7 @@ export function onWSConnectionChange(fn: (connected: boolean) => void): () => vo
   return () => connListeners.delete(fn);
 }
 
-export function onWSDirty(fn: (channel: string) => void): () => void {
+export function onWSDirty(fn: (channel: string, topic?: string) => void): () => void {
   dirtyListeners.add(fn);
   return () => dirtyListeners.delete(fn);
 }

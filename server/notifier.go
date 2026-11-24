@@ -36,10 +36,9 @@ const (
 )
 
 const (
-	// notifyTick is the delivery engine's polling interval. 3 seconds is the upper
-	// bound of this engine's realtimeness, and also the main source of latency
-	// between "vulnerability persisted" and "message arrives at the IM".
-	notifyTick = 3 * time.Second
+	// notifyTick is the delivery engine's fallback polling interval. Real-time
+	// events wake the loop immediately via Wake(), keeping idle DB queries near 0.
+	notifyTick = 30 * time.Second
 	// notifyLease is the lease duration when claiming deliveries. It must be
 	// significantly longer than the worst-case duration of a single delivery
 	// (the notify package's HTTP client timeout is 15 seconds), otherwise the
@@ -101,13 +100,17 @@ var notifyBackoff = []time.Duration{
 // failures must not affect each other — a stuck delivery must not impact agent
 // triggering.
 type Notifier struct {
-	s  *Server
-	pg *db.DB
+	s    *Server
+	pg   *db.DB
+	wake chan struct{}
 
-	// mu guards buckets. The number of channels is small and contention is low,
-	// so a single mutex is enough; a finer-grained structure is not worth it.
-	mu      sync.Mutex
-	buckets map[int64]*notifyBucket
+	// mu guards buckets and short-lived config cache.
+	mu          sync.Mutex
+	buckets     map[int64]*notifyBucket
+	cfgAt       time.Time
+	cfgEnabled  bool
+	cfgChannels []*db.NotificationChannel
+	cfgBaseURL  string
 }
 
 // notifyBucket is the token bucket for a single channel.
@@ -123,7 +126,26 @@ type notifyBucket struct {
 }
 
 func newNotifier(s *Server) *Notifier {
-	return &Notifier{s: s, pg: s.m.pg, buckets: map[int64]*notifyBucket{}}
+	return &Notifier{
+		s:       s,
+		pg:      s.m.pg,
+		wake:    make(chan struct{}, 1),
+		buckets: map[int64]*notifyBucket{},
+	}
+}
+
+// Wake invalidates the short config cache and nudges the delivery loop.
+func (n *Notifier) Wake() {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	n.cfgAt = time.Time{}
+	n.mu.Unlock()
+	select {
+	case n.wake <- struct{}{}:
+	default:
+	}
 }
 
 // Run loops until ctx ends. Started once by server.New.
@@ -137,10 +159,46 @@ func (n *Notifier) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-n.wake:
+			n.step(ctx)
 		case <-t.C:
 			n.step(ctx)
 		}
 	}
+}
+
+func (n *Notifier) loadConfig(ctx context.Context) (bool, []*db.NotificationChannel, string, error) {
+	n.mu.Lock()
+	if !n.cfgAt.IsZero() && time.Since(n.cfgAt) < 30*time.Second {
+		en, chs, base := n.cfgEnabled, n.cfgChannels, n.cfgBaseURL
+		n.mu.Unlock()
+		return en, chs, base, nil
+	}
+	n.mu.Unlock()
+
+	en := n.enabled()
+	var chs []*db.NotificationChannel
+	var base string
+	if en {
+		var err error
+		chs, err = n.pg.ListNotificationChannels(ctx)
+		if err != nil {
+			return false, nil, "", err
+		}
+		for _, ch := range chs {
+			if ch.IsEnabled() {
+				base = n.publicBaseURL()
+				break
+			}
+		}
+	}
+	n.mu.Lock()
+	n.cfgAt = time.Now()
+	n.cfgEnabled = en
+	n.cfgChannels = chs
+	n.cfgBaseURL = base
+	n.mu.Unlock()
+	return en, chs, base, nil
 }
 
 // step runs one round: first fan out new events, then deliver due tasks.
@@ -149,19 +207,28 @@ func (n *Notifier) Run(ctx context.Context) {
 // notification system must never escalate into a process-level problem. Every
 // tick is independent, and the next round will naturally retry.
 func (n *Notifier) step(ctx context.Context) {
-	if !n.enabled() {
+	enabled, channels, baseURL, err := n.loadConfig(ctx)
+	if err != nil {
+		log.Printf("[notify] failed to read channels: %v", err)
+		return
+	}
+	if !enabled {
+		return
+	}
+	hasEnabled := false
+	for _, ch := range channels {
+		if ch.IsEnabled() {
+			hasEnabled = true
+			break
+		}
+	}
+	if !hasEnabled {
 		return
 	}
 	if _, _, err := n.pg.FanOutPendingEvents(ctx, notifyFanOutPerTick); err != nil {
 		log.Printf("[notify] failed to fan out events: %v", err)
 		return
 	}
-	channels, err := n.pg.ListNotificationChannels(ctx)
-	if err != nil {
-		log.Printf("[notify] failed to read channels: %v", err)
-		return
-	}
-	baseURL := n.publicBaseURL()
 	for _, ch := range channels {
 		if !ch.IsEnabled() {
 			continue

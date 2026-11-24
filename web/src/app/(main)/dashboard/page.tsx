@@ -135,6 +135,7 @@ export default function DashboardPage() {
   // data state
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [findings, setFindings] = React.useState<Finding[]>([]);
+  const [findingSev, setFindingSev] = React.useState<Record<string, number>>({});
   const [stats, setStats] = React.useState<Stats | null>(null);
   const [settings, setSettings] = React.useState<Settings | null>(null);
   const [pending, setPending] = React.useState<InterceptPending[]>([]);
@@ -155,18 +156,13 @@ export default function DashboardPage() {
   React.useEffect(() => {
     let alive = true;
     let loading = false;
-    let signature = "";
     const load = async () => {
       if (loading) return;
       loading = true;
       try {
         const tr = await api.tasks();
         if (!alive) return;
-        const nextSignature = JSON.stringify(tr.tasks);
-        if (nextSignature !== signature) {
-          signature = nextSignature;
-          setTasks(tr.tasks);
-        }
+        setTasks(tr.tasks);
       } catch {
         /* transient errors — next poll retries */
       } finally {
@@ -174,7 +170,7 @@ export default function DashboardPage() {
       }
     };
     void load();
-    const stopPolling = setVisibleInterval(load, 5000);
+    const stopPolling = setVisibleInterval(load, 5000, { topics: ["tasks"] });
     return () => {
       alive = false;
       stopPolling();
@@ -189,8 +185,9 @@ export default function DashboardPage() {
       if (loading) return;
       loading = true;
       try {
-        const [findings, stats, pending, activity, tokens, conversationTokens] = await Promise.all([
-          api.findings(),
+        const [fPage, fStats, stats, pending, activity, tokens, conversationTokens] = await Promise.all([
+          api.findingsPage({ page: 1, pageSize: 8 }),
+          api.findingStats().catch(() => null),
           api.stats(),
           api.interceptPending(),
           api.activity(undefined, { limit: 30 }),
@@ -198,8 +195,17 @@ export default function DashboardPage() {
           api.conversationTokens(),
         ]);
         if (!alive) return;
-        setFindings(findings);
+        setFindings(fPage.items ?? []);
+        if (fStats) {
+          setFindingSev({
+            critical: fStats.critical ?? 0,
+            high: fStats.high ?? 0,
+            medium: fStats.medium ?? 0,
+            low: fStats.low ?? 0,
+          });
+        }
         setStats(stats);
+        if (stats?.asset_counts) setAssetCounts(stats.asset_counts);
         setPending(pending);
         setActivity(activity.items);
         setTokens(tokens.total ?? null);
@@ -211,7 +217,7 @@ export default function DashboardPage() {
       }
     };
     void load();
-    const stopPolling = setVisibleInterval(load, 5000);
+    const stopPolling = setVisibleInterval(load, 5000, { topics: ["findings", "stats", "intercept"] });
     return () => {
       alive = false;
       stopPolling();
@@ -246,26 +252,24 @@ export default function DashboardPage() {
     };
   }, []);
 
-  // slow poll: live traffic, asset counts, usage (every 15s)
+  // slow poll: live traffic and usage (every 15s; asset_counts already comes from stats)
   React.useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
-        const [traf, counts, usage] = await Promise.all([
+        const [traf, usage] = await Promise.all([
           api.traffic(0, 50),
-          api.assetCounts(),
           api.usageStats(365),
         ]);
         if (!alive) return;
         setTraffic(traf.exchanges ?? []);
-        setAssetCounts(counts ?? {});
         setUsageStats(usage);
       } catch {
         /* transient errors */
       }
     };
     void load();
-    const stopPolling = setVisibleInterval(load, 15000);
+    const stopPolling = setVisibleInterval(load, 15000, { topics: ["traffic", "stats"] });
     return () => {
       alive = false;
       stopPolling();
@@ -281,12 +285,19 @@ export default function DashboardPage() {
   }, [tasks]);
 
   const findingsBySev = React.useMemo(() => {
-    const m = { critical: 0, high: 0, medium: 0, low: 0 };
-    for (const f of findings) {
-      if (f.severity in m) m[f.severity as keyof typeof m]++;
+    const m = {
+      critical: findingSev.critical ?? 0,
+      high: findingSev.high ?? 0,
+      medium: findingSev.medium ?? 0,
+      low: findingSev.low ?? 0,
+    };
+    if (m.critical + m.high + m.medium + m.low === 0 && findings.length > 0) {
+      for (const f of findings) {
+        if (f.severity in m) m[f.severity as keyof typeof m]++;
+      }
     }
     return m;
-  }, [findings]);
+  }, [findingSev, findings]);
 
   const sortedTasks = React.useMemo(
     () =>

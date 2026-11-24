@@ -224,7 +224,7 @@ export default function TrafficPage() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: reloadTick is an explicit manual-refetch trigger.
   React.useEffect(() => {
     let alive = true;
-    const load = () => {
+    const load = () =>
       api
         .traffic(page, size, hostQ, method, queryQ, {
           body: bodyQ,
@@ -242,20 +242,15 @@ export default function TrafficPage() {
         .catch(() => {
           // Keep the last successful snapshot during transient refresh failures.
         });
-      api
-        .trafficHosts()
-        .then((r) => {
-          if (alive) setHosts(r.hosts ?? []);
-        })
-        .catch(() => {
-          // Keep the last successful host list during transient refresh failures.
-        });
-    };
-    load();
-    const stopPolling = setVisibleInterval(() => {
-      if (page !== 0) return; // only auto-refresh the newest page
-      load();
-    }, 5000);
+    void load();
+    const stopPolling = setVisibleInterval(
+      () => {
+        if (page !== 0) return; // only auto-refresh the newest page
+        return load();
+      },
+      5000,
+      { topics: ["traffic"] },
+    );
     return () => {
       alive = false;
       stopPolling();
@@ -275,6 +270,23 @@ export default function TrafficPage() {
     sort,
     reloadTick,
   ]);
+
+  // Refresh host list only on mount / explicit reloadTick instead of every 5s poll.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reloadTick triggers manual refresh.
+  React.useEffect(() => {
+    let alive = true;
+    api
+      .trafficHosts()
+      .then((r) => {
+        if (alive) setHosts(r.hosts ?? []);
+      })
+      .catch(() => {
+        // Keep the last successful host list during transient refresh failures.
+      });
+    return () => {
+      alive = false;
+    };
+  }, [reloadTick]);
 
   // Delete traffic for the current host filter (substring) or the checked
   // hosts (exact batch), then refetch.

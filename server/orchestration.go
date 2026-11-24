@@ -1079,7 +1079,7 @@ func (s *Server) seedWorkerReadbackRebind() {
 // before Auto existed still give Auto its default toolset — without re-adding it
 // after a user deliberately unbinds.
 func (s *Server) seedAutoDefaultBindings() {
-	const flag = "auto_default_bindings_v3" // v3: replaces old asset tool names, adds insert_assets/add_company_scope
+	const flag = "auto_default_bindings_v4" // v4: adds install_skill to Auto's default platform tools
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}

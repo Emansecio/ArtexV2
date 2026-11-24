@@ -34,7 +34,7 @@ const (
 )
 
 func newScheduler(s *Server) *Scheduler {
-	return &Scheduler{s: s, pg: s.m.pg, tick: 5 * time.Second}
+	return &Scheduler{s: s, pg: s.m.pg, tick: 30 * time.Second}
 }
 
 // Run loops until ctx is done, ticking the scheduler. Started once from server New.

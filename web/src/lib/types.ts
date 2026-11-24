@@ -1380,6 +1380,7 @@ export interface Tool {
 // ---- Stats ----
 export interface Stats {
   assets: number;
+  asset_counts?: Record<string, number>;
   engine_mode: EngineMode;
   llm_configured: boolean;
   roe_enabled: boolean;

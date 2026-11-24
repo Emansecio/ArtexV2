@@ -5,7 +5,16 @@ import { isWSConnected, onWSConnectionChange, onWSDirty } from "@/lib/ws";
 // immediately, without creating a second request while one is still running.
 // When the multiplexed WS is live, intervals relax to 30s and incoming WS
 // activity triggers debounced revalidation.
-export function setVisibleInterval(callback: () => unknown | Promise<unknown>, delay: number): () => void {
+export interface VisibleIntervalOpts {
+  /** Optional WS topics/channel prefixes that trigger debounced revalidation. */
+  topics?: string[];
+}
+
+export function setVisibleInterval(
+  callback: () => unknown | Promise<unknown>,
+  delay: number,
+  opts?: VisibleIntervalOpts,
+): () => void {
   let stopped = false;
   let running = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -45,12 +54,16 @@ export function setVisibleInterval(callback: () => unknown | Promise<unknown>, d
   const unsubConn = onWSConnectionChange(() => {
     if (!stopped && visible() && !running) schedule();
   });
-  const unsubDirty = onWSDirty(() => {
+  const unsubDirty = onWSDirty((ch, topic) => {
     if (stopped || running || !visible() || dirtyTimer !== undefined) return;
+    if (opts?.topics && opts.topics.length > 0) {
+      const matched = opts.topics.some((t) => topic === t || ch === t || ch.startsWith(`${t}:`));
+      if (!matched) return;
+    }
     dirtyTimer = setTimeout(() => {
       dirtyTimer = undefined;
       void run();
-    }, 800);
+    }, 1200);
   });
   schedule();
   return () => {

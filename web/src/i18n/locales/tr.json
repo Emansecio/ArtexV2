@@ -2705,5 +2705,11 @@
   "Hashes": "Özetler",
   "Masked (HMAC)": "Maskeli (HMAC)",
   "Resulting request": "Ortaya çıkan istek",
-  "Resulting response": "Ortaya çıkan yanıt"
+  "Resulting response": "Ortaya çıkan yanıt",
+  "Operations": "Operasyonlar",
+  "Exploration": "Keşif",
+  "Traces": "İzler",
+  "AI & Governance": "Yapay Zeka ve Yönetişim",
+  "AI Engine": "Yapay Zeka Motoru",
+  "Interception": "Araya Girme"
 }

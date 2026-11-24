@@ -20,7 +20,7 @@ import (
 	"github.com/Autumn-27/artex/traffic"
 )
 
-const taskArchivePollInterval = 2 * time.Second
+const taskArchivePollInterval = 5 * time.Minute
 
 type archiveBatchRequest struct {
 	TaskIDs    []string `json:"task_ids"`
@@ -72,6 +72,7 @@ func (s *Server) startTaskArchiveWorker() {
 		log.Printf("[task-archive] worker disabled because startup recovery is incomplete")
 		return
 	}
+	s.remoteJournalDirty.Store(true)
 	s.archiveWG.Add(1)
 	go func() {
 		defer s.archiveWG.Done()
@@ -106,10 +107,13 @@ func (s *Server) runOneTaskArchiveJob() error {
 	if s.ctx.Err() != nil {
 		return s.ctx.Err()
 	}
-	// Retry deferred remote cleanup before claiming more work. Failed cleanup
-	// keeps its durable journal and does not block unrelated local archives.
-	if err := s.recoverRemoteArchiveJournals(); err != nil {
-		log.Printf("[task-archive] deferred object cleanup: %v", err)
+	// Retry deferred remote cleanup only when startup or a prior failure
+	// marked remote journals as dirty, avoiding idle directory scans.
+	if s.remoteJournalDirty.Swap(false) {
+		if err := s.recoverRemoteArchiveJournals(); err != nil {
+			s.remoteJournalDirty.Store(true)
+			log.Printf("[task-archive] deferred object cleanup: %v", err)
+		}
 	}
 	job, err := s.m.pg.ClaimTaskArchiveJob(s.ctx)
 	if err != nil || job == nil {

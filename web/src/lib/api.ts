@@ -140,31 +140,47 @@ export class ApiError extends Error {
 }
 
 const inflightGets = new Map<string, Promise<unknown>>();
+const ETAG_CACHE_MAX = 64;
+const etagCache = new Map<string, { etag: string; data: unknown }>();
+
+function setEtagEntry(path: string, etag: string, data: unknown) {
+  if (etagCache.has(path)) etagCache.delete(path);
+  etagCache.set(path, { etag, data });
+  if (etagCache.size > ETAG_CACHE_MAX) {
+    const oldest = etagCache.keys().next().value;
+    if (oldest !== undefined) etagCache.delete(oldest);
+  }
+}
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) {
     const { mockHandle } = await import("@/lib/mock/handler");
     return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   }
-  const canDedupe =
-    (!init?.method || init.method.toUpperCase() === "GET") &&
-    !init?.signal &&
-    !init?.body &&
-    !init?.headers;
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    etagCache.clear();
+  }
+  const canDedupe = method === "GET" && !init?.signal && !init?.body && !init?.headers;
   if (canDedupe) {
     const existing = inflightGets.get(path);
     if (existing) return existing as Promise<T>;
   }
   const reqPromise = (async () => {
     const token = getToken();
+    const cached = canDedupe ? etagCache.get(path) : undefined;
     const r = await fetch(`/api${path}`, {
       ...init,
       headers: {
         ...(init?.body ? { "Content-Type": "application/json" } : {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(cached ? { "If-None-Match": cached.etag } : {}),
         ...(init?.headers as Record<string, string> | undefined),
       },
     });
+    if (r.status === 304 && cached) {
+      return cached.data as T;
+    }
     if (r.status === 401) {
       if (typeof window !== "undefined") {
         localStorage.removeItem("artex_token");
@@ -187,7 +203,12 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       throw new ApiError(message, r.status);
     }
     if (r.status === 204) return undefined as T;
-    return r.json() as Promise<T>;
+    const data = (await r.json()) as T;
+    if (canDedupe) {
+      const etag = r.headers.get("ETag");
+      if (etag) setEtagEntry(path, etag, data);
+    }
+    return data;
   })();
   if (!canDedupe) return reqPromise;
   inflightGets.set(path, reqPromise);

@@ -12,7 +12,17 @@ function moduleFor(name, globals = {}) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const exports = {};
-  vm.runInNewContext(output, { exports, ...globals });
+  const require = (id) => {
+    if (id === "@/lib/ws") {
+      return {
+        isWSConnected: () => false,
+        onWSConnectionChange: () => () => {},
+        onWSDirty: () => () => {},
+      };
+    }
+    throw new Error(`Unexpected require: ${id}`);
+  };
+  vm.runInNewContext(output, { exports, require, ...globals });
   return exports;
 }
 function setup(hidden = false) {

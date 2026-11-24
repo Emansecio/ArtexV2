@@ -17,6 +17,7 @@
 #   ARTEX_UPX_ARGS="--best --lzma"    Arguments passed to UPX.
 #   ARTEX_SKIP_FRONTEND=1             Reuse server/webui/dist (for CI artifact builds).
 #   ARTEX_SKIP_NPM_CI=1               Skip npm ci while rebuilding the frontend.
+#   ARTEX_SKIP_TOOLBOX=1              Skip fetching/embedding static Go tools (toolbox/embedded/toolbox.tar.zst).
 #   ARTEX_GOSUMDB=sum.golang.org      Go checksum database.
 set -euo pipefail
 
@@ -183,7 +184,7 @@ package_binary() {
     cp start.sh "$package_root/"
     chmod +x "$package_root/start.sh"
   fi
-  cp -R skills "$package_root/"
+  # Built-in skills are embedded in the artex binary and seeded on first start.
   cp config.example.json "$package_root/"
   if [ -f README.md ]; then cp README.md "$package_root/"; fi
   (cd "$ARTEX_PACKAGE_DIR" && zip -q -r -9 "$(basename "$archive")" "$(basename "$package_root")")
@@ -212,6 +213,11 @@ build_target() {
     output="${ARTEX_OUTPUT_DIR}/artex-${goos}-${goarch}/${binary_name}"
   fi
   mkdir -p "$(dirname "$output")"
+
+  if [ "${ARTEX_SKIP_TOOLBOX:-0}" != "1" ]; then
+    info "Fetching embedded Go security toolbox for ${goos}/${goarch}"
+    bash ./scripts/fetch-toolbox.sh --target "${goos}/${goarch}"
+  fi
 
   info "Compiling ${goos}/${goarch}, version ${ARTEX_BUILD_VERSION}"
   GOSUMDB="$ARTEX_GOSUMDB" \

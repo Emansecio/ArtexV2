@@ -15,6 +15,7 @@ import {
 } from "@/lib/preferences/layout";
 import { PREFERENCE_DEFAULTS } from "@/lib/preferences/preferences-config";
 import { cn } from "@/lib/utils";
+import { subscribeWS } from "@/lib/ws";
 
 import { MainContent } from "./_components/main-content";
 
@@ -44,6 +45,13 @@ export default function Layout({ children }: Readonly<{ children: ReactNode }>) 
       window.location.href = "/login";
     }
   }, []);
+
+  React.useEffect(() => {
+    if (!authed) return;
+    // Keep one lightweight multiplexed WS connection open across all pages so
+    // background pollers automatically relax from 3-5s to 30s.
+    return subscribeWS("global", { onEvent: () => {} });
+  }, [authed]);
 
   const defaultOpen = typeof document === "undefined" ? true : getClientCookie("sidebar_state") !== "false";
   const variant = readPref<SidebarVariant>(

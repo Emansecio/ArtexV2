@@ -377,16 +377,24 @@ func (c *Compactor) finish(expID int64) {
 // loadColdGraph reads the exploration's nodes + edges and builds the cold-graph
 // view plus an id→node index (for summaries/payload during compression).
 func loadColdGraph(ts *db.ExplorationStore) (*coldGraph, map[int64]*db.Node, error) {
+	cg, byID, _, _, err := loadColdGraphWithRaw(ts)
+	return cg, byID, err
+}
+
+// loadColdGraphWithRaw returns the coldGraph alongside the raw nodes and edges
+// slice so callers like graphOverviewData can partition by kind in memory
+// without re-querying the same rows multiple times.
+func loadColdGraphWithRaw(ts *db.ExplorationStore) (*coldGraph, map[int64]*db.Node, []*db.Node, []db.Edge, error) {
 	// Compaction must see the WHOLE graph, not the default row caps — pass a very
 	// high limit so the LIMIT clause is effectively unbounded for real task sizes.
 	const allRows = 1 << 30
 	nodes, err := ts.Nodes(allRows)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	edges, err := ts.Edges(allRows)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	cgNodes := make([]cgNode, 0, len(nodes))
 	byID := make(map[int64]*db.Node, len(nodes))
@@ -398,7 +406,7 @@ func loadColdGraph(ts *db.ExplorationStore) (*coldGraph, map[int64]*db.Node, err
 	for _, e := range edges {
 		cgEdges = append(cgEdges, cgEdge{From: e.From, Rel: e.Rel, To: e.To})
 	}
-	return newColdGraph(cgNodes, cgEdges), byID, nil
+	return newColdGraph(cgNodes, cgEdges), byID, nodes, edges, nil
 }
 
 func toDBStampOps(ops []stampOp) []db.StampOp {

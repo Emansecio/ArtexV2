@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
+import { useStreamDelta } from "@/lib/delta-store";
 import { intlLocale, t } from "@/i18n";
 import { Markdown } from "@/components/markdown";
 import { Badge } from "@/components/ui/badge";
@@ -771,6 +772,46 @@ export interface StreamingDeltaView {
 // Transcript renders a session's activity as a compact grouped execution replay:
 // human turns, thinking, tool calls (command+result paired), and messages — for
 // the main agent (interactive) and worker/planner (read-only) alike.
+const MemoStreamingBlock = React.memo(function MemoStreamingBlock({ text }: { text: string }) {
+  return <Markdown text={text} />;
+});
+
+function StreamingBubble({
+  streamingDelta,
+  streamSessionKey,
+}: {
+  streamingDelta?: StreamingDeltaView | null;
+  streamSessionKey?: string | null;
+}) {
+  const storeDelta = useStreamDelta(streamSessionKey);
+  const active = streamSessionKey ? storeDelta : streamingDelta;
+  if (!active?.text) return null;
+
+  if (active.kind === "thinking") {
+    return (
+      <div className="my-1 rounded-md border border-dashed border-muted-foreground/30 bg-muted/20 px-3 py-2 text-xs text-muted-foreground whitespace-pre-wrap break-words">
+        <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/80">
+          {t("Thinking")}…
+        </div>
+        {active.text}
+      </div>
+    );
+  }
+
+  // Split completed paragraphs (\n\n) from the trailing live line so only
+  // finalized blocks are parsed by ReactMarkdown (avoids O(N^2) 60 FPS AST work).
+  const splitIdx = active.text.lastIndexOf("\n\n");
+  const finalized = splitIdx > 0 ? active.text.slice(0, splitIdx) : "";
+  const tail = splitIdx > 0 ? active.text.slice(splitIdx + 2) : active.text;
+
+  return (
+    <div className="my-1 px-2 py-1 text-sm whitespace-pre-wrap break-words">
+      {finalized && <MemoStreamingBlock text={finalized} />}
+      {tail && <div className="whitespace-pre-wrap break-words">{tail}</div>}
+    </div>
+  );
+}
+
 export function Transcript({
   activity,
   live,
@@ -779,6 +820,7 @@ export function Transcript({
   fetchDetail,
   focusedSeq,
   streamingDelta,
+  streamSessionKey,
 }: {
   activity: Activity[];
   live?: boolean;
@@ -787,6 +829,7 @@ export function Transcript({
   fetchDetail?: (seq: number) => Promise<string>;
   focusedSeq?: number;
   streamingDelta?: StreamingDeltaView | null;
+  streamSessionKey?: string | null;
 }) {
   const transcriptRef = React.useRef<HTMLDivElement>(null);
   const [focusPadding, setFocusPadding] = React.useState(0);
@@ -803,26 +846,7 @@ export function Transcript({
   return (
     <div ref={transcriptRef} className="flex flex-col gap-1" style={focusPadding ? { paddingBlock: focusPadding } : undefined}>
       <ExecView activity={activity} taskId={taskId} chat={chat} fetchDetail={fetchDetail} focusedSeq={focusedSeq} />
-      {streamingDelta?.text && (
-        <div
-          className={
-            streamingDelta.kind === "thinking"
-              ? "my-1 rounded-md border border-dashed border-muted-foreground/30 bg-muted/20 px-3 py-2 text-xs text-muted-foreground whitespace-pre-wrap break-words"
-              : "my-1 px-2 py-1 text-sm whitespace-pre-wrap break-words"
-          }
-        >
-          {streamingDelta.kind === "thinking" ? (
-            <>
-              <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/80">
-                {t("Thinking")}…
-              </div>
-              {streamingDelta.text}
-            </>
-          ) : (
-            <Markdown text={streamingDelta.text} />
-          )}
-        </div>
-      )}
+      <StreamingBubble streamingDelta={streamingDelta} streamSessionKey={streamSessionKey} />
       {live && (
         <div className="flex items-center gap-2 pl-2 pt-1 text-xs text-muted-foreground">
           <span className="flex gap-1">

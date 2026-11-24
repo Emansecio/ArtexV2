@@ -66,35 +66,82 @@ export interface NavGroup {
 export const sidebarItems: NavGroup[] = [
   {
     id: 1,
-    label: t("Functions"),
+    label: t("Operations"),
     items: [
       { id: "dashboard", title: t("Dashboard"), url: "/dashboard", icon: LayoutDashboard },
-      { id: "chat", title: t("Chat"), url: "/chat", icon: MessageSquare },
       { id: "tasks", title: t("Tasks"), url: "/function/tasks", icon: Target },
       { id: "findings", title: t("Findings"), url: "/function/findings", icon: Bug },
-      { id: "traffic", title: t("Traffic"), url: "/function/traffic", icon: Activity },
-      { id: "commands", title: t("Tool Execution"), url: "/function/commands", icon: Terminal },
-      { id: "llm-records", title: t("LLM Recording"), url: "/function/llm-records", icon: Radio },
-      { id: "assets", title: t("Assets"), url: "/function/assets", icon: Network },
-      { id: "sync", title: t("Asset Sync"), url: "/function/sync", icon: FolderSync },
-      { id: "workspace", title: t("Workspace"), url: "/function/workspace", icon: FolderOpen },
+      { id: "chat", title: t("Chat"), url: "/chat", icon: MessageSquare },
     ],
   },
   {
     id: 2,
+    label: t("Exploration"),
+    items: [
+      {
+        id: "assets-group",
+        title: t("Assets"),
+        icon: Network,
+        subItems: [
+          { id: "assets", title: t("Assets"), url: "/function/assets", icon: Network },
+          { id: "sync", title: t("Asset Sync"), url: "/function/sync", icon: FolderSync },
+          { id: "workspace", title: t("Workspace"), url: "/function/workspace", icon: FolderOpen },
+        ],
+      },
+      { id: "traffic", title: t("Traffic"), url: "/function/traffic", icon: Activity },
+      {
+        id: "traces",
+        title: t("Traces"),
+        icon: Terminal,
+        subItems: [
+          { id: "commands", title: t("Tool Execution"), url: "/function/commands", icon: Terminal },
+          { id: "llm-records", title: t("LLM Recording"), url: "/function/llm-records", icon: Radio },
+        ],
+      },
+    ],
+  },
+  {
+    id: 3,
+    label: t("AI & Governance"),
+    items: [
+      {
+        id: "ai-engine",
+        title: t("AI Engine"),
+        icon: Brain,
+        subItems: [
+          { id: "llm", title: t("LLM"), url: "/system/llm", icon: Brain },
+          { id: "agents", title: t("Agent"), url: "/system/agents", icon: Bot },
+          { id: "mcp", title: t("MCP"), url: "/system/mcp", icon: Plug },
+          { id: "skills", title: t("Skill"), url: "/system/skills", icon: Sparkles },
+          { id: "tools", title: t("Tools"), url: "/system/tools", icon: Wrench },
+        ],
+      },
+      {
+        id: "interception",
+        title: t("Interception"),
+        icon: ShieldAlert,
+        subItems: [
+          { id: "approvals", title: t("Approval Records"), url: "/system/intercept/approvals", icon: ClipboardList },
+          { id: "intercept", title: t("Interception Rules"), url: "/system/intercept", icon: ShieldAlert },
+          { id: "asset-intercept", title: t("Asset Interception"), url: "/system/intercept/assets", icon: Ban },
+        ],
+      },
+    ],
+  },
+  {
+    id: 4,
     label: t("System"),
     items: [
-      { id: "llm", title: t("LLM"), url: "/system/llm", icon: Brain },
-      { id: "agents", title: t("Agent"), url: "/system/agents", icon: Bot },
-      { id: "mcp", title: t("MCP"), url: "/system/mcp", icon: Plug },
-      { id: "skills", title: t("Skill"), url: "/system/skills", icon: Sparkles },
-      { id: "tools", title: t("Tools"), url: "/system/tools", icon: Wrench },
-      { id: "notify", title: t("Notifications"), url: "/system/notify", icon: BellRing },
-      { id: "intercept", title: t("Interception Rules"), url: "/system/intercept", icon: ShieldAlert },
-      { id: "asset-intercept", title: t("Asset Interception"), url: "/system/intercept/assets", icon: Ban },
-      { id: "approvals", title: t("Approval Records"), url: "/system/intercept/approvals", icon: ClipboardList },
-      { id: "logs", title: t("Logs"), url: "/system/logs", icon: ScrollText },
-      { id: "settings", title: t("System Settings"), url: "/system/settings", icon: Settings2 },
+      {
+        id: "system",
+        title: t("System"),
+        icon: Settings2,
+        subItems: [
+          { id: "settings", title: t("System Settings"), url: "/system/settings", icon: Settings2 },
+          { id: "notify", title: t("Notifications"), url: "/system/notify", icon: BellRing },
+          { id: "logs", title: t("Logs"), url: "/system/logs", icon: ScrollText },
+        ],
+      },
     ],
   },
 ];

@@ -256,7 +256,7 @@ function TaskDetailInner() {
           // Polling is best-effort; the next interval retries automatically.
         });
     void load();
-    const stopPolling = setVisibleInterval(load, 5000);
+    const stopPolling = setVisibleInterval(load, 5000, { topics: ["intercept"] });
     return () => {
       alive = false;
       stopPolling();
@@ -265,9 +265,9 @@ function TaskDetailInner() {
 
   const taskLoadInFlight = React.useRef<string | null>(null);
   const load = React.useCallback(() => {
-    if (taskLoadInFlight.current === id) return;
+    if (taskLoadInFlight.current === id) return Promise.resolve();
     taskLoadInFlight.current = id;
-    Promise.all([api.task(id), api.stats(id).catch(() => null)])
+    return Promise.all([api.task(id), api.stats(id).catch(() => null)])
       .then(([task, s]) => {
         if (taskLoadInFlight.current !== id) return;
         const base = { ...task };
@@ -293,8 +293,8 @@ function TaskDetailInner() {
       });
   }, [id]);
   React.useEffect(() => {
-    load();
-    const stopPolling = setVisibleInterval(load, 5000);
+    void load();
+    const stopPolling = setVisibleInterval(load, 5000, { topics: ["tasks", "stats"] });
     return stopPolling;
   }, [load]);
 

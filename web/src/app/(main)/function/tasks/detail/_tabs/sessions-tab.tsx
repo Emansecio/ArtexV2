@@ -52,6 +52,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSideQuestions } from "@/hooks/use-side-questions";
 import { api } from "@/lib/api";
+import { appendStreamDeltas, clearAllStreamDeltas } from "@/lib/delta-store";
 import { subscribeWS } from "@/lib/ws";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { MOCK } from "@/lib/mock/enabled";
@@ -685,8 +686,6 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   const [llmResolutions, setLLMResolutions] = React.useState<TaskLLMResolutions | null>(null);
   // Pending intercept requests for this task — used to show warning icons on sessions.
   const [pendingIntercepts, setPendingIntercepts] = React.useState<InterceptApprovalRow[]>([]);
-  // Ephemeral streaming deltas per session key, cleared when final persisted step lands.
-  const [deltas, setDeltas] = React.useState<Record<string, StreamingDeltaView>>({});
   const currentSegRef = React.useRef(0);
   React.useEffect(() => {
     currentSegRef.current = currentSeg;
@@ -914,10 +913,14 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   }, [taskId]);
 
   // Periodically recompute streaming-stale liveness badge without 1.5s full-tree churn;
-  // elapsed duration ticks independently inside LiveRunDuration below.
+  // paused when the browser tab is hidden to avoid background re-renders.
   const [, setTick] = React.useState(0);
   React.useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 5000);
+    const id = setInterval(() => {
+      if (typeof document === "undefined" || document.visibilityState !== "hidden") {
+        setTick((t) => t + 1);
+      }
+    }, 5000);
     return () => clearInterval(id);
   }, []);
 
@@ -929,7 +932,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   // ID) resumes from the DB, so a dropped realtime link self-heals; seq-merge dedups.
   React.useEffect(() => {
     setStore({});
-    setDeltas({});
+    clearAllStreamDeltas();
     setIntents([]);
     setIntentAssets([]);
     setOlderIntents([]);
@@ -1082,25 +1085,10 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
               return next;
             });
             if (clearKeys.size > 0 || ds.length > 0) {
-              setDeltas((prev) => {
-                const next = { ...prev };
-                for (const k of clearKeys) delete next[k];
-                for (const d of ds) {
-                  const cur = next[d.key];
-                  next[d.key] = cur && cur.kind === d.kind ? { kind: d.kind, text: cur.text + d.text } : { kind: d.kind, text: d.text };
-                }
-                return next;
-              });
+              appendStreamDeltas(clearKeys, ds);
             }
           } else if (ds.length > 0) {
-            setDeltas((prev) => {
-              const next = { ...prev };
-              for (const d of ds) {
-                const cur = next[d.key];
-                next[d.key] = cur && cur.kind === d.kind ? { kind: d.kind, text: cur.text + d.text } : { kind: d.kind, text: d.text };
-              }
-              return next;
-            });
+            appendStreamDeltas([], ds);
           }
         };
 
@@ -2036,7 +2024,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                     taskId={taskId}
                     chat={isMain}
                     focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
-                    streamingDelta={active.live ? (deltas[activeKey] ?? null) : null}
+                    streamSessionKey={active.live ? activeKey : null}
                   />
                 ) : (
                   <div className="pl-9 text-xs text-muted-foreground">

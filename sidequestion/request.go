@@ -96,6 +96,9 @@ func BuildRequest(s Snapshot, history []Exchange, question string) (llm.Completi
 	if err != nil {
 		return req, err
 	}
+	// Preserve req.Tools on same-model side-questions: stripping tools changes
+	// the [tools, system, messages] prefix hash and invalidates 100% of prompt
+	// caching on Anthropic/OpenAI. Only strip tools if routed to a distinct model.
 	base := llm.MessagesForAPI(req.Messages)
 	req.MaxTokens = outputBudget(req, 0)
 	var success []Exchange

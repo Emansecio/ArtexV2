@@ -39,20 +39,25 @@ import type {
 } from "@/navigation/sidebar/sidebar-items";
 import { setVisibleInterval } from "@/lib/polling";
 
+const SIDEBAR_OPEN_KEY = "artex.sidebar.open";
+
 interface NavMainProps {
   readonly items: readonly NavGroup[];
 }
 interface NavItemProps {
   readonly item: NavMainItem;
   readonly isItemActive: (item: NavMainItem) => boolean;
-  readonly isSubItemActive: (url: string) => boolean;
-  readonly isSubmenuOpen: (item: NavMainParentItem) => boolean;
+  readonly activeSubUrl: (item: NavMainParentItem) => string | null;
+  readonly isOpen: boolean;
+  readonly onOpenChange: (open: boolean) => void;
+  readonly pendingCount: number;
 }
 
 interface NavLinkItemProps {
   readonly item: NavMainLinkItem;
   readonly isActive: boolean;
   readonly showIconFallback: boolean;
+  readonly pendingCount: number;
 }
 
 interface NavLinkIconProps {
@@ -63,14 +68,17 @@ interface NavLinkIconProps {
 interface NavDropdownItemProps {
   readonly item: NavMainParentItem;
   readonly isActive: boolean;
-  readonly isSubItemActive: (url: string) => boolean;
+  readonly activeSubUrl: string | null;
+  readonly pendingCount: number;
 }
 
 interface NavCollapsibleItemProps {
   readonly item: NavMainParentItem;
   readonly isActive: boolean;
-  readonly defaultOpen: boolean;
-  readonly isSubItemActive: (url: string) => boolean;
+  readonly open: boolean;
+  readonly onOpenChange: (open: boolean) => void;
+  readonly activeSubUrl: string | null;
+  readonly pendingCount: number;
 }
 
 function CollapsedIconFallback({ title }: { title: string }) {
@@ -85,8 +93,35 @@ function hasSubItems(item: NavMainItem): item is NavMainParentItem {
   return Boolean(item.subItems?.length);
 }
 
+function matchPath(path: string, url: string): boolean {
+  return path === url || path.startsWith(`${url}/`);
+}
+
+function useInterceptPendingCount(): number {
+  const [count, setCount] = React.useState(0);
+  React.useEffect(() => {
+    let live = true;
+    async function poll() {
+      try {
+        const list = await api.interceptPending();
+        if (live) setCount(list.length);
+      } catch {
+        /* ignore */
+      }
+    }
+    void poll();
+    const stopPolling = setVisibleInterval(poll, 5000);
+    return () => {
+      live = false;
+      stopPolling();
+    };
+  }, []);
+  return count;
+}
+
 export function NavMain({ items }: NavMainProps) {
   const rawPath = usePathname();
+  const pendingCount = useInterceptPendingCount();
   // Route segments contain Chinese, so the pathname may be percent-encoded; decode it before comparing against nav urls so highlighting hits.
   const path = (() => {
     try {
@@ -96,20 +131,77 @@ export function NavMain({ items }: NavMainProps) {
     }
   })();
 
+  const activeSubUrl = React.useCallback(
+    (item: NavMainParentItem): string | null => {
+      let best: string | null = null;
+      for (const sub of item.subItems) {
+        if (matchPath(path, sub.url) && (!best || sub.url.length > best.length)) {
+          best = sub.url;
+        }
+      }
+      return best;
+    },
+    [path],
+  );
+
   const isItemActive = (item: NavMainItem) => {
     if (hasSubItems(item)) {
-      return item.subItems.some((sub) => path.startsWith(sub.url));
+      return activeSubUrl(item) !== null;
     }
-
-    return path === item.url;
+    return matchPath(path, item.url);
   };
 
-  const isSubItemActive = (url: string) => {
-    return path === url;
-  };
+  const [openMap, setOpenMap] = React.useState<Record<string, boolean>>(() => {
+    const init: Record<string, boolean> = {};
+    for (const group of items) {
+      for (const item of group.items) {
+        if (hasSubItems(item) && item.subItems.some((sub) => matchPath(path, sub.url))) {
+          init[item.id] = true;
+        }
+      }
+    }
+    return init;
+  });
 
-  const isSubmenuOpen = (item: NavMainParentItem) => {
-    return item.subItems.some((sub) => path.startsWith(sub.url));
+  React.useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SIDEBAR_OPEN_KEY) ?? "{}") as Record<string, boolean>;
+      if (saved && typeof saved === "object") {
+        setOpenMap((prev) => ({ ...saved, ...prev }));
+      }
+    } catch {
+      /* ignore malformed storage */
+    }
+  }, []);
+
+  React.useEffect(() => {
+    const activeIds: string[] = [];
+    for (const group of items) {
+      for (const item of group.items) {
+        if (hasSubItems(item) && activeSubUrl(item) !== null) {
+          activeIds.push(item.id);
+        }
+      }
+    }
+    if (activeIds.length === 0) return;
+    setOpenMap((prev) => {
+      if (activeIds.every((id) => prev[id])) return prev;
+      const next = { ...prev };
+      for (const id of activeIds) next[id] = true;
+      return next;
+    });
+  }, [items, activeSubUrl]);
+
+  const handleOpenChange = (id: string, open: boolean) => {
+    setOpenMap((prev) => {
+      const next = { ...prev, [id]: open };
+      try {
+        localStorage.setItem(SIDEBAR_OPEN_KEY, JSON.stringify(next));
+      } catch {
+        /* ignore storage quota errors */
+      }
+      return next;
+    });
   };
 
   return (
@@ -128,8 +220,10 @@ export function NavMain({ items }: NavMainProps) {
                   key={item.id}
                   item={item}
                   isItemActive={isItemActive}
-                  isSubItemActive={isSubItemActive}
-                  isSubmenuOpen={isSubmenuOpen}
+                  activeSubUrl={activeSubUrl}
+                  isOpen={Boolean(openMap[item.id])}
+                  onOpenChange={(open) => handleOpenChange(item.id, open)}
+                  pendingCount={pendingCount}
                 />
               ))}
             </SidebarMenu>
@@ -140,53 +234,61 @@ export function NavMain({ items }: NavMainProps) {
   );
 }
 
-function NavItem({ item, isItemActive, isSubItemActive, isSubmenuOpen }: NavItemProps) {
+function NavItem({ item, isItemActive, activeSubUrl, isOpen, onOpenChange, pendingCount }: NavItemProps) {
   const { state, isMobile } = useSidebar();
   const isCollapsedDesktop = state === "collapsed" && !isMobile;
 
   if (!hasSubItems(item)) {
-    return <NavLinkItem item={item} isActive={isItemActive(item)} showIconFallback={isCollapsedDesktop} />;
+    return (
+      <NavLinkItem
+        item={item}
+        isActive={isItemActive(item)}
+        showIconFallback={isCollapsedDesktop}
+        pendingCount={pendingCount}
+      />
+    );
   }
 
+  const subActive = activeSubUrl(item);
+
   if (isCollapsedDesktop) {
-    return <NavDropdownItem item={item} isActive={isItemActive(item)} isSubItemActive={isSubItemActive} />;
+    return (
+      <NavDropdownItem
+        item={item}
+        isActive={isItemActive(item)}
+        activeSubUrl={subActive}
+        pendingCount={pendingCount}
+      />
+    );
   }
 
   return (
     <NavCollapsibleItem
       item={item}
       isActive={isItemActive(item)}
-      defaultOpen={isSubmenuOpen(item)}
-      isSubItemActive={isSubItemActive}
+      open={isOpen}
+      onOpenChange={onOpenChange}
+      activeSubUrl={subActive}
+      pendingCount={pendingCount}
     />
   );
 }
 
-// InterceptPendingBadge polls /api/intercept/pending every 5 s and shows a red
-// count badge when there are unresolved approval requests.
-function InterceptPendingBadge() {
-  const [count, setCount] = React.useState(0);
-  React.useEffect(() => {
-    let live = true;
-    async function poll() {
-      try {
-        const list = await api.interceptPending();
-        if (live) setCount(list.length);
-      } catch { /* ignore */ }
-    }
-    poll();
-    const stopPolling = setVisibleInterval(poll, 5000);
-    return () => { live = false; stopPolling(); };
-  }, []);
-  if (count === 0) return null;
+function PendingPill({ count, className }: { count: number; className?: string }) {
+  if (count <= 0) return null;
   return (
-    <SidebarMenuBadge className="flex h-4.5 min-w-[18px] items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white shadow-sm ring-1 ring-amber-400/40">
+    <span
+      className={cn(
+        "flex h-4.5 min-w-[18px] items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white shadow-sm ring-1 ring-amber-400/40 tabular-nums",
+        className,
+      )}
+    >
       {count > 99 ? "99+" : count}
-    </SidebarMenuBadge>
+    </span>
   );
 }
 
-function NavLinkItem({ item, isActive, showIconFallback }: NavLinkItemProps) {
+function NavLinkItem({ item, isActive, showIconFallback, pendingCount }: NavLinkItemProps) {
   return (
     <SidebarMenuItem>
       <SidebarMenuButton asChild aria-disabled={item.disabled} tooltip={item.title} isActive={isActive}>
@@ -200,7 +302,13 @@ function NavLinkItem({ item, isActive, showIconFallback }: NavLinkItemProps) {
           <span>{item.title}</span>
         </Link>
       </SidebarMenuButton>
-      {item.id === "approvals" ? <InterceptPendingBadge /> : <NavItemBadge badge={item.badge} />}
+      {item.id === "approvals" && pendingCount > 0 ? (
+        <SidebarMenuBadge>
+          <PendingPill count={pendingCount} />
+        </SidebarMenuBadge>
+      ) : (
+        <NavItemBadge badge={item.badge} />
+      )}
     </SidebarMenuItem>
   );
 }
@@ -219,16 +327,23 @@ function NavLinkIcon({ item, showFallback }: NavLinkIconProps) {
   return null;
 }
 
-function NavDropdownItem({ item, isActive, isSubItemActive }: NavDropdownItemProps) {
+function NavDropdownItem({ item, isActive, activeSubUrl, pendingCount }: NavDropdownItemProps) {
   const Icon = item.icon;
+  const showParentDot = item.id === "interception" && pendingCount > 0;
 
   return (
     <SidebarMenuItem>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <SidebarMenuButton tooltip={item.title} isActive={isActive} disabled={item.disabled}>
+          <SidebarMenuButton tooltip={item.title} isActive={isActive} disabled={item.disabled} className="relative">
             {Icon ? <Icon /> : <CollapsedIconFallback title={item.title} />}
             <span>{item.title}</span>
+            {showParentDot && (
+              <span
+                aria-hidden="true"
+                className="absolute top-1.5 right-1.5 size-2 rounded-full bg-amber-500 ring-2 ring-sidebar"
+              />
+            )}
           </SidebarMenuButton>
         </DropdownMenuTrigger>
 
@@ -244,11 +359,12 @@ function NavDropdownItem({ item, isActive, isSubItemActive }: NavDropdownItemPro
                     href={subItem.url}
                     target={subItem.newTab ? "_blank" : undefined}
                     rel={subItem.newTab ? "noreferrer" : undefined}
-                    aria-current={isSubItemActive(subItem.url) ? "page" : undefined}
+                    aria-current={activeSubUrl === subItem.url ? "page" : undefined}
                     className="flex items-center gap-2"
                   >
                     {SubIcon && <SubIcon />}
-                    <span>{subItem.title}</span>
+                    <span className="truncate">{subItem.title}</span>
+                    {subItem.id === "approvals" && <PendingPill count={pendingCount} className="ml-auto" />}
                   </Link>
                 </DropdownMenuItem>
               );
@@ -260,17 +376,32 @@ function NavDropdownItem({ item, isActive, isSubItemActive }: NavDropdownItemPro
   );
 }
 
-function NavCollapsibleItem({ item, isActive, defaultOpen, isSubItemActive }: NavCollapsibleItemProps) {
+function NavCollapsibleItem({
+  item,
+  isActive,
+  open,
+  onOpenChange,
+  activeSubUrl,
+  pendingCount,
+}: NavCollapsibleItemProps) {
   const Icon = item.icon;
+  const showParentBadge = item.id === "interception" && pendingCount > 0;
 
   return (
-    <Collapsible asChild defaultOpen={defaultOpen} className="group/collapsible">
+    <Collapsible asChild open={open} onOpenChange={onOpenChange} className="group/collapsible">
       <SidebarMenuItem>
         <CollapsibleTrigger asChild>
           <SidebarMenuButton tooltip={item.title} isActive={isActive} disabled={item.disabled}>
             {Icon && <Icon />}
             <span>{item.title}</span>
-            <ChevronRight className="ml-auto transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+            {showParentBadge ? (
+              <span className="ml-auto flex items-center gap-1.5">
+                <PendingPill count={pendingCount} />
+                <ChevronRight className="size-4 transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+              </span>
+            ) : (
+              <ChevronRight className="ml-auto transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+            )}
           </SidebarMenuButton>
         </CollapsibleTrigger>
         <NavItemBadge badge={item.badge} />
@@ -285,7 +416,7 @@ function NavCollapsibleItem({ item, isActive, defaultOpen, isSubItemActive }: Na
                   <SidebarMenuSubButton
                     asChild
                     aria-disabled={subItem.disabled}
-                    isActive={isSubItemActive(subItem.url)}
+                    isActive={activeSubUrl === subItem.url}
                   >
                     <Link
                       prefetch={false}
@@ -294,7 +425,8 @@ function NavCollapsibleItem({ item, isActive, defaultOpen, isSubItemActive }: Na
                       rel={subItem.newTab ? "noreferrer" : undefined}
                     >
                       {SubIcon && <SubIcon />}
-                      <span>{subItem.title}</span>
+                      <span className="truncate">{subItem.title}</span>
+                      {subItem.id === "approvals" && <PendingPill count={pendingCount} className="ml-auto" />}
                     </Link>
                   </SidebarMenuSubButton>
                 </SidebarMenuSubItem>

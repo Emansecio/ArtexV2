@@ -656,7 +656,14 @@ function ChatView({
       since: cursorRef.current,
       onState: (open) => {
         if (!live) return;
-        if (!open) startFallbackPoll();
+        if (open) {
+          if (pollTimer !== undefined) {
+            clearTimeout(pollTimer);
+            pollTimer = undefined;
+          }
+        } else {
+          startFallbackPoll();
+        }
       },
       onEvent: (event, data) => {
         if (!live || !data || typeof data !== "object") return;

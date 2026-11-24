@@ -10,6 +10,19 @@ import "fmt"
 // reads or edits intercept rules, so an agent cannot lower them.
 func (d *DB) seedPersistenceApprovalRules() error {
 	if v, _, _ := d.GetSetting("intercept_persistence_rules_v1"); v == "done" {
+		// One-time upgrade for existing DBs: extend the unmodified built-in skill rule
+		// to also cover install_skill without touching operator-customized rules.
+		if v2, _, _ := d.GetSetting("intercept_persistence_rules_v2"); v2 != "done" {
+			_, _ = d.Exec(`
+UPDATE intercept_rules
+SET pattern = $1
+WHERE name = $2 AND pattern = $3`,
+				`^(?:create_skill|update_skill_file|install_skill)$`,
+				"[built-in] Persistent change: skill",
+				`^(?:create_skill|update_skill_file)$`,
+			)
+			_ = d.SetSetting("intercept_persistence_rules_v2", "done")
+		}
 		return nil
 	}
 	rules := []struct {
@@ -29,8 +42,8 @@ func (d *DB) seedPersistenceApprovalRules() error {
 		},
 		{
 			name:    "[built-in] Persistent change: skill",
-			pattern: `^(?:create_skill|update_skill_file)$`,
-			message: "Approval needed: the agent asks to create or change a skill file. Every agent that sees the skill loads its content as instructions.",
+			pattern: `^(?:create_skill|update_skill_file|install_skill)$`,
+			message: "Approval needed: the agent asks to create, install, or change a skill file. Every agent that sees the skill loads its content as instructions.",
 		},
 	}
 	// intercept_rules.name has no unique index, so ON CONFLICT cannot apply: the insert

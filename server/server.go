@@ -160,17 +160,40 @@ type Server struct {
 
 	// Cold task archives run through one persistent FIFO worker. The buffered wake
 	// channel coalesces enqueue bursts; the database remains the source of truth.
-	archiveWake     chan struct{}
-	archiveWG       sync.WaitGroup
-	archiveStore    *archivestore.Store
-	archiveStoreErr error
-	side            *sideQuestionState
-	deltaHub        *DeltaHub
-	mcpPool         *mcpPool
+	archiveWake        chan struct{}
+	archiveWG          sync.WaitGroup
+	archiveStore       *archivestore.Store
+	archiveStoreErr    error
+	remoteJournalDirty atomic.Bool
+	side               *sideQuestionState
+	deltaHub           *DeltaHub
+	mcpPool            *mcpPool
+
+	txMu    sync.Mutex
+	txStore *transcript.Store
 
 	agentCacheMu sync.Mutex
 	agentCache   map[string]cachedAgentEntry
 	httpProxyTr  sync.Map // key: proxyStr+"\x00"+caFile -> *http.Transport
+}
+
+func (s *Server) sharedTranscriptStore() *transcript.Store {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+	if s.txStore == nil {
+		s.txStore = transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
+	}
+	return s.txStore
+}
+
+func (s *Server) closeTranscriptStore() {
+	s.txMu.Lock()
+	tx := s.txStore
+	s.txStore = nil
+	s.txMu.Unlock()
+	if tx != nil {
+		_ = tx.Close()
+	}
 }
 
 type cachedAgentEntry struct {
@@ -400,9 +423,11 @@ func (s *Server) Wait(ctx context.Context) error {
 	select {
 	case <-done:
 		s.mcpPool.CloseAll()
+		s.closeTranscriptStore()
 		return nil
 	case <-ctx.Done():
 		s.mcpPool.CloseAll()
+		s.closeTranscriptStore()
 		return ctx.Err()
 	}
 }
@@ -617,7 +642,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// (agentsForTask), resolved through the engine's authoritative resolver. Global
 	// readiness (Ready()/llm_configured) is reported from s.llmOn, set below.
 
-	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
+	tx := s.sharedTranscriptStore()
 	win := cfg.CompactionWindow()
 	// chat stays the GLOBAL fallback since one ChatAgent serves many agent keys — its
 	// per-agent binding is resolved at Chat time (runConversationSync →
@@ -772,7 +797,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	if !ok {
 		return nil
 	}
-	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
+	tx := s.sharedTranscriptStore()
 	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
 	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	ca.SetWebSearch(s.m.WebSearchOpts())
@@ -1176,8 +1201,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	out["engine_mode"] = "idle"              // spec enum; overridden below when a task is active
 	out["llm_configured"] = s.engine.Ready() // is an LLM provider installed at all
 	if tr := s.m.Traffic(); tr != nil {
-		c, _ := tr.Count()
-		out["traffic"] = c
+		out["traffic"] = tr.CountFast()
 		out["traffic_enabled"] = true
 	}
 	if counts, err := s.m.Assets().CountsByType(); err == nil {

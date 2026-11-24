@@ -81,6 +81,8 @@ func (g *gzipResponseWriter) shouldBypassHeaders() bool {
 		strings.HasPrefix(ct, "image/") ||
 		strings.HasPrefix(ct, "video/") ||
 		strings.HasPrefix(ct, "audio/") ||
+		strings.HasPrefix(ct, "font/") ||
+		strings.HasPrefix(ct, "application/font-") ||
 		strings.HasPrefix(ct, "application/zip") ||
 		strings.HasPrefix(ct, "application/gzip") {
 		return true

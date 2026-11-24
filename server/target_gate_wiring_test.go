@@ -346,10 +346,10 @@ func TestHostToolsDeclareNoTarget(t *testing.T) {
 	if len(tools) < 25 {
 		t.Fatalf("only %d host tools found", len(tools))
 	}
-	// The tools that set up a custom tool or an MCP server take an endpoint of
-	// the model's choosing. They are scanned like any unknown tool: that
-	// endpoint is a target.
-	scanned := map[string]bool{"create_custom_tool": true, "update_custom_tool": true, "create_mcp": true, "update_mcp": true, "mcp_status": true}
+	// The tools that set up a custom tool, MCP server, or install a remote skill
+	// take an endpoint of the model's choosing. They are scanned like any unknown
+	// tool: that endpoint is a target.
+	scanned := map[string]bool{"create_custom_tool": true, "update_custom_tool": true, "create_mcp": true, "update_mcp": true, "mcp_status": true, "install_skill": true}
 	input := []byte(`{"task_id":1,"description":"test https://app.example.com/ and 203.0.113.7:8443","command":"curl https://app.example.com/","q":"host:app.example.com:443"}`)
 	for _, tool := range tools {
 		targets := intercept.ExtractTargets(tool.Name(), input)

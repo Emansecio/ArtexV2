@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +25,7 @@ func (s *Server) platformTools() []actool.CoreTool {
 		s.toolAskOperator(),
 		s.toolCreateSkill(),
 		s.toolUpdateSkillFile(),
+		s.toolInstallSkill(),
 		s.toolCreateCustomTool(),
 		s.toolUpdateCustomTool(),
 		s.toolCreateMCP(),
@@ -32,7 +36,7 @@ func (s *Server) platformTools() []actool.CoreTool {
 
 // platformToolKeys are the tool keys the Auto agent gets bound by default.
 var platformToolKeys = []string{
-	"create_skill", "update_skill_file",
+	"create_skill", "update_skill_file", "install_skill",
 	"create_custom_tool", "update_custom_tool",
 	"create_mcp", "update_mcp",
 	"delete_assets_by_host",
@@ -87,10 +91,16 @@ func (s *Server) toolCreateSkill() actool.CoreTool {
 		objSchema(map[string]any{
 			"name":         strParam("skill name (starts with a lowercase letter; letters/digits/hyphens)"),
 			"description":  strParam("skill description (required; what it does / when to use it)"),
+			"mcps":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "optional MCP server names this skill unlocks on load"},
 			"instructions": strParam("Markdown body instructions (optional)"),
 		}, "name", "description"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
-			var a struct{ Name, Description, Instructions string }
+			var a struct {
+				Name         string   `json:"name"`
+				Description  string   `json:"description"`
+				MCPs         []string `json:"mcps"`
+				Instructions string   `json:"instructions"`
+			}
 			_ = json.Unmarshal(in, &a)
 			if !validSkillName(a.Name) {
 				return actool.Errorf("invalid skill name (must start with a lowercase letter, only letters/digits/hyphens, max 64)"), nil
@@ -109,10 +119,18 @@ func (s *Server) toolCreateSkill() actool.CoreTool {
 			if err := os.MkdirAll(path, 0o755); err != nil {
 				return actool.Errorf(safeFSErr(err)), nil
 			}
+			mcps := cleanStrs(a.MCPs)
 			var b strings.Builder
 			b.WriteString("---\n")
-			fmt.Fprintf(&b, "name: %s\n", a.Name)
-			fmt.Fprintf(&b, "description: %s\n", a.Description)
+			fmt.Fprintf(&b, "name: %s\n", yamlScalar(a.Name))
+			fmt.Fprintf(&b, "description: %s\n", yamlScalar(a.Description))
+			if len(mcps) > 0 {
+				quoted := make([]string, len(mcps))
+				for i, m := range mcps {
+					quoted[i] = yamlScalar(m)
+				}
+				fmt.Fprintf(&b, "mcps: %s\n", strings.Join(quoted, ", "))
+			}
 			b.WriteString("---\n")
 			if strings.TrimSpace(a.Instructions) != "" {
 				b.WriteString(a.Instructions)
@@ -123,7 +141,124 @@ func (s *Server) toolCreateSkill() actool.CoreTool {
 				_ = os.RemoveAll(path)
 				return actool.Errorf(safeFSErr(err)), nil
 			}
+			if err := verifySkillFile(path, a.Name, mcps); err != nil {
+				_ = os.RemoveAll(path)
+				return actool.Errorf("generated SKILL.md failed parser verification: " + err.Error()), nil
+			}
 			return actool.Text("skill created: " + a.Name), nil
+		})
+}
+
+const maxInstallSkillBytes = 256 * 1024
+
+func (s *Server) toolInstallSkill() actool.CoreTool {
+	return wrTool("install_skill",
+		"Install a skill from an HTTP/HTTPS URL pointing to a SKILL.md file (e.g. a raw GitHub URL). Validates YAML frontmatter before saving; refuses to overwrite an existing skill unless overwrite=true.",
+		objSchema(map[string]any{
+			"url":       strParam("HTTP or HTTPS URL of the SKILL.md file to install"),
+			"name":      strParam("optional skill name override (lowercase letters/digits/hyphens); defaults to the frontmatter name"),
+			"overwrite": map[string]any{"type": "boolean", "description": "replace existing skill SKILL.md if it already exists (default false)"},
+		}, "url"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				URL       string `json:"url"`
+				Name      string `json:"name"`
+				Overwrite bool   `json:"overwrite"`
+			}
+			_ = json.Unmarshal(in, &a)
+			rawURL := strings.TrimSpace(a.URL)
+			u, err := url.Parse(rawURL)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				return actool.Errorf("url must be a valid http:// or https:// URL"), nil
+			}
+			reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
+			if err != nil {
+				return actool.Errorf("invalid request URL: " + err.Error()), nil
+			}
+			resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+			if err != nil {
+				return actool.Errorf("fetch skill failed: " + err.Error()), nil
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return actool.Errorf(fmt.Sprintf("fetch skill returned HTTP %d", resp.StatusCode)), nil
+			}
+			data, err := io.ReadAll(io.LimitReader(resp.Body, maxInstallSkillBytes+1))
+			if err != nil {
+				return actool.Errorf("read skill body failed: " + err.Error()), nil
+			}
+			if len(data) == 0 {
+				return actool.Errorf("downloaded SKILL.md is empty"), nil
+			}
+			if len(data) > maxInstallSkillBytes {
+				return actool.Errorf(fmt.Sprintf("SKILL.md exceeds %d bytes limit", maxInstallSkillBytes)), nil
+			}
+
+			if err := os.MkdirAll(s.skillDir, 0o755); err != nil {
+				return actool.Errorf(safeFSErr(err)), nil
+			}
+			tmpDir, err := os.MkdirTemp(s.skillDir, ".install-*")
+			if err != nil {
+				return actool.Errorf(safeFSErr(err)), nil
+			}
+			cleanup := true
+			defer func() {
+				if cleanup {
+					_ = os.RemoveAll(tmpDir)
+				}
+			}()
+			if err := os.Chmod(tmpDir, 0o755); err != nil {
+				return actool.Errorf(safeFSErr(err)), nil
+			}
+			if err := os.WriteFile(filepath.Join(tmpDir, "SKILL.md"), data, 0o644); err != nil {
+				return actool.Errorf(safeFSErr(err)), nil
+			}
+			reg, err := loadSkillsConfined(tmpDir)
+			if err != nil {
+				return actool.Errorf("parse SKILL.md failed: " + safeFSErr(err)), nil
+			}
+			var parsedName, parsedDesc string
+			for _, sk := range reg.List() {
+				if sk.Dir != "" {
+					parsedName = sk.Name
+					parsedDesc = sk.Description
+					break
+				}
+			}
+			if strings.TrimSpace(parsedDesc) == "" {
+				return actool.Errorf("invalid SKILL.md: missing required frontmatter description"), nil
+			}
+			skillName := strings.TrimSpace(a.Name)
+			if skillName == "" {
+				skillName = parsedName
+			}
+			if !validSkillName(skillName) {
+				return actool.Errorf("invalid skill name (must be 1-64 lowercase letters/digits/hyphens): " + skillName), nil
+			}
+			if parsedName != skillName {
+				return actool.Errorf(fmt.Sprintf("SKILL.md frontmatter name %q does not match target name %q", parsedName, skillName)), nil
+			}
+			dirCP, err := resolveSkillDir(s.skillDir, skillName)
+			if err != nil {
+				return actool.Errorf("invalid skill path"), nil
+			}
+			target := filepath.Join(s.skillDir, skillName)
+			if dirCP.exists {
+				if !a.Overwrite {
+					return actool.Errorf("skill already exists: " + skillName + " (set overwrite=true to replace)"), nil
+				}
+				if err := os.WriteFile(filepath.Join(target, "SKILL.md"), data, 0o644); err != nil {
+					return actool.Errorf(safeFSErr(err)), nil
+				}
+				return actool.Text("skill updated: " + skillName), nil
+			}
+			if err := os.Rename(tmpDir, target); err != nil {
+				return actool.Errorf(safeFSErr(err)), nil
+			}
+			cleanup = false
+			return actool.Text("skill installed: " + skillName), nil
 		})
 }
 

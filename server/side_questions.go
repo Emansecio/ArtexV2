@@ -36,6 +36,7 @@ type sideQuestionState struct {
 	latest       map[string]sidequestion.Snapshot
 	seen         map[string][2]int64
 	runs         map[string]sideRun
+	wake         chan struct{}
 	done         chan struct{}
 	outputTokens int
 }
@@ -51,7 +52,14 @@ func bindSideProvider(p llm.Provider, cfg agent.Config, id int64, name string) l
 }
 
 func (s *Server) initSideQuestions() {
-	s.side = &sideQuestionState{pending: map[string]sidequestion.Snapshot{}, latest: map[string]sidequestion.Snapshot{}, seen: map[string][2]int64{}, runs: map[string]sideRun{}, done: make(chan struct{})}
+	s.side = &sideQuestionState{
+		pending: map[string]sidequestion.Snapshot{},
+		latest:  map[string]sidequestion.Snapshot{},
+		seen:    map[string][2]int64{},
+		runs:    map[string]sideRun{},
+		wake:    make(chan struct{}, 1),
+		done:    make(chan struct{}),
+	}
 	if n, err := strconv.Atoi(os.Getenv("ARTEX_BTW_MAX_OUTPUT_TOKENS")); err == nil && n >= 256 && n <= 32768 {
 		s.side.outputTokens = n
 	}
@@ -64,23 +72,45 @@ func (s *Server) initSideQuestions() {
 	}
 	s.ctx = sidequestion.WithPublisher(s.ctx, func(snap sidequestion.Snapshot) {
 		s.side.mu.Lock()
-		defer s.side.mu.Unlock()
 		key := snap.Parent.Key()
 		old, ok := s.side.seen[key]
 		if ok && (old[0] > snap.RunID || old[0] == snap.RunID && old[1] >= snap.Version) {
+			s.side.mu.Unlock()
 			return
 		}
 		s.side.latest[key] = snap
 		s.side.seen[key] = [2]int64{snap.RunID, snap.Version}
 		s.side.pending[key] = snap
+		s.side.mu.Unlock()
+		select {
+		case s.side.wake <- struct{}{}:
+		default:
+		}
 	})
 	go func() {
 		defer close(s.side.done)
-		tick := time.NewTicker(250 * time.Millisecond)
-		defer tick.Stop()
+		var (
+			flushTimer *time.Timer
+			flushC     <-chan time.Time
+		)
+		defer func() {
+			if flushTimer != nil {
+				flushTimer.Stop()
+			}
+		}()
 		for {
 			select {
-			case <-tick.C:
+			case <-s.side.wake:
+				if flushC == nil {
+					if flushTimer == nil {
+						flushTimer = time.NewTimer(250 * time.Millisecond)
+					} else {
+						flushTimer.Reset(250 * time.Millisecond)
+					}
+					flushC = flushTimer.C
+				}
+			case <-flushC:
+				flushC = nil
 				s.flushSideSnapshots()
 			case <-s.ctx.Done():
 				s.flushSideSnapshots()
@@ -436,10 +466,10 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 	if parent.TaskID > 0 {
 		ctx = llmrec.WithTaskID(ctx, strconv.FormatInt(parent.TaskID, 10))
 	}
-	// Deletions can race between request insertion and registration. Observe the
-	// persisted lifecycle even while a provider is blocked without emitting text.
+	// Deletions are cancelled immediately via s.side.runs; keep a light 5s DB
+	// fallback in case a deletion happened externally before registration.
 	go func() {
-		tick := time.NewTicker(500 * time.Millisecond)
+		tick := time.NewTicker(5 * time.Second)
 		defer tick.Stop()
 		for {
 			select {

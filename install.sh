@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# ARTEX install script: 1) all-Docker  2) local build & run
+# ARTEX native install script (macOS / Linux): configures PostgreSQL, builds the
+# self-contained binary (embedded UI, Go security toolbox, default skills & wordlists),
+# and starts ARTEX.
 set -euo pipefail
 cd "$(cd "$(dirname "$0")" && pwd)"
 
@@ -17,75 +19,65 @@ json_str(){
   s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"
   printf '"%s"' "$s"
 }
-# sed_repl escapes $1 for the replacement side of s|...|...|: \, | and &.
-sed_repl(){ printf '%s' "$1" | sed 's/[\\|&]/\\&/g'; }
 
-# ── docker environment check / auto-install ───────────────────
-ensure_docker(){
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    ok "docker and docker compose detected"; return
+setup_homebrew_pg(){
+  command -v brew >/dev/null 2>&1 || die "Homebrew not found; install PostgreSQL manually or install Homebrew first"
+  if ! brew list postgresql@17 >/dev/null 2>&1; then
+    info "installing postgresql@17 via Homebrew..."
+    brew install postgresql@17
   fi
-  warn "docker / docker compose not detected"
-  case "$(uname -s)" in
-    Linux)
-      if [ "$(ask 'Install Docker automatically? (y/n)' y)" = y ]; then
-        curl -fsSL https://get.docker.com | sh
-        sudo usermod -aG docker "$USER" || true
-        ok "Docker installed (re-login required for the group change to take effect)"
-      else
-        die "please install docker yourself and retry"
-      fi ;;
-    Darwin) die "on macOS please install Docker Desktop: https://www.docker.com/products/docker-desktop/" ;;
-    *)      die "please install docker yourself and retry" ;;
-  esac
-}
+  local pg_bin
+  pg_bin="$(brew --prefix postgresql@17)/bin"
+  export PATH="$pg_bin:$PATH"
+  info "starting postgresql@17 service..."
+  brew services start postgresql@17
+  # Wait briefly for Postgres to accept connections.
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1 && break
+    sleep 1
+  done
+  pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1 || die "PostgreSQL did not become ready on 127.0.0.1:5432"
 
-# ── 1) All-Docker ───────────────────────────────
-install_docker(){
-  ensure_docker
-  if [ ! -f .env ]; then
-    cp .env.example .env 2>/dev/null || true
-    local pw key
-    pw="$(ask 'Postgres password (press Enter to generate randomly)' "$(rand)")"
-    key="$(ask 'ANTHROPIC_API_KEY (may be empty, configure later in the UI)' '')"
-    sed -i.bak "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(sed_repl "$pw")|" .env
-    sed -i.bak "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=$(sed_repl "$key")|" .env
-    rm -f .env.bak
-    ok ".env generated (POSTGRES_PASSWORD set)"
+  local pw
+  pw="$(ask 'Password for local PostgreSQL role artex (Enter for random)' "$(rand)")"
+  if ! psql -h 127.0.0.1 -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='artex'" | grep -q 1; then
+    psql -h 127.0.0.1 -d postgres -v ON_ERROR_STOP=1 -v pw="$pw" -c "CREATE ROLE artex WITH LOGIN PASSWORD :'pw' SUPERUSER;" >/dev/null
   else
-    info "reusing existing .env"
+    psql -h 127.0.0.1 -d postgres -v ON_ERROR_STOP=1 -v pw="$pw" -c "ALTER ROLE artex WITH PASSWORD :'pw';" >/dev/null
   fi
-  info "building the image from this checkout and starting..."
-  docker compose up -d --build
-  ok "started → http://localhost:8787"
-  info "view logs: docker compose logs -f artex"
+  if ! psql -h 127.0.0.1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='artex'" | grep -q 1; then
+    createdb -h 127.0.0.1 -O artex artex
+  fi
+  ok "local PostgreSQL ready (artex@127.0.0.1:5432/artex)"
+  DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=artex DB_PASS="$pw" DB_NAME=artex DB_SSL=disable
 }
 
-# ── 2) Local build & run ──────────────────────────────
-install_local(){
-  echo "Database setup:"
-  echo "  1) Connect to an existing PostgreSQL"
-  echo "  2) Start a PostgreSQL with Docker (requires docker)"
-  case "$(ask 'Choose' 1)" in
-    2)
-      ensure_docker
-      local pw; pw="$(ask 'Postgres password (press Enter for random)' "$(rand)")"
-      docker run -d --name artex-pg -p 5432:5432 \
-        -e POSTGRES_USER=artex -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=artex \
-        -v artex-pg:/var/lib/postgresql/data postgres:16-alpine
-      DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=artex DB_PASS="$pw" DB_NAME=artex DB_SSL=disable ;;
-    *)
-      DB_HOST="$(ask 'Database host' 127.0.0.1)"
-      DB_PORT="$(ask 'Port' 5432)"
-      DB_USER="$(ask 'User' artex)"
-      DB_PASS="$(ask 'Password' '')"
-      DB_NAME="$(ask 'Database name' artex)"
-      DB_SSL="$(ask 'sslmode (disable/require)' disable)" ;;
-  esac
+echo "=============================="
+echo "  ARTEX Native Install"
+echo "=============================="
+echo "Database setup:"
+echo "  1) Connect to an existing PostgreSQL"
+if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+  echo "  2) Install & start local PostgreSQL 17 via Homebrew"
+fi
 
-  # generate config.json (string values JSON-escaped: a password may contain " or \)
-  case "$DB_PORT" in (*[!0-9]*|'') die "port must be a number: $DB_PORT" ;; esac
-  cat > config.json <<JSON
+case "$(ask 'Choose' 1)" in
+  2)
+    [ "$(uname -s)" = "Darwin" ] || die "Homebrew PostgreSQL option is only available on macOS"
+    setup_homebrew_pg ;;
+  *)
+    DB_HOST="$(ask 'Database host' 127.0.0.1)"
+    DB_PORT="$(ask 'Port' 5432)"
+    DB_USER="$(ask 'User' artex)"
+    DB_PASS="$(ask 'Password' '')"
+    DB_NAME="$(ask 'Database name' artex)"
+    DB_SSL="$(ask 'sslmode (disable/require)' disable)" ;;
+esac
+
+# generate config.json (string values JSON-escaped: a password may contain " or \)
+case "$DB_PORT" in (*[!0-9]*|'') die "port must be a number: $DB_PORT" ;; esac
+cat > config.json <<JSON
 {
   "database": {
     "host": $(json_str "$DB_HOST"),
@@ -97,36 +89,29 @@ install_local(){
   }
 }
 JSON
-  ok "config.json generated"
+ok "config.json generated"
 
-  # go environment check
-  command -v go >/dev/null 2>&1 || die "Go not detected; please install Go (>=1.26) first: https://go.dev/dl/"
-  ok "Go: $(go version)"
+# go environment check
+command -v go >/dev/null 2>&1 || die "Go not detected; please install Go (>=1.26) first: https://go.dev/dl/"
+ok "Go: $(go version)"
 
-  # embedding the frontend requires node to produce the static assets
-  if command -v npm >/dev/null 2>&1; then
-    info "building frontend static assets..."
-    ( cd web && npm ci --ignore-scripts && npm run build:static )
-    rm -rf server/webui/dist && cp -r web/out server/webui/dist
-    info "compiling embedded single binary..."
-    CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
-  else
-    warn "npm not detected: building a backend WITHOUT the embedded frontend (run npm run dev separately for the frontend)"
-    CGO_ENABLED=0 go build -o artex ./cmd/artex
-  fi
-  ok "build complete → ./artex"
+if [ "${ARTEX_SKIP_TOOLBOX:-0}" != "1" ] && [ -x scripts/fetch-toolbox.sh ]; then
+  info "preparing embedded Go security toolbox..."
+  ./scripts/fetch-toolbox.sh "$(go env GOOS)/$(go env GOARCH)"
+fi
 
-  info "starting... (Ctrl-C to exit)"
-  ./artex
-}
+# embedding the frontend requires node to produce the static assets
+if command -v npm >/dev/null 2>&1; then
+  info "building frontend static assets..."
+  ( cd web && npm ci --ignore-scripts && npm run build:static )
+  rm -rf server/webui/dist && cp -r web/out server/webui/dist
+  info "compiling embedded single binary..."
+  CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+else
+  warn "npm not detected: building a backend WITHOUT the embedded frontend (run npm run dev separately for the frontend)"
+  CGO_ENABLED=0 go build -trimpath -o artex ./cmd/artex
+fi
+ok "build complete → ./artex"
 
-echo "=============================="
-echo "  ARTEX Install"
-echo "  1) All-Docker install"
-echo "  2) Run locally (go build)"
-echo "=============================="
-case "$(ask 'Choose' 1)" in
-  1) install_docker ;;
-  2) install_local ;;
-  *) die "invalid choice" ;;
-esac
+info "starting... (Ctrl-C to exit)"
+exec ./start.sh

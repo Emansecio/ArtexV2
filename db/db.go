@@ -14,8 +14,10 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -210,16 +212,27 @@ func openWithMigrations(dsn string, migrations fs.FS) (*DB, error) {
 	// Keep the dedicated lock connection checked out until both DDL and seeding
 	// finish so concurrent application instances cannot initialize out of order.
 	err = withSchemaMigrationLock(context.Background(), sqlDB, func(conn *sql.Conn) error {
-		if err := applySchemaWithRetry(context.Background(), conn, time.Sleep); err != nil {
-			return fmt.Errorf("apply schema: %w", err)
+		ctx := context.Background()
+		wantSchema := schemaDigest()
+		var curSchema string
+		if err := conn.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = '__schema_sha256'`).Scan(&curSchema); err != nil || curSchema != wantSchema {
+			if err := applySchemaWithRetry(ctx, conn, time.Sleep); err != nil {
+				return fmt.Errorf("apply schema: %w", err)
+			}
+			_, _ = conn.ExecContext(ctx, `INSERT INTO settings(key, value) VALUES ('__schema_sha256', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, wantSchema)
 		}
 		// Runs on conn, the lock holder; it must not call EnsureLLM*Table,
 		// whose own lock request would wait on conn forever.
-		if err := applyMigrations(context.Background(), conn, migrations); err != nil {
+		if err := applyMigrations(ctx, conn, migrations); err != nil {
 			return fmt.Errorf("apply migrations: %w", err)
 		}
-		if err := d.seedBuiltins(); err != nil {
-			return fmt.Errorf("seed builtins: %w", err)
+		wantBuiltins := builtinsDigest()
+		var curBuiltins string
+		if err := conn.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = '__builtins_sha256'`).Scan(&curBuiltins); err != nil || curBuiltins != wantBuiltins {
+			if err := d.seedBuiltins(); err != nil {
+				return fmt.Errorf("seed builtins: %w", err)
+			}
+			_, _ = conn.ExecContext(ctx, `INSERT INTO settings(key, value) VALUES ('__builtins_sha256', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, wantBuiltins)
 		}
 		return nil
 	})
@@ -243,6 +256,26 @@ type promptVar struct{ name, desc, example, source string }
 // intp returns a pointer to v, for explicitly setting builtinAgent optional
 // fields (e.g. runSeconds).
 func intp(v int) *int { return &v }
+
+func schemaDigest() string {
+	sum := sha256.Sum256([]byte(schemaSQL))
+	return hex.EncodeToString(sum[:])
+}
+
+func builtinsDigest() string {
+	h := sha256.New()
+	h.Write([]byte("builtins-v1\n"))
+	for _, a := range builtinAgents {
+		fmt.Fprintf(h, "%s|%s|%s|%s|%v|%v\n", a.key, a.name, a.role, a.desc, a.interactiveShell, a.runSeconds != nil)
+		if a.runSeconds != nil {
+			fmt.Fprintf(h, "rs=%d\n", *a.runSeconds)
+		}
+		for _, v := range a.vars {
+			fmt.Fprintf(h, "v:%s|%s|%s|%s\n", v.name, v.desc, v.example, v.source)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // builtinAgents mirrors docs §5(a). Built-in tools are not stored in the DB;
 // only agents + the variable catalog are seeded here.

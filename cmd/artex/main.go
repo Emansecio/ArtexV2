@@ -14,6 +14,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +23,8 @@ import (
 	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/server"
+	"github.com/Autumn-27/artex/skills"
+	"github.com/Autumn-27/artex/toolbox"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
@@ -84,6 +88,9 @@ func main() {
 	server.RunExecShimIfRequested(os.Args)
 	// Before any listener or child exists: keep the secrets out of /proc/<pid>/environ.
 	server.SealProcessEnv()
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(1536 << 20) // 1.5 GiB soft cap for native desktop footprint
+	}
 	os.Exit(run())
 }
 
@@ -105,10 +112,21 @@ func run() int {
 		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
 		// Identity of every agent process (Bash, the shell, custom tools, MCP stdio).
 		// A negative uid turns the drop off; 0 (root) is refused.
-		execUID = flag.Int("exec-uid", server.DefaultExecUID, "uid that agent processes run as (Bash, shell, custom tools, MCP stdio); -1 turns the drop off")
-		execGID = flag.Int("exec-gid", server.DefaultExecGID, "gid that agent processes run as")
+		execUID      = flag.Int("exec-uid", server.DefaultExecUID, "uid that agent processes run as (Bash, shell, custom tools, MCP stdio); -1 turns the drop off")
+		execGID      = flag.Int("exec-gid", server.DefaultExecGID, "gid that agent processes run as")
+		checkToolbox = flag.Bool("check-toolbox", false, "verify embedded security binaries and exit")
 	)
 	flag.Parse()
+
+	if *checkToolbox {
+		names, err := toolbox.Check("")
+		if err != nil {
+			log.Printf("[toolbox] check failed: %v", err)
+			return 1
+		}
+		log.Printf("[toolbox] ok (%d tools): %s", len(names), strings.Join(names, ", "))
+		return 0
+	}
 
 	// hand the build version to the server package so GET /api/health can report it
 	// to the frontend top bar.
@@ -137,6 +155,12 @@ func run() int {
 	}
 	if abs, e := filepath.Abs(skillDir); e == nil {
 		skillDir = abs
+	}
+	if seeded, err := skills.SeedDefaults(skillDir); err != nil {
+		log.Printf("[skills] seed defaults failed: %v", err)
+		return 1
+	} else if len(seeded) > 0 {
+		log.Printf("[skills] seeded %d default skills into %s: %s", len(seeded), skillDir, strings.Join(seeded, ", "))
 	}
 	// JWT signing key directory (also holds secret.key, see server.NewManager).
 	keyDir := config.KeyDir()
@@ -184,6 +208,12 @@ func run() int {
 	if err := server.PrepareExecPrivilege(&priv, *dataDir, config.KeyDir(), config.Path()); err != nil {
 		log.Printf("[config] %v", err)
 		return 1
+	}
+	if binDir, tools, err := toolbox.Materialize(*dataDir); err != nil {
+		log.Printf("[toolbox] materialize failed: %v", err)
+		return 1
+	} else if len(tools) > 0 {
+		log.Printf("[toolbox] embedded ready (%d tools): %s -> %s", len(tools), strings.Join(tools, ", "), binDir)
 	}
 	if err := server.InstallBashShim(priv); err != nil {
 		log.Printf("[config] %v", err)

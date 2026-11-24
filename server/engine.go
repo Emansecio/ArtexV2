@@ -257,6 +257,20 @@ func runTaskRoutine(rt *taskRuntime, fn func(context.Context)) {
 	}()
 }
 
+// retireTaskLoops cancels the task's background loops (planner, claim sweeper,
+// workers) once the task reaches a terminal state so finished tasks hold zero
+// idle goroutines or DB polling timers. Engine.Run recreates them if resumed.
+func (e *Engine) retireTaskLoops(taskID string) {
+	e.runtimeMu.Lock()
+	rt := e.runtimes[taskID]
+	delete(e.runtimes, taskID)
+	e.runtimeMu.Unlock()
+	e.started.Delete(taskID)
+	if rt != nil {
+		rt.cancel(agent.AbortGoalMet)
+	}
+}
+
 // Wait blocks until the task goroutines registered at the moment of the call,
 // and every admitted task operation, have finished, or until ctx ends. It
 // refuses new registrations and new beginTaskOperation calls first. Goroutines
@@ -1101,6 +1115,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			// in-flight intents produce no longer matters. The next worker-loop pass claims
 			// nothing new at the terminal gate; the cancelled ones take the "task completed" branch below and end up stopped (not blocked).
 			e.cancelExec(t.ID, agent.AbortGoalMet)
+			e.retireTaskLoops(t.ID)
 		default:
 			log.Printf("[planner] task %s planning finished", t.ID)
 		}
@@ -1144,6 +1159,13 @@ func (e *Engine) claimSweepLoop(ctx context.Context, t *Task) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+		if isTerminalStatus(e.m.TaskStatus(t.ID)) {
+			e.retireTaskLoops(t.ID)
+			return
+		}
+		if e.IsPaused(t.ID) {
+			continue
 		}
 		if !e.beginTaskOperation(t.ID) {
 			return
@@ -1199,13 +1221,13 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 		}
 		_, worker := e.snapshotFor(t)
 		if worker == nil {
-			if sleepCtx(ctx, 1500*time.Millisecond) {
+			if waitWorkerWake(ctx, t.wakeSignal(), 5*time.Second) {
 				return
 			}
 			continue
 		}
 		if e.IsPaused(t.ID) {
-			if sleepCtx(ctx, 1000*time.Millisecond) {
+			if waitWorkerWake(ctx, t.wakeSignal(), 5*time.Second) {
 				return
 			}
 			continue // user-paused: don't claim/execute intents
@@ -1220,16 +1242,14 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			continue // task timeout settlement in progress: claim no new intents (running ones settle themselves; the coordinator waits for them to drain)
 		}
 		if e.budgetBlocksClaim(t.ID) {
-			if sleepCtx(ctx, 1000*time.Millisecond) {
+			if waitWorkerWake(ctx, t.wakeSignal(), 5*time.Second) {
 				return
 			}
 			continue // run budget below one worker's estimate: dispatch no new worker (the planner loop settles the task)
 		}
 		if isTerminalStatus(e.m.TaskStatus(t.ID)) {
-			if sleepCtx(ctx, 1000*time.Millisecond) {
-				return
-			}
-			continue // task already terminal (done/failed/timeout): stop claiming leftover intents; do not churn the frontier after completion
+			e.retireTaskLoops(t.ID)
+			return
 		}
 		if !e.beginTaskOperation(t.ID) {
 			return

@@ -131,11 +131,19 @@ type snapTable struct {
 	ttl        time.Duration
 
 	sweeps, capacity, tombDrops, conversions, largeResponses atomic.Int64
+	wake                                                     chan struct{}
 }
 
 func newSnapTable() *snapTable {
-	return &snapTable{slots: map[flowKey]*reqSnap{}, now: time.Now,
-		maxEntries: maxSnapEntries, maxBytes: maxSnapBytes, maxTombs: maxSnapTombs, ttl: snapTTL}
+	return &snapTable{
+		slots:      map[flowKey]*reqSnap{},
+		now:        time.Now,
+		maxEntries: maxSnapEntries,
+		maxBytes:   maxSnapBytes,
+		maxTombs:   maxSnapTombs,
+		ttl:        snapTTL,
+		wake:       make(chan struct{}, 1),
+	}
 }
 
 func doneClosed(ch <-chan struct{}) bool {
@@ -178,6 +186,12 @@ func (t *snapTable) reserve(k flowKey, e *reqSnap) bool {
 	t.slots[k] = e
 	t.entries++
 	t.bytes += e.cost
+	if t.wake != nil {
+		select {
+		case t.wake <- struct{}{}:
+		default:
+		}
+	}
 	return true
 }
 
@@ -321,16 +335,41 @@ func (t *snapTable) counts() (entries, tombs int) {
 }
 
 // sweepSnapshots is the single sweeper goroutine, started by Open and stopped
-// by Close.
+// by Close. It sleeps with zero wakeups while the table is empty and arms a
+// 1-second timer only while entries or tombstones exist.
 func (t *Traffic) sweepSnapshots() {
-	tick := time.NewTicker(time.Second)
-	defer tick.Stop()
+	var (
+		timer *time.Timer
+		tickC <-chan time.Time
+	)
+	arm := func() {
+		if tickC != nil {
+			return
+		}
+		if timer == nil {
+			timer = time.NewTimer(time.Second)
+		} else {
+			timer.Reset(time.Second)
+		}
+		tickC = timer.C
+	}
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		select {
 		case <-t.closed:
 			return
-		case <-tick.C:
+		case <-t.snaps.wake:
+			arm()
+		case <-tickC:
+			tickC = nil
 			t.snaps.tick()
+			if entries, tombs := t.snaps.counts(); entries > 0 || tombs > 0 {
+				arm()
+			}
 		}
 	}
 }

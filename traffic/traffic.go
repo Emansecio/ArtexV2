@@ -293,9 +293,10 @@ type Traffic struct {
 	transparent   *transparentServer
 
 	// Async batched exchange writer (decouples SQLite/blob I/O from proxy response path).
-	recCh      chan recItem
-	recPending atomic.Int64
-	recWg      sync.WaitGroup
+	recCh         chan recItem
+	recPending    atomic.Int64
+	recWg         sync.WaitGroup
+	exchangeCount atomic.Int64
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
@@ -321,6 +322,9 @@ func Open(dir, addr string) (*Traffic, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Cap SQLite pool size so each connection's 32 MiB page cache stays bounded.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
 	t := &Traffic{
 		dir:    dir,
 		addr:   addr,
@@ -436,9 +440,13 @@ func (t *Traffic) initIndex() error {
 	}
 	if _, err := conn.ExecContext(ctx, ftsSchema); err != nil {
 		log.Printf("[traffic] full-text index unavailable; body search will be disabled (metadata search is unaffected): %v", err)
-		return nil
+	} else {
+		t.fts = true
 	}
-	t.fts = true
+	var cnt int64
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM exchanges`).Scan(&cnt); err == nil {
+		t.exchangeCount.Store(cnt)
+	}
 	return nil
 }
 
@@ -931,7 +939,9 @@ func (t *Traffic) writeBatch(batch []pendingRecord) {
 	}
 	if err := tx.Commit(); err != nil {
 		logBatchFail(items, "committing", err)
+		return
 	}
+	t.exchangeCount.Add(int64(len(items)))
 }
 
 func (t *Traffic) insertPreparedRecord(tx *sql.Tx, it preparedRecord) (string, error) {
@@ -1474,6 +1484,12 @@ func (t *Traffic) pageWhere(f PageQuery) (where string, args []any) {
 // pagination). Bodies are never included in the rows.
 func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
 	t.flushPending()
+	return t.PageFast(f, page, size)
+}
+
+// PageFast queries recorded exchanges without blocking behind pending batch
+// writer flushes (ideal for UI polling; at most ~50ms behind live writes).
+func (t *Traffic) PageFast(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
 	if size <= 0 || size > 500 {
 		size = 100
 	}
@@ -1568,6 +1584,11 @@ type HostCount struct {
 // activity first — powers the page's target picker.
 func (t *Traffic) Hosts() ([]HostCount, error) {
 	t.flushPending()
+	return t.HostsFast()
+}
+
+// HostsFast returns distinct recorded hosts without blocking on flushPending.
+func (t *Traffic) HostsFast() ([]HostCount, error) {
 	rows, err := t.db.Query(`SELECT host, COUNT(*) AS n, MAX(ts) AS last FROM exchanges GROUP BY host ORDER BY last DESC`)
 	if err != nil {
 		return nil, err
@@ -1590,7 +1611,22 @@ func (t *Traffic) Count() (int, error) {
 	t.flushPending()
 	var n int
 	err := t.db.QueryRow(`SELECT COUNT(*) FROM exchanges`).Scan(&n)
+	if err == nil {
+		t.exchangeCount.Store(int64(n))
+	}
 	return n, err
+}
+
+// CountFast returns the approximate exchange count in O(1) without touching SQLite.
+func (t *Traffic) CountFast() int {
+	if t == nil {
+		return 0
+	}
+	n := t.exchangeCount.Load()
+	if n < 0 {
+		return 0
+	}
+	return int(n)
 }
 
 // DeleteHost removes every recorded exchange whose host contains the given
@@ -1628,6 +1664,11 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, errors.Join(fmt.Errorf("commit traffic index deletion: %w", err), restoreTrees(stageDir, moves))
+	}
+	if n > 0 {
+		if t.exchangeCount.Add(-n) < 0 {
+			t.exchangeCount.Store(0)
+		}
 	}
 	t.reapStage(stageDir)
 	if n > 0 {
@@ -1679,6 +1720,7 @@ func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
 	if err := tx.Commit(); err != nil {
 		return 0, 0, errors.Join(fmt.Errorf("commit traffic index deletion: %w", err), restoreTrees(stageDir, moves))
 	}
+	t.exchangeCount.Store(0)
 	t.reapStage(stageDir)
 	if err := t.gcBlobs(); err != nil {
 		return deleted, 0, err
