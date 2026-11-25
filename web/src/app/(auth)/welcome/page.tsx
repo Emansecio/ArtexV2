@@ -7,6 +7,7 @@ import {
   Brain,
   Check,
   Database,
+  Globe,
   LayoutDashboard,
   Loader2,
   MessageSquare,
@@ -21,9 +22,10 @@ import { ThemeSwitcher } from "@/app/(main)/_components/sidebar/theme-switcher";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { t } from "@/i18n";
+import { type Locale, LOCALES, locale, setLocale, t } from "@/i18n";
 import { api } from "@/lib/api";
 import { auth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
@@ -191,6 +193,21 @@ export default function WelcomePage() {
         </div>
 
         <div className="flex items-center gap-2">
+          <Select value={locale} onValueChange={(v) => v && setLocale(v as Locale)}>
+            <SelectTrigger size="sm" className="h-8 w-auto gap-1.5 text-xs" aria-label={t("Language")}>
+              <Globe className="size-3.5 text-muted-foreground" />
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent align="end">
+              <SelectGroup>
+                {LOCALES.map((l) => (
+                  <SelectItem key={l.code} value={l.code} className="text-xs">
+                    {l.label}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
           <Button
             type="button"
             size="sm"

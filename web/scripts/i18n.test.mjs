@@ -8,6 +8,7 @@ import ts from "typescript";
 const sourceURL = new URL("../src/i18n/index.ts", import.meta.url);
 const require = createRequire(sourceURL);
 const runtimeDicts = {
+  "pt-BR": JSON.parse(readFileSync(new URL("../src/i18n/locales/pt-BR.json", import.meta.url), "utf8")),
   tr: JSON.parse(readFileSync(new URL("../src/i18n/locales/tr.json", import.meta.url), "utf8")),
   "zh-CN": JSON.parse(readFileSync(new URL("../src/i18n/locales/zh-CN.json", import.meta.url), "utf8")),
 };
@@ -83,6 +84,22 @@ test("existing English and Turkish preferences and formatting are preserved", ()
   assert.equal(turkish.intlLocale, "tr-TR");
   assert.equal(turkish.t("Language"), "Dil");
   assert.equal(load({ languages: ["tr-TR"] }).api.locale, "tr");
+});
+
+test("Portuguese (Brazil) preference, browser tag detection and formatting", () => {
+  const { api, document } = load({ saved: "pt-BR", languages: ["en-US"] });
+  assert.equal(api.locale, "pt-BR");
+  assert.equal(api.intlLocale, "pt-BR");
+  assert.equal(document.documentElement.lang, "pt-BR");
+  assert.equal(api.t("Language"), "Idioma");
+  assert.equal(api.t("{count} tasks", { count: 3 }), "3 tarefas");
+  for (const tag of ["pt", "pt-BR", "pt-PT", "PT-br"]) {
+    assert.equal(load({ languages: [tag] }).api.locale, "pt-BR");
+  }
+  const state = load();
+  state.api.setLocale("pt-BR");
+  assert.deepEqual(state.writes, [["artex.locale", "pt-BR"]]);
+  assert.equal(state.reloads(), 1);
 });
 
 test("switching persists the existing storage key and reloads once", () => {

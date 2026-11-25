@@ -12,23 +12,25 @@
 // Dictionaries are served on demand from /locales/<code>.json by I18nBootScript so
 // English sessions pay 0 bytes for unused translations.
 
-export type Locale = "tr" | "en" | "zh-CN";
+export type Locale = "pt-BR" | "en" | "tr" | "zh-CN";
 
 // Used when nothing is saved and the browser language is not one of LOCALES,
 // and for the static prerender, which has no browser.
 export const DEFAULT_LOCALE: Locale = "en";
 
 export const LOCALES: { code: Locale; label: string }[] = [
-  { code: "tr", label: "Türkçe" },
+  { code: "pt-BR", label: "Português (BR)" },
   { code: "en", label: "English" },
+  { code: "tr", label: "Türkçe" },
   { code: "zh-CN", label: "简体中文" },
 ];
 
 const STORAGE_KEY = "artex.locale";
 
 const INTL_LOCALES: Record<Locale, string> = {
-  tr: "tr-TR",
+  "pt-BR": "pt-BR",
   en: "en-US",
+  tr: "tr-TR",
   "zh-CN": "zh-CN",
 };
 

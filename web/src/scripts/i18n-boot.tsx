@@ -11,7 +11,7 @@ export function I18nBootScript() {
   const code = `
     (function () {
       try {
-        var SUPPORTED = ["tr", "en", "zh-CN"];
+        var SUPPORTED = ["pt-BR", "en", "tr", "zh-CN"];
         var locale = "en";
         try {
           var saved = window.localStorage.getItem("artex.locale");

@@ -113,20 +113,20 @@ export function LayoutControls() {
           <div className="space-y-3 **:data-[slot=toggle-group]:w-full **:data-[slot=toggle-group-item]:flex-1 **:data-[slot=toggle-group-item]:text-xs">
             <div className="space-y-1">
               <Label className="font-medium text-xs">{t("Language")}</Label>
-              <ToggleGroup
-                size="sm"
-                spacing={0}
-                variant="outline"
-                type="single"
-                value={locale}
-                onValueChange={(v: string) => v && setLocale(v as Locale)}
-              >
-                {LOCALES.map((l) => (
-                  <ToggleGroupItem key={l.code} value={l.code} aria-label={l.label}>
-                    {l.label}
-                  </ToggleGroupItem>
-                ))}
-              </ToggleGroup>
+              <Select value={locale} onValueChange={(v) => v && setLocale(v as Locale)}>
+                <SelectTrigger size="sm" className="w-full text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {LOCALES.map((l) => (
+                      <SelectItem key={l.code} value={l.code} className="text-xs">
+                        {l.label}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
             </div>
 
             <div className="space-y-1">
