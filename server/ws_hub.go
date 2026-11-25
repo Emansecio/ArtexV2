@@ -67,13 +67,80 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 	shutdown := func() { closeOnce.Do(func() { close(doneCh) }) }
 	defer shutdown()
 
+	// Lossless coalescing queue for high-frequency token deltas: under backpressure
+	// (slow socket or multi-worker bursts), consecutive deltas for the same
+	// (channel, worker, intent_id, kind) are concatenated instead of dropped.
+	var deltaMu sync.Mutex
+	deltaOrder := make([]string, 0, 8)
+	deltaMap := make(map[string]wsOutbound, 8)
+	resyncMap := make(map[string]struct{})
+	deltaNotify := make(chan struct{}, 1)
+	pingDelta := func() {
+		select {
+		case deltaNotify <- struct{}{}:
+		default:
+		}
+	}
+
+	deltaKey := func(ch string, df DeltaFrame) string {
+		var iid string
+		if df.IntentID != nil {
+			iid = strconv.FormatInt(*df.IntentID, 10)
+		}
+		return ch + "\x00" + df.Worker + "\x00" + iid + "\x00" + df.Kind
+	}
+
 	enqueue := func(msg wsOutbound) {
+		if msg.Event == "delta" {
+			if df, ok := msg.Data.(DeltaFrame); ok {
+				k := deltaKey(msg.Channel, df)
+				deltaMu.Lock()
+				if cur, exists := deltaMap[k]; exists && !df.Reset {
+					prev := cur.Data.(DeltaFrame)
+					prev.Text += df.Text
+					cur.Data = prev
+					deltaMap[k] = cur
+				} else {
+					if !exists {
+						deltaOrder = append(deltaOrder, k)
+					}
+					deltaMap[k] = msg
+				}
+				deltaMu.Unlock()
+				pingDelta()
+				return
+			}
+		}
 		select {
 		case outCh <- msg:
 		case <-doneCh:
 		default:
-			// Backpressure: drop ephemeral delta/log frame when socket stalls.
+			// Backpressure on reliable channel: mark channel for client resync so
+			// activity rows are never silently lost.
+			if msg.Channel != "" && (msg.Event == "activity" || msg.Event == "status") {
+				deltaMu.Lock()
+				resyncMap[msg.Channel] = struct{}{}
+				deltaMu.Unlock()
+				pingDelta()
+			}
 		}
+	}
+
+	drainCoalesced := func(dst []wsOutbound) []wsOutbound {
+		deltaMu.Lock()
+		for _, k := range deltaOrder {
+			if m, ok := deltaMap[k]; ok {
+				dst = append(dst, m)
+			}
+		}
+		deltaOrder = deltaOrder[:0]
+		clear(deltaMap)
+		for ch := range resyncMap {
+			dst = append(dst, wsOutbound{Channel: ch, Event: "resync"})
+			delete(resyncMap, ch)
+		}
+		deltaMu.Unlock()
+		return dst
 	}
 
 	var subsMu sync.Mutex
@@ -248,7 +315,9 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		enqueue(wsOutbound{Channel: chName, Event: "subscribed"})
 	}
 
-	// Single writer goroutine (serializes control/ping/data writes).
+	// Single writer goroutine: drains reliable + coalesced delta queues into
+	// batched WebSocket frames (up to 64 messages per write) to cut syscalls and
+	// permessage-deflate flushes under multi-worker streaming load.
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
@@ -256,6 +325,38 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		ping := time.NewTicker(25 * time.Second)
 		defer ping.Stop()
 		lastAuth := time.Now()
+		batch := make([]wsOutbound, 0, 64)
+		flushBatch := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			if time.Since(lastAuth) >= 25*time.Second {
+				if !s.sessionOK(tok) {
+					return false
+				}
+				lastAuth = time.Now()
+			}
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			var err error
+			if len(batch) == 1 {
+				err = conn.WriteJSON(batch[0])
+			} else {
+				err = conn.WriteJSON(wsOutbound{Event: "batch", Data: batch})
+			}
+			batch = batch[:0]
+			return err == nil
+		}
+		drainMore := func() {
+			batch = drainCoalesced(batch)
+			for len(batch) < 64 {
+				select {
+				case m := <-outCh:
+					batch = append(batch, m)
+				default:
+					return
+				}
+			}
+		}
 		for {
 			select {
 			case <-doneCh:
@@ -263,14 +364,14 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 			case <-s.ctx.Done():
 				return
 			case msg := <-outCh:
-				if time.Since(lastAuth) >= 25*time.Second {
-					if !s.sessionOK(tok) {
-						return
-					}
-					lastAuth = time.Now()
+				batch = append(batch, msg)
+				drainMore()
+				if !flushBatch() {
+					return
 				}
-				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if err := conn.WriteJSON(msg); err != nil {
+			case <-deltaNotify:
+				drainMore()
+				if !flushBatch() {
 					return
 				}
 			case <-ping.C:

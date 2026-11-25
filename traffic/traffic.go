@@ -2742,6 +2742,10 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			if a.Length <= 0 || a.Length > maxBlobRead {
 				a.Length = maxBlobRead
 			}
+			blobKey := fmt.Sprintf("%s:%d:%d", a.Hash, a.Offset, a.Length)
+			if cached, ok := globalTrafficBlobCache.get(blobKey); ok {
+				return actool.Text(cached), nil
+			}
 			data, total, err := t.BlobRange(a.Hash, a.Offset, a.Length)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -2750,10 +2754,14 @@ func (t *Traffic) Tools() []actool.CoreTool {
 				return actool.Text(fmt.Sprintf("Offset %d is beyond the content length (total %d bytes).", a.Offset, total)), nil
 			}
 			head := fmt.Sprintf("[offset=%d chunk=%d total=%d]\n", a.Offset, len(data), total)
+			var rendered string
 			if isBinaryBody("", data) {
-				return actool.Text(head + "Binary content; first 512 bytes shown as hex:\n" + hex.EncodeToString(clipBytes(data, 512))), nil
+				rendered = head + "Binary content; first 512 bytes shown as hex:\n" + hex.EncodeToString(clipBytes(data, 512))
+			} else {
+				rendered = head + truncateUTF8(data, len(data))
 			}
-			return actool.Text(head + truncateUTF8(data, len(data))), nil
+			globalTrafficBlobCache.set(blobKey, rendered)
+			return actool.Text(rendered), nil
 		},
 	})
 

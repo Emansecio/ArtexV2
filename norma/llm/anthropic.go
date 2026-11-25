@@ -169,11 +169,35 @@ func toAnthropicWireMessages(msgs []Message, cc map[string]any) []anthropicWireM
 		wire[i] = anthropicWireMessage{Role: m.Role, Content: blocks}
 	}
 	if cc != nil && len(wire) > 0 {
+		// Place up to 2 sliding breakpoints on messages (Anthropic allows 4 total:
+		// tools [1] + static system [2] + penultimate stable turn [3] + latest turn [4]).
+		// Having a second breakpoint on an earlier turn preserves cache hits across
+		// retries, micro-compaction tail edits, and sidequestion forks.
+		placedLatest := -1
 		for i := len(wire) - 1; i >= 0; i-- {
 			for j := len(wire[i].Content) - 1; j >= 0; j-- {
 				if isAnthropicCacheableBlock(wire[i].Content[j]) {
 					wire[i].Content[j].CacheControl = cc
-					return wire
+					placedLatest = i
+					break
+				}
+			}
+			if placedLatest >= 0 {
+				break
+			}
+		}
+		if placedLatest >= 2 {
+			for i := placedLatest - 2; i >= 0; i-- {
+				done := false
+				for j := len(wire[i].Content) - 1; j >= 0; j-- {
+					if isAnthropicCacheableBlock(wire[i].Content[j]) {
+						wire[i].Content[j].CacheControl = cc
+						done = true
+						break
+					}
+				}
+				if done {
+					break
 				}
 			}
 		}
@@ -355,6 +379,7 @@ func parseAnthropicResponse(raw []byte) (Message, string, Usage, error) {
 func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 	var f struct {
 		Type         string `json:"type"`
+		Index        int    `json:"index"`
 		ContentBlock struct {
 			Type string `json:"type"`
 			ID   string `json:"id"`
@@ -400,7 +425,7 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 		}
 	case "content_block_start":
 		if f.ContentBlock.Type == "tool_use" {
-			return StreamEvent{Type: SEToolUseStart, ToolID: f.ContentBlock.ID, ToolName: f.ContentBlock.Name}, true, nil
+			return StreamEvent{Type: SEToolUseStart, ToolID: f.ContentBlock.ID, ToolName: f.ContentBlock.Name, ToolIndex: f.Index}, true, nil
 		}
 		if f.ContentBlock.Type == "redacted_thinking" {
 			return StreamEvent{Type: SERedactedThinking, Text: f.ContentBlock.Data}, true, nil
@@ -414,8 +439,10 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 		case "signature_delta":
 			return StreamEvent{Type: SEThinkingSignature, Text: f.Delta.Signature}, true, nil
 		case "input_json_delta":
-			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta.PartialJSON}, true, nil
+			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta.PartialJSON, ToolIndex: f.Index}, true, nil
 		}
+	case "content_block_stop":
+		return StreamEvent{Type: SEToolUseStop, ToolIndex: f.Index}, true, nil
 	case "message_delta":
 		ev := StreamEvent{Type: SEMessageDelta, StopReason: f.Delta.StopReason}
 		if f.Usage != nil {

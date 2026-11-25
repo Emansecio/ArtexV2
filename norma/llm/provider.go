@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,11 @@ const (
 	SEThinkingSignature StreamEventType = "thinking_signature"
 	SEToolUseStart      StreamEventType = "tool_use_start"
 	SEToolInputJSON     StreamEventType = "tool_input_delta"
+	// SEToolUseStop signals that a tool_use content block has finished streaming
+	// its arguments (Anthropic content_block_stop, OpenAI Responses
+	// response.function_call_arguments.done / response.output_item.done), allowing
+	// the harness to dispatch the tool immediately without waiting for message_stop.
+	SEToolUseStop StreamEventType = "tool_use_stop"
 	// SEToolUseSignature carries Gemini's thought_signature for the current
 	// tool_use block (see ContentBlock.ThoughtSignature). Mirrors
 	// SEThinkingSignature's role for thinking blocks; emitted only by the
@@ -297,21 +303,29 @@ func NewProvider(cfg Config) (Provider, error) {
 	}
 }
 
-// defaultHTTPClient builds the built-in HTTP client. A non-empty proxy
-// ("http://", "https://" or "socks5://") routes every request through it;
-// an empty proxy falls back to the standard *_PROXY environment variables
-// (net/http's ProxyFromEnvironment). The transport is cloned from
-// http.DefaultTransport so it keeps the standard timeouts and connection pool.
+var sharedDefaultTransports sync.Map // proxy string -> *http.Transport
+
+// defaultHTTPClient builds the built-in HTTP client backed by a shared
+// proxy-keyed HTTP/2 transport pool so multiple providers to the same host
+// reuse warm TCP/TLS connections.
 func defaultHTTPClient(proxy string) (*http.Client, error) {
+	proxy = strings.TrimSpace(proxy)
+	if v, ok := sharedDefaultTransports.Load(proxy); ok {
+		return &http.Client{Transport: v.(*http.Transport)}, nil
+	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.MaxIdleConns = 128
-	tr.MaxIdleConnsPerHost = 32
-	tr.IdleConnTimeout = 120 * time.Second
+	tr.MaxIdleConns = 256
+	tr.MaxIdleConnsPerHost = 64
+	tr.IdleConnTimeout = 90 * time.Second
+	tr.TLSHandshakeTimeout = 5 * time.Second
+	tr.ReadBufferSize = 64 << 10
+	tr.WriteBufferSize = 64 << 10
 	tr.ForceAttemptHTTP2 = true
 	tr.ResponseHeaderTimeout = responseHeaderTimeoutFromEnv()
 	if proxy == "" {
 		tr.Proxy = http.ProxyFromEnvironment
-		return &http.Client{Transport: tr}, nil
+		actual, _ := sharedDefaultTransports.LoadOrStore(proxy, tr)
+		return &http.Client{Transport: actual.(*http.Transport)}, nil
 	}
 	u, err := url.Parse(proxy)
 	if err != nil {
@@ -325,7 +339,8 @@ func defaultHTTPClient(proxy string) (*http.Client, error) {
 		return nil, fmt.Errorf("llm: unsupported proxy scheme %q (use http, https or socks5)", u.Scheme)
 	}
 	tr.Proxy = http.ProxyURL(u)
-	return &http.Client{Transport: tr}, nil
+	actual, _ := sharedDefaultTransports.LoadOrStore(proxy, tr)
+	return &http.Client{Transport: actual.(*http.Transport)}, nil
 }
 
 func responseHeaderTimeoutFromEnv() time.Duration {

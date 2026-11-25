@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -52,25 +53,40 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 	toolNames := map[string]string{} // tool_use id -> name, to label results
 
 	deltaSink := deltaSinkFrom(ctx)
+	var deltaMu sync.Mutex
 	var dbuf strings.Builder
 	var dkind string
+	var tailTimer *time.Timer
+	firstDelta := true
 	lastDeltaFlush := time.Now()
-	flushDelta := func() {
+	flushDeltaLocked := func() {
+		if tailTimer != nil {
+			tailTimer.Stop()
+			tailTimer = nil
+		}
 		if dbuf.Len() == 0 || deltaSink == nil {
 			dbuf.Reset()
 			dkind = ""
 			return
 		}
-		deltaSink(DeltaEvent{Kind: dkind, Text: dbuf.String()})
+		ev := DeltaEvent{Kind: dkind, Text: dbuf.String()}
 		dbuf.Reset()
 		dkind = ""
 		lastDeltaFlush = time.Now()
+		deltaSink(ev)
 	}
+	flushDelta := func() {
+		deltaMu.Lock()
+		flushDeltaLocked()
+		deltaMu.Unlock()
+	}
+	defer flushDelta()
 
 	var tbuf strings.Builder
 	var tkind string
 	flush := func() {
 		flushDelta()
+		firstDelta = true
 		if tbuf.Len() == 0 {
 			return
 		}
@@ -92,14 +108,23 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 		tkind = kind
 		tbuf.WriteString(text)
 		if deltaSink != nil {
+			deltaMu.Lock()
 			if dkind != "" && dkind != kind {
-				flushDelta()
+				flushDeltaLocked()
+				firstDelta = true
 			}
 			dkind = kind
 			dbuf.WriteString(text)
-			if dbuf.Len() >= 256 || time.Since(lastDeltaFlush) >= 40*time.Millisecond {
-				flushDelta()
+			// Emit the very first token of a block with zero coalescing delay (TTFT),
+			// then coalesce rapid bursts in 40ms/256B windows with a tail timer so
+			// chunks are never stranded when the model pauses.
+			if firstDelta || dbuf.Len() >= 256 || time.Since(lastDeltaFlush) >= 40*time.Millisecond {
+				firstDelta = false
+				flushDeltaLocked()
+			} else if tailTimer == nil {
+				tailTimer = time.AfterFunc(40*time.Millisecond, flushDelta)
 			}
+			deltaMu.Unlock()
 		}
 	}
 	lastTool := &runTrace{startedAt: time.Now()}

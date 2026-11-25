@@ -52,10 +52,11 @@ var ErrExhausted = errors.New("LLM failover: all profiles unavailable")
 // It is safe for concurrent use: members are immutable after construction and
 // all mutable state lives in the shared Registry.
 type Pool struct {
-	members    []*Member // in chain order (active first, then priority DESC)
-	health     *Registry
-	rr         atomic.Uint64 // rotates the starting point within an equal-priority group
-	hedgeDelay time.Duration // optional speculative hedge threshold (ARTEX_LLM_HEDGE_MS)
+	members      []*Member // in chain order (active first, then priority DESC)
+	health       *Registry
+	rr           atomic.Uint64 // rotates the starting point within an equal-priority group
+	hedgeDelay   time.Duration // optional speculative hedge threshold (ARTEX_LLM_HEDGE_MS)
+	hedgeDisable bool          // true when ARTEX_LLM_HEDGE_MS explicitly disables hedging
 }
 
 // New builds a Pool over members (already in chain order). Returns nil when the
@@ -68,28 +69,65 @@ func New(members []*Member, health *Registry) *Pool {
 	if health == nil {
 		health = NewRegistry(nil, nil)
 	}
+	delay, disabled := hedgeDelayFromEnv()
 	return &Pool{
-		members:    members,
-		health:     health,
-		hedgeDelay: hedgeDelayFromEnv(),
+		members:      members,
+		health:       health,
+		hedgeDelay:   delay,
+		hedgeDisable: disabled,
 	}
 }
 
 // SetHedgeDelay configures speculative hedging between the top two members in
 // Pool.Stream (0 disables). Only starts member 1 if member 0 yields no event
 // within d, and cancels the slower stream before emitting to the caller.
-func (p *Pool) SetHedgeDelay(d time.Duration) { p.hedgeDelay = d }
+func (p *Pool) SetHedgeDelay(d time.Duration) {
+	p.hedgeDelay = d
+	p.hedgeDisable = d <= 0
+}
 
-func hedgeDelayFromEnv() time.Duration {
-	raw := strings.TrimSpace(os.Getenv("ARTEX_LLM_HEDGE_MS"))
+func hedgeDelayFromEnv() (time.Duration, bool) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_LLM_HEDGE_MS")))
 	if raw == "" {
-		return 0
+		return 0, false
+	}
+	if raw == "0" || raw == "off" || raw == "false" || raw == "no" {
+		return 0, true
 	}
 	ms, err := strconv.Atoi(raw)
 	if err != nil || ms <= 0 {
+		return 0, false
+	}
+	return time.Duration(ms) * time.Millisecond, false
+}
+
+// effectiveHedgeDelay resolves the TTFT hedge trigger for (m0, m1):
+//   - explicit ARTEX_LLM_HEDGE_MS=off/0 → disabled;
+//   - explicit ARTEX_LLM_HEDGE_MS=<ms> → fixed threshold;
+//   - unset → adaptive P90 (1.5× P90 clamped to [1.2s, 4s]) only when m0 and m1
+//     share the same Rank (same priority / cost tier).
+func (p *Pool) effectiveHedgeDelay(m0, m1 *Member) time.Duration {
+	if p.hedgeDisable || m0 == nil || m1 == nil {
 		return 0
 	}
-	return time.Duration(ms) * time.Millisecond
+	if p.hedgeDelay > 0 {
+		return p.hedgeDelay
+	}
+	if m0.Rank != m1.Rank || p.health == nil {
+		return 0
+	}
+	p90 := p.health.P90TTFT(m0.ID)
+	if p90 <= 0 {
+		return 0
+	}
+	d := p90 * 3 / 2
+	if d < 1200*time.Millisecond {
+		d = 1200 * time.Millisecond
+	}
+	if d > 4*time.Second {
+		d = 4 * time.Second
+	}
+	return d
 }
 
 // Members returns the chain in order (read-only).
@@ -114,15 +152,17 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 		var lastErr error
 		startIdx := 0
 		thinking := req.Thinking == "enabled" || (req.Thinking == "" && len(order) > 0 && (order[0].Thinking || (req.ReasoningEffort != "" && req.ReasoningEffort != "none")))
-		if p.hedgeDelay > 0 && !thinking && len(order) >= 2 {
-			done, err := p.streamHedgedFirstTwo(ctx, req, order[0], order[1], len(order) > 2, yield)
-			if done {
-				return
+		if !thinking && len(order) >= 2 {
+			if hedgeWait := p.effectiveHedgeDelay(order[0], order[1]); hedgeWait > 0 {
+				done, err := p.streamHedgedFirstTwo(ctx, req, order[0], order[1], len(order) > 2, hedgeWait, yield)
+				if done {
+					return
+				}
+				if err != nil {
+					lastErr = err
+				}
+				startIdx = 2
 			}
-			if err != nil {
-				lastErr = err
-			}
-			startIdx = 2
 		}
 		for i := startIdx; i < len(order); i++ {
 			m := order[i]
@@ -189,6 +229,7 @@ func (p *Pool) streamHedgedFirstTwo(
 	req llm.CompletionRequest,
 	m0, m1 *Member,
 	hasMore bool,
+	hedgeWait time.Duration,
 	yield func(llm.StreamEvent, error) bool,
 ) (bool, error) {
 	runMember := func(mctx context.Context, m *Member, out chan<- hedgeResult) {
@@ -245,8 +286,8 @@ func (p *Pool) streamHedgedFirstTwo(
 		}
 	}
 
-	// Fast path: wait up to p.hedgeDelay for m0 before hedging m1.
-	timer := time.NewTimer(p.hedgeDelay)
+	// Fast path: wait up to hedgeWait for m0 before hedging m1.
+	timer := time.NewTimer(hedgeWait)
 	select {
 	case <-ctx.Done():
 		timer.Stop()
@@ -282,7 +323,7 @@ func (p *Pool) streamHedgedFirstTwo(
 		go runMember(ctx1, m1, ch1)
 		if !m0Dead {
 			log.Printf("[llmpool] speculative hedge: racing %q(%s) alongside slow %q(%s) after %v",
-				m1.Name, m1.Model, m0.Name, m0.Model, p.hedgeDelay)
+				m1.Name, m1.Model, m0.Name, m0.Model, hedgeWait)
 		} else {
 			log.Printf("[llmpool] LLM failover: %q(%s) → %q(%s), reason: %s",
 				m0.Name, m0.Model, m1.Name, m1.Model, trimErr(lastErr))

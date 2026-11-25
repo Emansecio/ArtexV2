@@ -94,7 +94,9 @@ func (p *openaiResponsesProvider) buildBody(req CompletionRequest, stream bool) 
 	}
 	if len(tools) > 0 {
 		if p.cfg.ToolsAsInputItem {
-			body.Input = append(body.Input, orInputItem{Type: "additional_tools", Tools: tools})
+			// Place static tool schemas at the prefix of Input (before mutable turn
+			// history) so OpenAI's automatic prefix cache reuses them across turns.
+			body.Input = append([]orInputItem{{Type: "additional_tools", Tools: tools}}, body.Input...)
 		} else {
 			body.Tools = tools
 		}
@@ -201,7 +203,8 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 	// The event name is authoritative; some gateways omit the SSE `event:` line
 	// and put the discriminator only in the JSON `type` field, so fall back to it.
 	var f struct {
-		Type string `json:"type"`
+		Type        string `json:"type"`
+		OutputIndex int    `json:"output_index"`
 		// output_item.added: item carries the function_call id/name.
 		Item struct {
 			Type      string `json:"type"`
@@ -231,7 +234,7 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 	switch kind {
 	case "response.output_item.added":
 		if f.Item.Type == "function_call" {
-			return StreamEvent{Type: SEToolUseStart, ToolID: f.Item.CallID, ToolName: f.Item.Name}, true, nil
+			return StreamEvent{Type: SEToolUseStart, ToolID: f.Item.CallID, ToolName: f.Item.Name, ToolIndex: f.OutputIndex}, true, nil
 		}
 	case "response.output_text.delta":
 		if f.Delta != "" {
@@ -243,7 +246,13 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 		}
 	case "response.function_call_arguments.delta":
 		if f.Delta != "" {
-			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta}, true, nil
+			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta, ToolIndex: f.OutputIndex}, true, nil
+		}
+	case "response.function_call_arguments.done":
+		return StreamEvent{Type: SEToolUseStop, ToolIndex: f.OutputIndex}, true, nil
+	case "response.output_item.done":
+		if f.Item.Type == "function_call" {
+			return StreamEvent{Type: SEToolUseStop, ToolIndex: f.OutputIndex}, true, nil
 		}
 	case "response.completed", "response.incomplete":
 		ev := StreamEvent{Type: SEMessageDelta, StopReason: "end_turn"}

@@ -7,11 +7,32 @@ export interface StreamDelta {
 
 const deltas = new Map<string, StreamDelta>();
 const listeners = new Map<string, Set<() => void>>();
+const pendingNotify = new Set<string>();
+let rafScheduled = false;
 
 function notify(key: string) {
   const subs = listeners.get(key);
   if (!subs) return;
   for (const fn of subs) fn();
+}
+
+function flushNotifications() {
+  rafScheduled = false;
+  if (pendingNotify.size === 0) return;
+  const keys = [...pendingNotify];
+  pendingNotify.clear();
+  for (const k of keys) notify(k);
+}
+
+function scheduleNotify(keys: Iterable<string>) {
+  for (const k of keys) pendingNotify.add(k);
+  if (rafScheduled || pendingNotify.size === 0) return;
+  rafScheduled = true;
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(flushNotifications);
+  } else {
+    queueMicrotask(flushNotifications);
+  }
 }
 
 export function appendStreamDeltas(
@@ -30,12 +51,13 @@ export function appendStreamDeltas(
     );
     touched.add(d.key);
   }
-  for (const k of touched) notify(k);
+  if (touched.size > 0) scheduleNotify(touched);
 }
 
 export function clearAllStreamDeltas() {
   const keys = [...deltas.keys()];
   deltas.clear();
+  for (const k of keys) pendingNotify.delete(k);
   for (const k of keys) notify(k);
 }
 

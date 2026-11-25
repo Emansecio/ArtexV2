@@ -689,7 +689,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 				// When the asset-coverage feature is off, the test scope (denominator) is no
 				// longer accumulated. A failed flag read is treated as on, so an outage
 				// still writes, including for a task whose stored flag is off.
-				writeIntentAutoScope(as, taskID, assets, coverageEnabled)
+				// Offload idempotent auto-scope upserts off the pre-TTFT critical path.
+				go writeIntentAutoScope(as, taskID, assets, coverageEnabled)
 			}
 		}
 	}

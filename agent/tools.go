@@ -485,29 +485,44 @@ type overviewCacheEntry struct {
 }
 
 var overviewCache = struct {
-	mu sync.Mutex
-	m  map[string]overviewCacheEntry
+	mu     sync.Mutex
+	m      map[string]overviewCacheEntry
+	flight flightGroup[map[string]any]
 }{m: map[string]overviewCacheEntry{}}
 
 // graphOverviewData computes the distilled situational snapshot shared by the
 // graph_overview tool and the planner's wake-up prompt. Queries execute
-// concurrently and unchanged snapshots are cached briefly for parallel workers.
+// concurrently and unchanged snapshots are cached and singleflight-coalesced
+// for parallel workers.
 func (t *ToolSet) graphOverviewData() map[string]any {
 	var cacheKey, fp string
 	if t.ts != nil {
-		if sfp, ferr := t.ts.OverviewFingerprint(); ferr == nil && sfp != "" {
-			fp = sfp
-			// The snapshot folds related-task overviews, so it must be keyed on
-			// the sources' fingerprints too — a source's writes have to bust it.
-			var kb strings.Builder
-			fmt.Fprintf(&kb, "%d:%d:%v", t.ts.ID(), t.taskID, t.coverageDisabled)
-			if srcs, serr := t.ts.DirectSourceStores(); serr == nil {
-				for _, src := range srcs {
-					sfp2, _ := src.Store.OverviewFingerprint()
-					fmt.Fprintf(&kb, "|%d:%s", src.Task.TaskID, sfp2)
-				}
+		srcs, serr := t.ts.DirectSourceStores()
+		if serr == nil && len(srcs) == 0 {
+			// Fast path: no inherited source tasks — key off the in-process atomic
+			// graph mutation counter (zero Postgres round-trips on cache hits).
+			if gv := t.ts.GraphVersion(); gv > 0 {
+				fp = fmt.Sprintf("gv:%d", gv)
+				cacheKey = fmt.Sprintf("%d:%d:%v", t.ts.ID(), t.taskID, t.coverageDisabled)
 			}
-			cacheKey = kb.String()
+		}
+		if fp == "" {
+			if sfp, ferr := t.ts.OverviewFingerprint(); ferr == nil && sfp != "" {
+				fp = sfp
+				// The snapshot folds related-task overviews, so it must be keyed on
+				// the sources' fingerprints too — a source's writes have to bust it.
+				var kb strings.Builder
+				fmt.Fprintf(&kb, "%d:%d:%v", t.ts.ID(), t.taskID, t.coverageDisabled)
+				if serr == nil {
+					for _, src := range srcs {
+						sfp2, _ := src.Store.OverviewFingerprint()
+						fmt.Fprintf(&kb, "|%d:%s", src.Task.TaskID, sfp2)
+					}
+				}
+				cacheKey = kb.String()
+			}
+		}
+		if cacheKey != "" {
 			overviewCache.mu.Lock()
 			if ent, ok := overviewCache.m[cacheKey]; ok && ent.fp == fp && time.Since(ent.createdAt) < 15*time.Second {
 				cp := maps.Clone(ent.data)
@@ -517,6 +532,23 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			overviewCache.mu.Unlock()
 		}
 	}
+	if cacheKey != "" {
+		res, _ := overviewCache.flight.Do(cacheKey+"@"+fp, func() (map[string]any, error) {
+			overviewCache.mu.Lock()
+			if ent, ok := overviewCache.m[cacheKey]; ok && ent.fp == fp && time.Since(ent.createdAt) < 15*time.Second {
+				cp := maps.Clone(ent.data)
+				overviewCache.mu.Unlock()
+				return cp, nil
+			}
+			overviewCache.mu.Unlock()
+			return t.computeGraphOverviewData(cacheKey, fp), nil
+		})
+		return maps.Clone(res)
+	}
+	return t.computeGraphOverviewData("", "")
+}
+
+func (t *ToolSet) computeGraphOverviewData(cacheKey, fp string) map[string]any {
 
 	const openIntentsCap = 30
 	const coldDigestsCap = 15
@@ -790,16 +822,13 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		overviewCache.mu.Lock()
 		if len(overviewCache.m) >= 128 {
 			for k, ent := range overviewCache.m {
-				if now.Sub(ent.createdAt) >= 1500*time.Millisecond {
+				if now.Sub(ent.createdAt) >= 15*time.Second {
 					delete(overviewCache.m, k)
 				}
 			}
 			if len(overviewCache.m) >= 128 {
 				clear(overviewCache.m)
 			}
-		}
-		if len(overviewCache.m) >= 32 {
-			clear(overviewCache.m)
 		}
 		overviewCache.m[cacheKey] = overviewCacheEntry{fp: fp, data: maps.Clone(out), createdAt: now}
 		overviewCache.mu.Unlock()

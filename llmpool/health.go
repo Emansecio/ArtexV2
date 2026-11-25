@@ -12,6 +12,7 @@ package llmpool
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -30,6 +31,9 @@ type State struct {
 	Trips     int           // total trips, indexes the backoff ladder
 	OpenUntil time.Time     // zero / past = closed (usable)
 	TTFT      time.Duration // EWMA time-to-first-token (0 = unmeasured)
+	ttftRing  [32]time.Duration
+	ttftCount int
+	ttftIdx   int
 	LastError string
 	LastAt    time.Time
 }
@@ -184,6 +188,31 @@ func (r *Registry) RecordTTFT(id int64, d time.Duration) {
 		// EWMA alpha = 0.25
 		st.TTFT = (st.TTFT*3 + d) / 4
 	}
+	st.ttftRing[st.ttftIdx] = d
+	st.ttftIdx = (st.ttftIdx + 1) % len(st.ttftRing)
+	if st.ttftCount < len(st.ttftRing) {
+		st.ttftCount++
+	}
+}
+
+// P90TTFT returns the 90th-percentile time-to-first-token over the last 32
+// samples for profile id (0 if fewer than 4 samples have been observed).
+func (r *Registry) P90TTFT(id int64) time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.m[id]
+	if st == nil || st.ttftCount < 4 {
+		return 0
+	}
+	var buf [32]time.Duration
+	n := st.ttftCount
+	copy(buf[:n], st.ttftRing[:n])
+	slices.Sort(buf[:n])
+	idx := (n*9 - 1) / 10
+	if idx >= n {
+		idx = n - 1
+	}
+	return buf[idx]
 }
 
 // TTFT returns the tracked EWMA time-to-first-token for profile id (0 if unmeasured).

@@ -87,3 +87,33 @@ func TestNonSafeToolsRunExclusively(t *testing.T) {
 		t.Fatalf("non-concurrency-safe tools must run exclusively (maxSeen=%d, want 1)", p.maxSeen)
 	}
 }
+
+func TestSafeToolsBreakHoLBehindQueuedExclusive(t *testing.T) {
+	safeProbe := &concurrencyProbe{}
+	exclProbe := &concurrencyProbe{}
+	turn := []llm.StreamEvent{
+		{Type: llm.SEToolUseStart, ToolID: "s1", ToolName: "safe", ToolIndex: 0},
+		{Type: llm.SEToolInputJSON, Text: `{}`, ToolIndex: 0},
+		{Type: llm.SEToolUseStop, ToolIndex: 0},
+		{Type: llm.SEToolUseStart, ToolID: "e1", ToolName: "excl", ToolIndex: 1},
+		{Type: llm.SEToolInputJSON, Text: `{}`, ToolIndex: 1},
+		{Type: llm.SEToolUseStop, ToolIndex: 1},
+		{Type: llm.SEToolUseStart, ToolID: "s2", ToolName: "safe", ToolIndex: 2},
+		{Type: llm.SEToolInputJSON, Text: `{}`, ToolIndex: 2},
+		{Type: llm.SEToolUseStop, ToolIndex: 2},
+		{Type: llm.SEMessageDelta, StopReason: "tool_use"},
+		{Type: llm.SEMessageStop},
+	}
+	m := &scriptedModel{turns: [][]llm.StreamEvent{turn, textTurn("done")}}
+	in := QueryInput{
+		Messages: []llm.Message{llm.UserText("go")}, PermissionMode: permission.ModeBypass,
+		Tools: tool.NewRegistry(probeTool("safe", true, safeProbe), probeTool("excl", false, exclProbe)),
+	}
+	drain(t, in, QueryDeps{CallModel: m.call})
+	if safeProbe.maxSeen != 2 {
+		t.Fatalf("safe tools behind queued exclusive tool should overlap (maxSeen=%d, want 2)", safeProbe.maxSeen)
+	}
+	if exclProbe.maxSeen != 1 {
+		t.Fatalf("exclusive tool must run alone (maxSeen=%d, want 1)", exclProbe.maxSeen)
+	}
+}

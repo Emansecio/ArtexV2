@@ -21,8 +21,7 @@ let connected = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 let reconnectMs = 1000;
 let dirtyTimer: ReturnType<typeof setTimeout> | undefined;
-let lastDirtyChannel = "";
-let lastDirtyTopic: string | undefined;
+const pendingDirty = new Map<string, string | undefined>();
 
 function buildWSUrl(): string {
   const raw = sseUrl("/api/ws");
@@ -49,14 +48,16 @@ function notifyConnection(next: boolean) {
 }
 
 function notifyDirty(channel: string, topic?: string) {
-  lastDirtyChannel = channel;
-  lastDirtyTopic = topic;
+  pendingDirty.set(`${channel}\0${topic ?? ""}`, topic);
   if (dirtyTimer !== undefined) return;
   dirtyTimer = setTimeout(() => {
     dirtyTimer = undefined;
-    const ch = lastDirtyChannel;
-    const tp = lastDirtyTopic;
-    for (const fn of dirtyListeners) fn(ch, tp);
+    const items = [...pendingDirty.entries()];
+    pendingDirty.clear();
+    for (const [k, tp] of items) {
+      const ch = k.slice(0, k.indexOf("\0"));
+      for (const fn of dirtyListeners) fn(ch, tp);
+    }
   }, 600);
 }
 
@@ -92,17 +93,22 @@ function ensureSocket() {
     }
   };
 
-  ws.onmessage = (ev) => {
-    if (typeof ev.data !== "string") return;
-    let msg: { channel?: string; event?: string; data?: unknown };
-    try {
-      msg = JSON.parse(ev.data) as { channel?: string; event?: string; data?: unknown };
-    } catch {
+  const dispatchFrame = (msg: { channel?: string; event?: string; data?: unknown }) => {
+    if (msg.event === "batch" && Array.isArray(msg.data)) {
+      for (const item of msg.data) {
+        if (item && typeof item === "object") {
+          dispatchFrame(item as { channel?: string; event?: string; data?: unknown });
+        }
+      }
       return;
     }
     const ch = msg.channel;
     const event = msg.event;
     if (!ch || !event) return;
+    if (event === "resync") {
+      notifyDirty(ch);
+      return;
+    }
     const subs = channels.get(ch);
     if (subs) {
       for (const s of subs) s.onEvent(event, msg.data);
@@ -113,6 +119,17 @@ function ensureSocket() {
     } else if (event === "activity" || event === "status" || event === "side") {
       notifyDirty(ch);
     }
+  };
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== "string") return;
+    let msg: { channel?: string; event?: string; data?: unknown };
+    try {
+      msg = JSON.parse(ev.data) as { channel?: string; event?: string; data?: unknown };
+    } catch {
+      return;
+    }
+    dispatchFrame(msg);
   };
 
   const handleClose = () => {

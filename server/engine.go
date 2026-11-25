@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"strings"
@@ -780,25 +781,52 @@ func (e *Engine) usageWriteQueue() chan usageActivityWrite {
 	return e.usageQ
 }
 
-// actEmitter is a per-run FIFO between the run's emit calls and the synchronous
-// persist+broadcast path, so a Postgres write never stalls tool dispatch or the
-// SSE reader during streaming. One goroutine drains in order; flush() must run
-// before the run ends so callers reading activities afterwards see every row
-// committed. Emits racing a completed flush fall back to writing inline.
+// actEmitter is a per-run FIFO between the run's emit calls and the persist+
+// broadcast path, so a Postgres write never stalls tool dispatch or the SSE
+// reader during streaming. One goroutine drains queued bursts in micro-batches
+// (up to 16 items per multi-row INSERT); flush() must run before the run ends
+// so callers reading activities afterwards see every row committed.
 type actEmitter struct {
-	write  func(db.Activity)
-	ch     chan db.Activity
-	done   chan struct{}
-	mu     sync.Mutex
-	closed bool
+	write      func(db.Activity)
+	writeBatch func([]db.Activity)
+	ch         chan db.Activity
+	done       chan struct{}
+	mu         sync.Mutex
+	closed     bool
 }
 
 func newActEmitter(write func(db.Activity)) *actEmitter {
-	e := &actEmitter{write: write, ch: make(chan db.Activity, 128), done: make(chan struct{})}
+	return newBatchActEmitter(write, nil)
+}
+
+func newBatchActEmitter(write func(db.Activity), writeBatch func([]db.Activity)) *actEmitter {
+	e := &actEmitter{write: write, writeBatch: writeBatch, ch: make(chan db.Activity, 256), done: make(chan struct{})}
 	go func() {
 		defer close(e.done)
-		for r := range e.ch {
-			write(r)
+		batch := make([]db.Activity, 0, 16)
+		for first := range e.ch {
+			batch = append(batch[:0], first)
+			// Opportunistically drain any additional queued activities without
+			// blocking, collapsing bursts into a single multi-row INSERT.
+		drain:
+			for len(batch) < 16 {
+				select {
+				case next, ok := <-e.ch:
+					if !ok {
+						break drain
+					}
+					batch = append(batch, next)
+				default:
+					break drain
+				}
+			}
+			if len(batch) > 1 && e.writeBatch != nil {
+				e.writeBatch(batch)
+			} else {
+				for _, r := range batch {
+					e.write(r)
+				}
+			}
 		}
 	}()
 	return e
@@ -828,6 +856,47 @@ func (e *actEmitter) flush() {
 	e.mu.Unlock()
 	close(e.ch)
 	<-e.done
+}
+
+// emitActivitiesBatch persists a non-usage batch in one multi-row INSERT and
+// publishes each row in order. Usage rows are routed to usageWriteQueue, and
+// any DB error falls back item-by-item to emitActivity so outbox/diagnostics
+// remain lossless.
+func (e *Engine) emitActivitiesBatch(t *Task, items []db.Activity) {
+	persistable := make([]db.Activity, 0, len(items))
+	for _, r := range items {
+		if r.Kind == "usage" {
+			e.emitActivity(t, r)
+			continue
+		}
+		persistable = append(persistable, r)
+	}
+	if len(persistable) == 0 {
+		return
+	}
+	if len(persistable) == 1 {
+		e.emitActivity(t, persistable[0])
+		return
+	}
+	ids, err := t.Store.AppendActivitiesBatch(persistable)
+	if err != nil {
+		for _, r := range persistable {
+			e.emitActivity(t, r)
+		}
+		return
+	}
+	wakeSched := false
+	for i, r := range persistable {
+		r.ID = ids[i]
+		e.bc.Publish(t.ID, r)
+		if r.Kind == "tool_result" {
+			wakeSched = true
+		}
+	}
+	e.touch(t.ID)
+	if wakeSched {
+		e.m.wakeScheduler()
+	}
 }
 
 // emitActivity persists one captured step AND fans it out to live subscribers,
@@ -1196,7 +1265,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		defer e.decInflight(t.ID)
 		e.stampFirstRun(t) // first real planning round → stamp first_run_at + compute the deadline (only for tasks with a timeout)
 		e.touch(t.ID)
-		em := newActEmitter(func(r db.Activity) { e.emitActivity(t, r) })
+		em := newBatchActEmitter(
+			func(r db.Activity) { e.emitActivity(t, r) },
+			func(batch []db.Activity) { e.emitActivitiesBatch(t, batch) },
+		)
 		defer em.flush()
 		emit := em.emit
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; carries the task deadline
@@ -1449,7 +1521,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // first real execution → stamp first_run_at + compute the deadline (only for tasks with a timeout)
 	e.touch(t.ID)
-	em := newActEmitter(func(r db.Activity) { e.emitActivity(t, r) })
+	em := newBatchActEmitter(
+		func(r db.Activity) { e.emitActivity(t, r) },
+		func(batch []db.Activity) { e.emitActivitiesBatch(t, batch) },
+	)
 	defer em.flush()
 	emit := em.emit
 	ectx, workCtx, workCancel, ok := e.intentWorkContext(ctx, t, intent.ID)
@@ -1513,9 +1588,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	for attempt := 1; attempt <= maxRetries &&
 		retryableWorkerModelError(reason, err) &&
 		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
+		wait := retryBackoff
+		if half := wait / 2; half > 0 {
+			wait = half + time.Duration(rand.Int64N(int64(half)+1))
+		}
 		log.Printf("[worker %s] task %s intent #%d finished with model_error, retrying after %v (%d/%d)",
-			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
-		if sleepCtx(workCtx, retryBackoff) {
+			name, t.ID, intent.ID, wait, attempt, maxRetries)
+		if sleepCtx(workCtx, wait) {
 			break // cancelled during backoff (kill/pause) → handled by the branches below
 		}
 		e.BeginLLMCall(t.ID)

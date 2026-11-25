@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/config"
@@ -184,8 +185,25 @@ func SuffixTestDatabase(suffix string) {
 // (MVCC), so unlike the old SQLite store there is no process-wide write mutex.
 type DB struct {
 	*sql.DB
-	cfgOnce sync.Once
-	cfg     *configCache
+	cfgOnce  sync.Once
+	cfg      *configCache
+	graphVer atomic.Uint64
+}
+
+// BumpGraphVersion advances the in-process exploration graph mutation counter,
+// allowing overview caches to detect mutations without a round-trip fingerprint query.
+func (d *DB) BumpGraphVersion() {
+	if d != nil {
+		d.graphVer.Add(1)
+	}
+}
+
+// GraphVersion returns the monotonic in-process graph mutation counter (never 0).
+func (d *DB) GraphVersion() uint64 {
+	if d == nil {
+		return 0
+	}
+	return d.graphVer.Load() + 1
 }
 
 // ensureDatabase connects to the postgres system database and creates the target

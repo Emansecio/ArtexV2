@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"net/url"
@@ -19,19 +20,21 @@ const (
 )
 
 type probeCacheEntry struct {
+	key       string
 	res       actool.Result
 	expiresAt time.Time
-	seq       uint64
 }
 
 // TaskProbeCache deduplicates successful GET-like WebFetch calls across workers
-// within the same task during a short TTL window.
+// within the same task during a short TTL window, using O(1) LRU eviction and
+// singleflight in-flight coalescing.
 type TaskProbeCache struct {
-	mu         sync.RWMutex
-	entries    map[string]probeCacheEntry
+	mu         sync.Mutex
+	entries    map[string]*list.Element
+	lru        *list.List
+	flight     flightGroup[actool.Result]
 	ttl        time.Duration
 	maxEntries int
-	seq        uint64
 	now        func() time.Time
 }
 
@@ -51,7 +54,8 @@ func newTaskProbeCache(ttl time.Duration, maxEntries int, now func() time.Time) 
 		now = time.Now
 	}
 	return &TaskProbeCache{
-		entries:    make(map[string]probeCacheEntry),
+		entries:    make(map[string]*list.Element, maxEntries),
+		lru:        list.New(),
 		ttl:        ttl,
 		maxEntries: maxEntries,
 		now:        now,
@@ -63,20 +67,19 @@ func (c *TaskProbeCache) get(key string) (actool.Result, bool) {
 		return actool.Result{}, false
 	}
 	now := c.now()
-	c.mu.RLock()
-	entry, ok := c.entries[key]
-	c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	elem, ok := c.entries[key]
 	if !ok {
 		return actool.Result{}, false
 	}
+	entry := elem.Value.(*probeCacheEntry)
 	if !now.Before(entry.expiresAt) {
-		c.mu.Lock()
-		if cur, exists := c.entries[key]; exists && !now.Before(cur.expiresAt) {
-			delete(c.entries, key)
-		}
-		c.mu.Unlock()
+		c.lru.Remove(elem)
+		delete(c.entries, key)
 		return actool.Result{}, false
 	}
+	c.lru.MoveToFront(elem)
 	return cloneToolResult(entry.res), true
 }
 
@@ -88,36 +91,28 @@ func (c *TaskProbeCache) set(key string, res actool.Result) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, exists := c.entries[key]; !exists && len(c.entries) >= c.maxEntries {
-		for k, e := range c.entries {
-			if !now.Before(e.expiresAt) {
-				delete(c.entries, k)
-			}
-		}
-		for len(c.entries) >= c.maxEntries {
-			var oldestKey string
-			var oldestSeq uint64
-			first := true
-			for k, e := range c.entries {
-				if first || e.seq < oldestSeq {
-					oldestKey = k
-					oldestSeq = e.seq
-					first = false
-				}
-			}
-			if oldestKey == "" {
-				break
-			}
-			delete(c.entries, oldestKey)
-		}
+	if elem, exists := c.entries[key]; exists {
+		entry := elem.Value.(*probeCacheEntry)
+		entry.res = cloneToolResult(res)
+		entry.expiresAt = now.Add(c.ttl)
+		c.lru.MoveToFront(elem)
+		return
 	}
-
-	c.seq++
-	c.entries[key] = probeCacheEntry{
+	for c.lru.Len() >= c.maxEntries {
+		back := c.lru.Back()
+		if back == nil {
+			break
+		}
+		ev := back.Value.(*probeCacheEntry)
+		delete(c.entries, ev.key)
+		c.lru.Remove(back)
+	}
+	entry := &probeCacheEntry{
+		key:       key,
 		res:       cloneToolResult(res),
 		expiresAt: now.Add(c.ttl),
-		seq:       c.seq,
 	}
+	c.entries[key] = c.lru.PushFront(entry)
 }
 
 func cloneToolResult(r actool.Result) actool.Result {
@@ -152,11 +147,21 @@ func (t *cachedWebFetchTool) Call(ctx context.Context, input json.RawMessage, tc
 	if cached, ok := t.cache.get(key); ok {
 		return cached, nil
 	}
-	res, err := t.CoreTool.Call(ctx, input, tc)
-	if err == nil && !res.IsError {
-		t.cache.set(key, res)
+	// Deduplicate concurrent in-flight GET probes for the same URL across workers.
+	res, err := t.cache.flight.Do(key, func() (actool.Result, error) {
+		if cached, ok := t.cache.get(key); ok {
+			return cached, nil
+		}
+		r, callErr := t.CoreTool.Call(ctx, input, tc)
+		if callErr == nil && !r.IsError {
+			t.cache.set(key, r)
+		}
+		return r, callErr
+	})
+	if err != nil {
+		return res, err
 	}
-	return res, err
+	return cloneToolResult(res), nil
 }
 
 func probeCacheKey(input json.RawMessage) (string, bool) {

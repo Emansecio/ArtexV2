@@ -18,11 +18,14 @@ var ErrStreamIdleTimeout = errors.New("llm: sse stream idle timeout")
 // (event, data) pair of each message. Anthropic uses named events; OpenAI uses
 // bare data lines. Both are handled.
 type sseScanner struct {
-	r       *bufio.Reader
-	closer  io.Closer
-	timeout time.Duration
-	timer   *time.Timer
-	timed   atomic.Bool
+	r            *bufio.Reader
+	buf          bytes.Buffer // reused across frames to avoid per-event allocations
+	closer       io.Closer
+	timeout      time.Duration
+	timer        *time.Timer
+	lastActivity atomic.Int64 // unix nanos of last received line
+	closed       atomic.Bool
+	timed        atomic.Bool
 }
 
 func newSSEScanner(body io.Reader) *sseScanner {
@@ -36,62 +39,92 @@ func newSSEScannerWithIdleTimeout(body io.ReadCloser, idleTimeout time.Duration)
 		timeout: idleTimeout,
 	}
 	if idleTimeout > 0 && body != nil {
-		s.timer = time.AfterFunc(idleTimeout, func() {
-			s.timed.Store(true)
-			_ = body.Close()
-		})
+		s.lastActivity.Store(time.Now().UnixNano())
+		var check func()
+		check = func() {
+			if s.closed.Load() {
+				return
+			}
+			elapsed := time.Duration(time.Now().UnixNano() - s.lastActivity.Load())
+			if elapsed >= s.timeout {
+				s.timed.Store(true)
+				_ = body.Close()
+				return
+			}
+			// Re-arm once for the remaining idle window instead of resetting the
+			// runtime timer heap on every single SSE line.
+			s.timer.Reset(s.timeout - elapsed)
+		}
+		s.timer = time.AfterFunc(idleTimeout, check)
 	}
 	return s
 }
 
-func (s *sseScanner) resetWatchdog() {
-	if s.timer != nil && s.timeout > 0 {
-		s.timer.Reset(s.timeout)
+func (s *sseScanner) touchWatchdog() {
+	if s.timeout > 0 {
+		s.lastActivity.Store(time.Now().UnixNano())
 	}
 }
 
 func (s *sseScanner) Close() {
+	s.closed.Store(true)
 	if s.timer != nil {
 		s.timer.Stop()
 	}
 }
 
+// readLine reads one '\n'-terminated line using ReadSlice on the fast path
+// (zero allocation for lines <= 64KB) and falling back to ReadBytes for huge lines.
+func (s *sseScanner) readLine() ([]byte, error) {
+	frag, err := s.r.ReadSlice('\n')
+	if err != bufio.ErrBufferFull {
+		return frag, err
+	}
+	full := make([]byte, len(frag), len(frag)*2)
+	copy(full, frag)
+	for err == bufio.ErrBufferFull {
+		frag, err = s.r.ReadSlice('\n')
+		full = append(full, frag...)
+	}
+	return full, err
+}
+
 // next returns the next event's (type, data). event is "" for bare-data streams.
 // Returns io.EOF at end of stream.
 func (s *sseScanner) next() (event, data string, err error) {
-	var buf bytes.Buffer
+	s.buf.Reset()
 	for {
-		s.resetWatchdog()
-		line, rerr := s.r.ReadString('\n')
+		s.touchWatchdog()
+		rawLine, rerr := s.readLine()
 		if rerr != nil {
 			if s.timed.Load() {
 				s.Close()
 				return "", "", ErrStreamIdleTimeout
 			}
-			if rerr == io.EOF && (buf.Len() > 0 || event != "") {
+			if rerr == io.EOF && (s.buf.Len() > 0 || event != "") {
 				s.Close()
-				return event, strings.TrimRight(buf.String(), "\n"), nil
+				return event, strings.TrimRight(s.buf.String(), "\n"), nil
 			}
 			s.Close()
 			return "", "", rerr
 		}
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			if buf.Len() > 0 || event != "" {
-				return event, strings.TrimRight(buf.String(), "\n"), nil
+		rawLine = bytes.TrimRight(rawLine, "\r\n")
+		if len(rawLine) == 0 {
+			if s.buf.Len() > 0 || event != "" {
+				return event, strings.TrimRight(s.buf.String(), "\n"), nil
 			}
 			continue
 		}
 		switch {
-		case strings.HasPrefix(line, "event:"):
-			event = strings.TrimSpace(line[len("event:"):])
-		case strings.HasPrefix(line, "data:"):
-			d := line[len("data:"):]
-			d = strings.TrimPrefix(d, " ")
-			buf.WriteString(d)
-			buf.WriteByte('\n')
+		case bytes.HasPrefix(rawLine, []byte("event:")):
+			event = string(bytes.TrimSpace(rawLine[len("event:"):]))
+		case bytes.HasPrefix(rawLine, []byte("data:")):
+			d := rawLine[len("data:"):]
+			d = bytes.TrimPrefix(d, []byte(" "))
+			s.buf.Write(d)
+			s.buf.WriteByte('\n')
 		default:
-			// comment / unknown field — ignore (still resets watchdog above)
+			// comment / unknown field — ignore (still refreshed watchdog above)
 		}
 	}
 }

@@ -776,6 +776,48 @@ const MemoStreamingBlock = React.memo(function MemoStreamingBlock({ text }: { te
   return <Markdown text={text} />;
 });
 
+// splitMarkdownBlocks incrementally partitions streaming Markdown into immutable
+// finalized blocks + a trailing live tail, respecting fenced code blocks (``` / ~~~)
+// so each completed paragraph/table/code block is parsed by ReactMarkdown once (O(N)
+// total instead of O(P²) re-parsing the full document on every paragraph boundary).
+function splitMarkdownBlocks(text: string): { blocks: string[]; tail: string } {
+  const blocks: string[] = [];
+  let blockStart = 0;
+  let fenceChar = "";
+  let fenceLen = 0;
+  let i = 0;
+  const n = text.length;
+
+  while (i < n) {
+    const lineEnd = text.indexOf("\n", i);
+    const end = lineEnd === -1 ? n : lineEnd;
+    const line = text.slice(i, end);
+    const trimmed = line.trimStart();
+
+    if (fenceChar) {
+      if (trimmed.startsWith(fenceChar.repeat(fenceLen)) && trimmed.slice(fenceLen).trim() === "") {
+        fenceChar = "";
+        fenceLen = 0;
+      }
+    } else if (trimmed.startsWith("```") || trimmed.startsWith("~~~")) {
+      const ch = trimmed[0];
+      let len = 0;
+      while (len < trimmed.length && trimmed[len] === ch) len++;
+      fenceChar = ch;
+      fenceLen = len;
+    } else if (trimmed === "" && lineEnd !== -1) {
+      const chunk = text.slice(blockStart, i).trim();
+      if (chunk) blocks.push(chunk);
+      blockStart = lineEnd + 1;
+    }
+
+    if (lineEnd === -1) break;
+    i = lineEnd + 1;
+  }
+
+  return { blocks, tail: text.slice(blockStart) };
+}
+
 function StreamingBubble({
   streamingDelta,
   streamSessionKey,
@@ -785,6 +827,10 @@ function StreamingBubble({
 }) {
   const storeDelta = useStreamDelta(streamSessionKey);
   const active = streamSessionKey ? storeDelta : streamingDelta;
+  const parsed = React.useMemo(
+    () => (active?.text && active.kind !== "thinking" ? splitMarkdownBlocks(active.text) : null),
+    [active?.text, active?.kind],
+  );
   if (!active?.text) return null;
 
   if (active.kind === "thinking") {
@@ -798,15 +844,14 @@ function StreamingBubble({
     );
   }
 
-  // Split completed paragraphs (\n\n) from the trailing live line so only
-  // finalized blocks are parsed by ReactMarkdown (avoids O(N^2) 60 FPS AST work).
-  const splitIdx = active.text.lastIndexOf("\n\n");
-  const finalized = splitIdx > 0 ? active.text.slice(0, splitIdx) : "";
-  const tail = splitIdx > 0 ? active.text.slice(splitIdx + 2) : active.text;
+  const blocks = parsed?.blocks ?? [];
+  const tail = parsed?.tail ?? "";
 
   return (
-    <div className="my-1 px-2 py-1 text-sm whitespace-pre-wrap break-words">
-      {finalized && <MemoStreamingBlock text={finalized} />}
+    <div className="my-1 space-y-1.5 px-2 py-1 text-sm whitespace-pre-wrap break-words">
+      {blocks.map((block, idx) => (
+        <MemoStreamingBlock key={idx} text={block} />
+      ))}
       {tail && <div className="whitespace-pre-wrap break-words">{tail}</div>}
     </div>
   );

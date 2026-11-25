@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/llmrec"
@@ -663,12 +664,13 @@ func (c Config) NewProvider() (llm.Provider, error) {
 		lc.PromptCacheTTL = promptCacheTTL()
 		lc.PromptCacheRetention = openAICacheRetention()
 		lc.OpenAICacheControl = openAICacheControlEnabled() ||
-			// OpenRouter → Claude gateways understand Anthropic-style
+			// OpenRouter / OpenCode → Claude gateways understand Anthropic-style
 			// cache_control on the OpenAI wire format; enable it unless the
 			// env explicitly opted out.
 			(!isFalsy(os.Getenv("ARTEX_OPENAI_CACHE_CONTROL")) &&
 				lc.Format == llm.FormatOpenAI &&
-				strings.Contains(strings.ToLower(lc.BaseURL), "openrouter.ai") &&
+				(strings.Contains(strings.ToLower(lc.BaseURL), "openrouter.ai") ||
+					strings.Contains(strings.ToLower(lc.BaseURL), "opencode.ai")) &&
 				strings.Contains(strings.ToLower(lc.Model), "claude"))
 		lc.StripOldReasoning = stripOldReasoningEnabled()
 	}
@@ -799,14 +801,22 @@ func requestBodySnapshot(req *http.Request) string {
 	return string(b)
 }
 
-func quotaAwareHTTPClient(proxy, sessionHeaderKey, userAgent string) (*http.Client, error) {
+var sharedLLMTransports sync.Map // proxy string -> *http.Transport
+
+func sharedLLMTransport(proxy string) (*http.Transport, error) {
+	proxy = strings.TrimSpace(proxy)
+	if v, ok := sharedLLMTransports.Load(proxy); ok {
+		return v.(*http.Transport), nil
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConns = 128
-	transport.MaxIdleConnsPerHost = 32
-	transport.IdleConnTimeout = 120 * time.Second
+	transport.MaxIdleConns = 256
+	transport.MaxIdleConnsPerHost = 64
+	transport.IdleConnTimeout = 90 * time.Second
+	transport.TLSHandshakeTimeout = 5 * time.Second
+	transport.ReadBufferSize = 64 << 10
+	transport.WriteBufferSize = 64 << 10
 	transport.ResponseHeaderTimeout = 60 * time.Second
 	transport.ForceAttemptHTTP2 = true
-	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
 		transport.Proxy = nil // empty = direct; no fallback to the HTTP_PROXY/HTTPS_PROXY env vars
 	} else {
@@ -822,6 +832,15 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey, userAgent string) (*http.Clie
 			return nil, fmt.Errorf("llm: unsupported proxy scheme %q (use http, https or socks5)", proxyURL.Scheme)
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	actual, _ := sharedLLMTransports.LoadOrStore(proxy, transport)
+	return actual.(*http.Transport), nil
+}
+
+func quotaAwareHTTPClient(proxy, sessionHeaderKey, userAgent string) (*http.Client, error) {
+	transport, err := sharedLLMTransport(proxy)
+	if err != nil {
+		return nil, err
 	}
 	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey), userAgent: strings.TrimSpace(userAgent)}}, nil
 }

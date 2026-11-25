@@ -67,7 +67,9 @@ func (a *Accumulator) Add(ev StreamEvent) {
 		}
 		a.toolPos[ev.ToolIndex] = len(a.toolSigs) - 1
 	case SEToolInputJSON:
-		if n := len(a.toolInputs); n > 0 {
+		if pos, ok := a.toolPos[ev.ToolIndex]; ok && pos < len(a.toolInputs) {
+			a.toolInputs[pos].WriteString(ev.Text)
+		} else if n := len(a.toolInputs); n > 0 {
 			a.toolInputs[n-1].WriteString(ev.Text)
 		}
 	case SEToolUseSignature:

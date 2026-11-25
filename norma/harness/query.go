@@ -838,20 +838,31 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 	exec = newStreamExec(l)
 	acc := llm.NewAccumulator()
 
-	var building bool
-	var curID, curName string
-	var curInput strings.Builder
-	finalizeTool := func() bool { // false = consumer stopped
-		if !building {
+	type pendingTool struct {
+		index int
+		id    string
+		name  string
+		input strings.Builder
+	}
+	pending := map[int]*pendingTool{}
+	var pendingOrder []int
+	finalizeToolIndex := func(idx int) bool { // false = consumer stopped
+		pt, ok := pending[idx]
+		if !ok {
 			return true
 		}
-		building = false
-		raw := strings.TrimSpace(curInput.String())
-		curInput.Reset()
+		delete(pending, idx)
+		for i, k := range pendingOrder {
+			if k == idx {
+				pendingOrder = append(pendingOrder[:i], pendingOrder[i+1:]...)
+				break
+			}
+		}
+		raw := strings.TrimSpace(pt.input.String())
 		if raw == "" || !jsonValid(raw) {
 			raw = "{}"
 		}
-		block := llm.ContentBlock{Type: llm.BlockToolUse, ID: curID, Name: curName, Input: []byte(raw)}
+		block := llm.ContentBlock{Type: llm.BlockToolUse, ID: pt.id, Name: pt.name, Input: []byte(raw)}
 		// Start the tool before emitting tool_use: the emit path persists an
 		// activity row synchronously, which would otherwise delay dispatch.
 		exec.add(block)
@@ -860,28 +871,71 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		}
 		return exec.drain()
 	}
+	finalizeAllTools := func() bool {
+		for len(pendingOrder) > 0 {
+			if !finalizeToolIndex(pendingOrder[0]) {
+				return false
+			}
+		}
+		return true
+	}
 
 	for ev, e := range l.deps.CallModel(l.ctx, req) {
 		if e != nil {
 			err = e
 			break
 		}
-		// Events that belong INSIDE a tool_use block must not reach
-		// finalizeTool below — that dispatches the tool and clears `building`,
-		// so any argument delta still to come would be dropped on the floor
-		// (curInput.WriteString is gated on `building`) and the tool would run
-		// with raw == "{}" while acc.Message() records the real arguments.
-		// SEToolUseSignature trails the arguments in Gemini's current framing,
-		// but a gateway is free to attach extra_content to the chunk that only
-		// declares id/name — so route it to the accumulator, not the boundary.
+		// Events that belong INSIDE a tool_use block must not finalize other
+		// in-flight calls — interleaved parallel tool_calls carry distinct ToolIndex
+		// values, and SEToolUseSignature may arrive before or after arguments.
 		if ev.Type == llm.SEToolInputJSON || ev.Type == llm.SEToolUseSignature {
-			if building && ev.Type == llm.SEToolInputJSON {
-				curInput.WriteString(ev.Text)
+			if ev.Type == llm.SEToolInputJSON {
+				if pt, ok := pending[ev.ToolIndex]; ok {
+					pt.input.WriteString(ev.Text)
+				} else if len(pendingOrder) > 0 {
+					pending[pendingOrder[len(pendingOrder)-1]].input.WriteString(ev.Text)
+				}
 			}
 			acc.Add(ev)
 			continue
 		}
-		if !finalizeTool() {
+		if ev.Type == llm.SEToolUseStop {
+			// Dispatch this specific tool_use immediately upon content_block_stop /
+			// function_call_arguments.done without waiting for message_stop.
+			if !finalizeToolIndex(ev.ToolIndex) {
+				return asst, exec, "", nil, true, false
+			}
+			acc.Add(ev)
+			continue
+		}
+		if ev.Type == llm.SEToolUseStart {
+			// If a provider/test reuses the same ToolIndex (e.g. default 0), finalize
+			// the previous call at that index immediately. For distinct indices
+			// (OpenAI parallel tool_calls), eagerly finalize any earlier call whose
+			// JSON is already syntactically complete so streaming overlap still fires,
+			// while leaving incomplete interleaved calls open for subsequent deltas.
+			if _, exists := pending[ev.ToolIndex]; exists {
+				if !finalizeToolIndex(ev.ToolIndex) {
+					return asst, exec, "", nil, true, false
+				}
+			} else {
+				for _, idx := range slices.Clone(pendingOrder) {
+					if pt := pending[idx]; pt != nil {
+						raw := strings.TrimSpace(pt.input.String())
+						if raw != "" && jsonValid(raw) {
+							if !finalizeToolIndex(idx) {
+								return asst, exec, "", nil, true, false
+							}
+						}
+					}
+				}
+			}
+			pending[ev.ToolIndex] = &pendingTool{index: ev.ToolIndex, id: ev.ToolID, name: ev.ToolName}
+			pendingOrder = append(pendingOrder, ev.ToolIndex)
+			acc.Add(ev)
+			continue
+		}
+		if !finalizeAllTools() {
 			return asst, exec, "", nil, true, false
 		}
 		switch ev.Type {
@@ -893,12 +947,10 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 			if ev.Text != "" && !l.emit(Event{Kind: KindThinking, Text: ev.Text}) {
 				return asst, exec, "", nil, true, false
 			}
-		case llm.SEToolUseStart:
-			curID, curName, building = ev.ToolID, ev.ToolName, true
 		}
 		acc.Add(ev)
 	}
-	if !finalizeTool() {
+	if !finalizeAllTools() {
 		return asst, exec, "", nil, true, false
 	}
 	l.usage.Add(acc.Usage)

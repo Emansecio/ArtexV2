@@ -2,13 +2,16 @@ package tool
 
 import (
 	"bufio"
+	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/norma/permission"
@@ -181,6 +184,107 @@ func WebSearchProbe(ctx context.Context, cfg WebSearchConfig, query string, limi
 	return prov.Search(ctx, query, limit)
 }
 
+const (
+	webSearchCacheTTL        = 10 * time.Minute
+	webSearchCacheMaxEntries = 256
+)
+
+type webSearchCacheEntry struct {
+	key       string
+	text      string
+	expiresAt time.Time
+}
+
+type webSearchFlight struct {
+	wg   sync.WaitGroup
+	text string
+	err  error
+}
+
+type webSearchCache struct {
+	mu      sync.Mutex
+	entries map[string]*list.Element
+	lru     *list.List
+	inflight map[string]*webSearchFlight
+}
+
+var globalWebSearchCache = &webSearchCache{
+	entries:  make(map[string]*list.Element, webSearchCacheMaxEntries),
+	lru:      list.New(),
+	inflight: make(map[string]*webSearchFlight),
+}
+
+func (c *webSearchCache) get(key string) (string, bool) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	elem, ok := c.entries[key]
+	if !ok {
+		return "", false
+	}
+	ent := elem.Value.(*webSearchCacheEntry)
+	if !now.Before(ent.expiresAt) {
+		c.lru.Remove(elem)
+		delete(c.entries, key)
+		return "", false
+	}
+	c.lru.MoveToFront(elem)
+	return ent.text, true
+}
+
+func (c *webSearchCache) set(key, text string) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if elem, ok := c.entries[key]; ok {
+		ent := elem.Value.(*webSearchCacheEntry)
+		ent.text = text
+		ent.expiresAt = now.Add(webSearchCacheTTL)
+		c.lru.MoveToFront(elem)
+		return
+	}
+	for c.lru.Len() >= webSearchCacheMaxEntries {
+		back := c.lru.Back()
+		if back == nil {
+			break
+		}
+		ev := back.Value.(*webSearchCacheEntry)
+		delete(c.entries, ev.key)
+		c.lru.Remove(back)
+	}
+	ent := &webSearchCacheEntry{key: key, text: text, expiresAt: now.Add(webSearchCacheTTL)}
+	c.entries[key] = c.lru.PushFront(ent)
+}
+
+func (c *webSearchCache) do(key string, fn func() (string, error)) (string, error) {
+	if text, ok := c.get(key); ok {
+		return text, nil
+	}
+	c.mu.Lock()
+	if f, ok := c.inflight[key]; ok {
+		c.mu.Unlock()
+		f.wg.Wait()
+		return f.text, f.err
+	}
+	f := &webSearchFlight{}
+	f.wg.Add(1)
+	c.inflight[key] = f
+	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		delete(c.inflight, key)
+		c.mu.Unlock()
+		f.wg.Done()
+	}()
+
+	f.text, f.err = fn()
+	if f.err == nil && f.text != "" {
+		c.set(key, f.text)
+	}
+	return f.text, f.err
+}
+
 func webSearchRunner(prov searchProvider) func(context.Context, json.RawMessage, *ToolContext) (Result, error) {
 	return func(ctx context.Context, input json.RawMessage, _ *ToolContext) (Result, error) {
 		var in struct {
@@ -201,25 +305,32 @@ func webSearchRunner(prov searchProvider) func(context.Context, json.RawMessage,
 		if limit > 20 {
 			limit = 20
 		}
-		// Hard wall-clock cap so a slow/rate-limited backend can't hang the agent
-		// loop. A backend that runs a model call per search (deepseek) declares a
-		// longer cap of its own; plain HTTP backends keep the 30s default.
-		wall := 30 * time.Second
-		if tp, ok := prov.(interface{ Timeout() time.Duration }); ok {
-			wall = tp.Timeout()
-		}
-		cctx, cancel := context.WithTimeout(ctx, wall)
-		defer cancel()
-		results, err := prov.Search(cctx, query, limit)
+		cacheKey := prov.Name() + "|" + strings.ToLower(query) + "|" + strconv.Itoa(limit)
+		text, err := globalWebSearchCache.do(cacheKey, func() (string, error) {
+			// Hard wall-clock cap so a slow/rate-limited backend can't hang the agent
+			// loop. A backend that runs a model call per search (deepseek) declares a
+			// longer cap of its own; plain HTTP backends keep the 30s default.
+			wall := 30 * time.Second
+			if tp, ok := prov.(interface{ Timeout() time.Duration }); ok {
+				wall = tp.Timeout()
+			}
+			cctx, cancel := context.WithTimeout(ctx, wall)
+			defer cancel()
+			results, err := prov.Search(cctx, query, limit)
+			if err != nil {
+				return "", err
+			}
+			out, _ := json.MarshalIndent(map[string]any{
+				"backend": prov.Name(),
+				"query":   query,
+				"results": results,
+			}, "", "  ")
+			return truncate(string(out), 50000), nil
+		})
 		if err != nil {
 			return Errorf(fmt.Sprintf("Error searching web via %s: %s", prov.Name(), err.Error())), nil
 		}
-		out, _ := json.MarshalIndent(map[string]any{
-			"backend": prov.Name(),
-			"query":   query,
-			"results": results,
-		}, "", "  ")
-		return Text(truncate(string(out), 50000)), nil
+		return Text(text), nil
 	}
 }
 

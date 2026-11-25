@@ -398,10 +398,36 @@ type triggerLookup struct {
 }
 
 func storeTriggerLookup(ts *db.ExplorationStore) triggerLookup {
+	return storeTriggerLookupBatch(ts, nil)
+}
+
+func storeTriggerLookupBatch(ts *db.ExplorationStore, batch map[int64]db.TriggerBatchInfo) triggerLookup {
 	return triggerLookup{
-		intentSummary: func(id int64) string { return intentSummary(ts, id) },
-		workerOutput:  func(id int64) string { return workerOutput(ts, id) },
-		factIDs:       func(id int64) string { return factIDsYielded(ts, id) },
+		intentSummary: func(id int64) string {
+			if info, ok := batch[id]; ok && info.Summary != "" {
+				return info.Summary
+			}
+			return intentSummary(ts, id)
+		},
+		workerOutput: func(id int64) string {
+			if info, ok := batch[id]; ok && info.Output != "" {
+				return truncOutput(info.Output, 800)
+			}
+			return workerOutput(ts, id)
+		},
+		factIDs: func(id int64) string {
+			if info, ok := batch[id]; ok {
+				if len(info.FactIDs) == 0 {
+					return ""
+				}
+				parts := make([]string, len(info.FactIDs))
+				for i, fid := range info.FactIDs {
+					parts[i] = fmt.Sprintf("#%d", fid)
+				}
+				return strings.Join(parts, ", ")
+			}
+			return factIDsYielded(ts, id)
+		},
 	}
 }
 
@@ -490,19 +516,54 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tsx.killWork = p.killWork   // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork // enable steer_work tool (nil = unavailable)
 	tsx.SetOnIntentCreated(p.onIntentCreated)
-	if origin, _ := ts.OriginFactID(); origin > 0 {
+	// Parallel pre-flight: fetch origin fact, graph overview, operation constraints,
+	// and batched trigger metadata concurrently to minimize pre-TTFT latency.
+	triggerIDs := make([]int64, 0, len(triggers))
+	for _, ev := range triggers {
+		if ev.IntentID > 0 {
+			triggerIDs = append(triggerIDs, ev.IntentID)
+		}
+	}
+	var (
+		origin      int64
+		overview    map[string]any
+		constraints string
+		trigBatch   map[int64]db.TriggerBatchInfo
+		preWG       sync.WaitGroup
+	)
+	preWG.Add(1)
+	go func() {
+		defer preWG.Done()
+		origin, _ = ts.OriginFactID()
+	}()
+	preWG.Add(1)
+	go func() {
+		defer preWG.Done()
+		overview = tsx.graphOverviewData()
+	}()
+	if p.wantConstraints() {
+		preWG.Add(1)
+		go func() {
+			defer preWG.Done()
+			constraints = constraintBlock(ts)
+		}()
+	}
+	if len(triggerIDs) > 0 {
+		preWG.Add(1)
+		go func() {
+			defer preWG.Done()
+			trigBatch, _ = ts.BatchTriggerContext(triggerIDs)
+		}()
+	}
+	preWG.Wait()
+	if origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
 	}
-	overview := tsx.graphOverviewData()
 	pruned := plannerPruneToolsEnabled() && overviewHasFacts(overview)
-	// Domain tools + default tool set. Once facts > 0, plannerDefaultTmpl forbids
-	// probing by the planner itself, so drop Bash/Write/Edit/MultiEdit/Glob/Grep/Sleep/WebFetch.
-	var base []actool.CoreTool
-	if pruned {
-		base = append(tsx.DropCoverageTools(tsx.PlannerTools()), defaultToolsOnly(p.workDir, "Read", "LS")...)
-	} else {
-		base = append(tsx.DropCoverageTools(tsx.PlannerTools()), defaultTools(p.workDir)...)
-	}
+	// Keep the planner's tool schema list identical across round 1 and rounds 2+
+	// so provider prompt caches stay warm; once facts > 0, plannerPruneHook blocks
+	// probing tools in PreToolUse instead of mutating the wire tools array.
+	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), defaultTools(p.workDir)...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(WithToolQuery(ctx, plannerToolQuery(goal, triggers)), "planner", base)
 	defer cleanup()
@@ -515,7 +576,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// risk). situational is spliced into input below.
 	// One envelope (one fresh nonce) per user message (#124, F3).
 	env := newDataEnvelope()
-	situational := plannerSituational(triggers, storeTriggerLookup(ts), overview, env)
+	situational := plannerSituational(triggers, storeTriggerLookupBatch(ts, trigBatch), overview, env)
 	// Task-level deadline / endgame mode (injected via ctx, see taskclock.go). On the
 	// endgame round, the task-timeout planner wrap-up prompt is spliced into this
 	// round's user input (along with situational) as [this round's operating
@@ -535,9 +596,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
 	sysBody := plannerSystem(goal, p.workDir, taskDir) + frameLessonsBlockWithNonce(p.lessonsBlock, p.lessonsNonce)
-	constraints := ""
-	if p.wantConstraints() {
-		constraints = constraintBlock(ts)
+	if constraints != "" {
 		sysBody += constraints // inject the operation constraints (if any) into the system prompt, bounding exploration
 	}
 	system, boundary := deferredSystem(sysBody, def)
@@ -549,10 +608,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("planner", nil, clamped)
 	}
-	plannerTools := tools
-	if !pruned {
-		plannerTools = withWebFetch(ctx, tools, p.proxyAddr, p.proxyCACert) // WebFetch: route through the recording proxy for traceability; load the proxy CA to verify MITM-re-signed HTTPS certs; every redirect hop is gated
-	}
+	plannerTools := withWebFetch(ctx, tools, p.proxyAddr, p.proxyCACert) // WebFetch: route through the recording proxy for traceability; load the proxy CA to verify MITM-re-signed HTTPS certs; every redirect hop is gated
 	opts := agentcore.Options{
 		Provider:               p.prov,
 		SummaryProvider:        p.summaryProv,
@@ -599,6 +655,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	}
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
+	}
+	if pruned {
+		opts.Hooks = &plannerPruneHook{next: opts.Hooks}
 	}
 	opts.Hooks = SpillHooks(opts.Hooks, opts.ToolOutputDir)
 	// The session id is the provider-side identity (session header, usage metering)
@@ -647,6 +706,40 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 
 func plannerPruneToolsEnabled() bool {
 	return !isFalsy(os.Getenv("ARTEX_PLANNER_PRUNE_TOOLS"))
+}
+
+// plannerPruneHook blocks probing tools after facts > 0 without removing their
+// schemas from the LLM request, keeping the provider prompt cache warm across rounds.
+type plannerPruneHook struct {
+	next harness.HookRunner
+}
+
+var plannerPrunedToolNames = map[string]bool{
+	"Bash": true, "Write": true, "Edit": true, "MultiEdit": true,
+	"Glob": true, "Grep": true, "Sleep": true, "WebFetch": true, "web_search": true,
+}
+
+func (h *plannerPruneHook) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
+	if plannerPrunedToolNames[name] {
+		return true, fmt.Sprintf("Tool %s is disabled for the planner once exploration facts exist; dispatch an intent via add_intent for a worker to investigate.", name), nil
+	}
+	if h.next != nil {
+		return h.next.PreToolUse(ctx, name, input)
+	}
+	return false, "", nil
+}
+
+func (h *plannerPruneHook) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
+	if h.next != nil {
+		h.next.PostToolUse(ctx, name, input, result, isErr)
+	}
+}
+
+func (h *plannerPruneHook) Stop(ctx context.Context, messages []llm.Message) (bool, []string, string) {
+	if h.next != nil {
+		return h.next.Stop(ctx, messages)
+	}
+	return false, nil, ""
 }
 
 func overviewHasFacts(overview map[string]any) bool {

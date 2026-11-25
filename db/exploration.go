@@ -215,6 +215,14 @@ func (d *DB) Exploration(id int64) *ExplorationStore { return &ExplorationStore{
 
 func (s *ExplorationStore) ID() int64 { return s.expID }
 
+// GraphVersion returns the parent DB's monotonic graph mutation counter.
+func (s *ExplorationStore) GraphVersion() uint64 {
+	if s == nil || s.db == nil {
+		return 0
+	}
+	return s.db.GraphVersion()
+}
+
 // Root returns the exploration's description and goal.
 func (s *ExplorationStore) Root() (description, goal string, err error) {
 	var d sql.NullString
@@ -249,7 +257,11 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 			return 0, err
 		}
 	}
-	return id, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.db.BumpGraphVersion()
+	return id, nil
 }
 
 func checkFactAnchorAssets(tx *sql.Tx, ids []int64) error {
@@ -510,7 +522,11 @@ func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, er
 			summary = sm
 		}
 	}
-	return summary, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	s.db.BumpGraphVersion()
+	return summary, nil
 }
 
 // CancelIntent physically deletes an intent plus all exclusively-owned
@@ -695,7 +711,11 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 	if removed != int64(len(ids)) {
 		return out, fmt.Errorf("intent cleanup changed concurrently")
 	}
-	return out, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return out, err
+	}
+	s.db.BumpGraphVersion()
+	return out, nil
 }
 
 type tokenUsageBucket struct {
@@ -1515,6 +1535,129 @@ type queryRower interface {
 // AppendActivity records one worker step and returns its id.
 func (s *ExplorationStore) AppendActivity(a Activity) (int64, error) {
 	return s.appendActivity(s.db, a)
+}
+
+// AppendActivitiesBatch persists multiple activities in a single multi-row
+// INSERT ... RETURNING id statement, preserving input order.
+func (s *ExplorationStore) AppendActivitiesBatch(items []Activity) ([]int64, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	if len(items) == 1 {
+		id, err := s.AppendActivity(items[0])
+		if err != nil {
+			return nil, err
+		}
+		return []int64{id}, nil
+	}
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, main_seg) VALUES `)
+	args := make([]any, 0, len(items)*15)
+	for i, a := range items {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		base := i * 15
+		fmt.Fprintf(&sb, "($%d,$%d,NULLIF($%d,''),NULLIF($%d,''),NULLIF($%d,''),NULLIF($%d,''),$%d,NULLIF($%d,''),NULLIF($%d,''),$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11, base+12, base+13, base+14, base+15)
+		metadata := a.Metadata
+		if len(metadata) == 0 {
+			metadata = json.RawMessage(`{}`)
+		}
+		args = append(args,
+			s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool),
+			utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),
+			metadata, a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens, a.MainSeg,
+		)
+	}
+	sb.WriteString(` RETURNING id`)
+	rows, err := s.db.Query(sb.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]int64, 0, len(items))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) != len(items) {
+		return nil, fmt.Errorf("activity batch insert returned %d ids for %d items", len(ids), len(items))
+	}
+	return ids, nil
+}
+
+// TriggerBatchInfo carries pre-fetched planner trigger metadata for one intent.
+type TriggerBatchInfo struct {
+	Summary string
+	Output  string
+	FactIDs []int64
+}
+
+// BatchTriggerContext loads intent summaries, latest worker output texts, and
+// yielded fact IDs for a set of intent IDs in 3 batched queries instead of 3*N.
+func (s *ExplorationStore) BatchTriggerContext(intentIDs []int64) (map[int64]TriggerBatchInfo, error) {
+	out := make(map[int64]TriggerBatchInfo, len(intentIDs))
+	if s == nil || s.db == nil || len(intentIDs) == 0 {
+		return out, nil
+	}
+	// 1. Intent summaries from exploration_nodes
+	if rows, err := s.db.Query(`SELECT id, payload FROM exploration_nodes WHERE exploration_id=$1 AND id = ANY($2::bigint[])`, s.expID, intentIDs); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var id int64
+			var raw []byte
+			if rows.Scan(&id, &raw) == nil {
+				var p map[string]any
+				if json.Unmarshal(raw, &p) == nil {
+					if sm, ok := p["summary"].(string); ok && sm != "" {
+						info := out[id]
+						info.Summary = sm
+						out[id] = info
+					}
+				}
+			}
+		}
+	}
+	// 2. Latest worker output text (result preferred over text)
+	if rows, err := s.db.Query(`SELECT DISTINCT ON (node_id) node_id, COALESCE(NULLIF(detail,''), summary)
+		FROM activity
+		WHERE exploration_id=$1 AND node_id = ANY($2::bigint[]) AND kind IN ('result','text')
+		ORDER BY node_id, (kind='result') DESC, id DESC`, s.expID, intentIDs); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var id int64
+			var txt sql.NullString
+			if rows.Scan(&id, &txt) == nil && txt.Valid {
+				info := out[id]
+				info.Output = txt.String
+				out[id] = info
+			}
+		}
+	}
+	// 3. Yielded fact IDs
+	if rows, err := s.db.Query(`SELECT e.src_id, n.id
+		FROM exploration_edges e
+		JOIN exploration_nodes n ON n.id=e.dst_id AND n.exploration_id=e.exploration_id
+		WHERE e.exploration_id=$1 AND e.src_id = ANY($2::bigint[]) AND e.rel=$3 AND n.kind=$4
+		ORDER BY e.src_id, n.id`, s.expID, intentIDs, RelYields, KindFact); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var srcID, factID int64
+			if rows.Scan(&srcID, &factID) == nil {
+				info := out[srcID]
+				info.FactIDs = append(info.FactIDs, factID)
+				out[srcID] = info
+			}
+		}
+	}
+	return out, nil
 }
 
 func (s *ExplorationStore) appendActivity(q queryRower, a Activity) (int64, error) {

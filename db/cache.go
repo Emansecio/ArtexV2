@@ -12,10 +12,9 @@ import (
 // assembly repeats ~15-20 config queries per turn (settings, tools, prompts,
 // MCP list, visibility, agent lookup); most answers are stable for minutes.
 //
-// Entries carry a short TTL so writes that bypass the cache-aware methods
-// (raw-SQL migrations and one-off Exec repairs) still converge quickly — the
-// same 2s policy s.cachedAgentByKey already uses.
-const configCacheTTL = 2 * time.Second
+// Entries carry a 60s TTL (up from 2s) because all write paths — both typed
+// setters and raw Exec/Query/QueryRow DML — actively invalidate affected keys.
+const configCacheTTL = 60 * time.Second
 
 type configCache struct {
 	mu sync.RWMutex
@@ -95,8 +94,27 @@ func (d *DB) InvalidateMCPCache() {
 // cache-aware write methods, so the Exec/Query/QueryRow wrappers below drop the
 // affected entries instead of serving stale config for up to configCacheTTL.
 var configWriteTable = regexp.MustCompile(`(?i)\b(?:insert\s+into|update|delete\s+from|truncate(?:\s+table)?)\s+(settings|tools|mcp_servers|agent_prompts|agent_visibility|agent_skill_visibility|agents)\b`)
+var graphWriteTable = regexp.MustCompile(`(?i)\b(?:insert\s+into|update|delete\s+from|truncate(?:\s+table)?)\s+(exploration_nodes|exploration_edges)\b`)
+
+// isPureSelect reports whether query begins with SELECT (ignoring leading
+// whitespace/comments), allowing read queries to bypass the DML invalidation
+// regex completely. CTEs starting with WITH still fall through to the regex so
+// write CTEs (WITH ... DELETE/UPDATE/INSERT) continue to invalidate.
+func isPureSelect(query string) bool {
+	s := strings.TrimSpace(query)
+	if len(s) < 6 {
+		return false
+	}
+	return strings.EqualFold(s[:6], "SELECT") && (len(s) == 6 || s[6] == ' ' || s[6] == '\t' || s[6] == '\n' || s[6] == '\r')
+}
 
 func (d *DB) invalidateConfigFor(query string) {
+	if isPureSelect(query) {
+		return
+	}
+	if graphWriteTable.MatchString(query) {
+		d.BumpGraphVersion()
+	}
 	m := configWriteTable.FindStringSubmatch(query)
 	if m == nil {
 		return

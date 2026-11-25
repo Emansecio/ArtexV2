@@ -74,8 +74,12 @@ func (e *streamExec) canStartLocked(safe bool) bool {
 	return true
 }
 
-// processQueue starts every queued tool that may run, honoring FIFO: a non-safe
-// tool that cannot start blocks the tools behind it.
+// processQueue starts every queued tool that may run. A non-safe tool requires
+// exclusive access (no other tool executing), so if any non-safe tool is running
+// nothing else starts. However, when only safe tools are running and a non-safe
+// tool is waiting for them to finish, subsequent queued safe tools can still
+// overlap with the active safe tools (breaking Head-of-Line blocking) while
+// drain() and results() preserve arrival order.
 func (e *streamExec) processQueue() {
 	e.mu.Lock()
 	var start []*tracked
@@ -86,8 +90,6 @@ func (e *streamExec) processQueue() {
 		if e.canStartLocked(t.safe) {
 			t.status = stExecuting
 			start = append(start, t)
-		} else if !t.safe {
-			break
 		}
 	}
 	e.mu.Unlock()

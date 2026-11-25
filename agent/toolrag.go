@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
 	actool "github.com/Autumn-27/norma/tool"
@@ -101,10 +102,35 @@ func rankTools(query string, tools []actool.CoreTool, score ToolScorer) ([]actoo
 	return out, nil
 }
 
-// bm25Score is the default ToolScorer: Okapi BM25 (k1=1.2, b=0.75) over each tool's
-// name + description + parameter names, IDF computed across the candidate set.
-func bm25Score(query string, tools []actool.CoreTool) ([]float64, error) {
-	const k1, b = 1.2, 0.75
+type bm25Index struct {
+	docs []map[string]int
+	lens []float64
+	df   map[string]int
+	avg  float64
+}
+
+var bm25Cache = struct {
+	mu sync.RWMutex
+	m  map[string]*bm25Index
+}{m: map[string]*bm25Index{}}
+
+func bm25CatalogKey(tools []actool.CoreTool) string {
+	var b strings.Builder
+	for _, t := range tools {
+		b.WriteString(t.Name())
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+func getOrBuildBM25Index(tools []actool.CoreTool) *bm25Index {
+	key := bm25CatalogKey(tools)
+	bm25Cache.mu.RLock()
+	idx := bm25Cache.m[key]
+	bm25Cache.mu.RUnlock()
+	if idx != nil {
+		return idx
+	}
 	docs := make([]map[string]int, len(tools))
 	lens := make([]float64, len(tools))
 	df := map[string]int{}
@@ -126,18 +152,40 @@ func bm25Score(query string, tools []actool.CoreTool) ([]float64, error) {
 		}
 		docs[i], total = tf, total+lens[i]
 	}
+	n := float64(len(tools))
+	built := &bm25Index{
+		docs: docs,
+		lens: lens,
+		df:   df,
+		avg:  math.Max(total/math.Max(n, 1), 1),
+	}
+	bm25Cache.mu.Lock()
+	if len(bm25Cache.m) >= 64 {
+		clear(bm25Cache.m)
+	}
+	bm25Cache.m[key] = built
+	bm25Cache.mu.Unlock()
+	return built
+}
+
+// bm25Score is the default ToolScorer: Okapi BM25 (k1=1.2, b=0.75) over each tool's
+// name + description + parameter names, IDF computed across the candidate set.
+// The per-catalog inverted index is memoized to avoid re-tokenizing on every wake.
+func bm25Score(query string, tools []actool.CoreTool) ([]float64, error) {
+	const k1, b = 1.2, 0.75
+	idx := getOrBuildBM25Index(tools)
 	scores := make([]float64, len(tools))
 	n := float64(len(tools))
-	avg, seen := math.Max(total/math.Max(n, 1), 1), map[string]bool{}
+	seen := map[string]bool{}
 	for _, q := range tokenize(query) {
-		if seen[q] || df[q] == 0 {
+		if seen[q] || idx.df[q] == 0 {
 			continue
 		}
 		seen[q] = true
-		idf := math.Log(1 + (n-float64(df[q])+0.5)/(float64(df[q])+0.5))
-		for i, tf := range docs {
+		idf := math.Log(1 + (n-float64(idx.df[q])+0.5)/(float64(idx.df[q])+0.5))
+		for i, tf := range idx.docs {
 			if f := float64(tf[q]); f > 0 {
-				scores[i] += idf * f * (k1 + 1) / (f + k1*(1-b+b*lens[i]/avg))
+				scores[i] += idf * f * (k1 + 1) / (f + k1*(1-b+b*idx.lens[i]/idx.avg))
 			}
 		}
 	}
