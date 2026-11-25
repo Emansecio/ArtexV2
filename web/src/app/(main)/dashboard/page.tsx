@@ -551,7 +551,7 @@ export default function DashboardPage() {
             </Link>
           </Button>
           <Button asChild size="sm">
-            <Link href="/function/tasks">
+            <Link href="/function/tasks?new=1">
               <PlusIcon />
               {t("New task")}
             </Link>

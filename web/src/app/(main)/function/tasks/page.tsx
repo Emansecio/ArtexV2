@@ -3321,6 +3321,16 @@ function CreateTaskSheet({
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const sheetContentRef = React.useRef<HTMLDivElement>(null);
 
+  // Auto-open the create drawer when navigated via /function/tasks?new=1 (e.g. Cmd+K or Dashboard CTA).
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("new") !== "1") return;
+    setOpen(true);
+    url.searchParams.delete("new");
+    window.history.replaceState(null, "", url);
+  }, []);
+
   // load LLM profiles once for the create-task profile picker.
   React.useEffect(() => {
     api

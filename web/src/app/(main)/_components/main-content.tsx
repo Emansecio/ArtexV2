@@ -19,6 +19,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import { useInterceptPendingCount } from "@/lib/intercept-pending";
+import { useRunningTasksCount } from "@/lib/running-tasks";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { cn } from "@/lib/utils";
 import { sidebarItems } from "@/navigation/sidebar/sidebar-items";
@@ -67,13 +68,23 @@ function resolveBreadcrumb(pathname: string): { group?: string; page: string } |
   return best ? { group: best.group, page: best.page } : null;
 }
 
+const BASE_TITLE = "ARTEX — Autonomous Penetration Testing Console";
+
 export function MainContent({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const pendingCount = useInterceptPendingCount();
+  const runningCount = useRunningTasksCount();
   const crumb = resolveBreadcrumb(pathname);
   const [version, setVersion] = useState("");
   // Only set when the backend has the opt-in update check on (ARTEX_UPDATE_CHECK) and found a newer release.
   const [latest, setLatest] = useState("");
+
+  useEffect(() => {
+    const parts: string[] = [];
+    if (pendingCount > 0) parts.push(`⚠ ${pendingCount}`);
+    if (runningCount > 0) parts.push(`● ${runningCount}`);
+    document.title = parts.length > 0 ? `${parts.join(" · ")} · ARTEX` : BASE_TITLE;
+  }, [pendingCount, runningCount]);
 
   useEffect(() => {
     api

@@ -3,6 +3,7 @@
 import * as React from "react";
 
 import {
+  ArrowDownIcon,
   ArrowUpIcon,
   CircleXIcon,
   ClockIcon,
@@ -1326,18 +1327,28 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   const unreadFor = React.useCallback((s: Session) => store[keyForSession(s)]?.unread ?? 0, [store]);
 
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
+  const [showJumpBottom, setShowJumpBottom] = React.useState(false);
   const contentRef = React.useRef<HTMLDivElement | null>(null);
   const viewport = React.useCallback(
     () => (contentRef.current?.closest('[data-slot="scroll-area-viewport"]') as HTMLElement | null) ?? null,
     [],
   );
+  const scrollToBottom = React.useCallback(() => {
+    const vp = viewport();
+    if (!vp) return;
+    atBottomRef.current = true;
+    setShowJumpBottom(false);
+    vp.scrollTo({ top: vp.scrollHeight, behavior: "smooth" });
+  }, [viewport]);
   // biome-ignore lint/correctness/useExhaustiveDependencies: activeId intentionally rebinds the scroll listener.
   React.useEffect(() => {
     const vp = viewport();
     if (!vp) return;
     const onScroll = () => {
       if (approvalFocus.state && !focusHistory.ready) return;
-      atBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 60;
+      const atBottom = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 60;
+      atBottomRef.current = atBottom;
+      setShowJumpBottom(!atBottom && vp.scrollHeight - vp.clientHeight > 120);
       if (vp.scrollTop <= 80) loadEarlier(activeKeyRef.current, viewport); // near top → older page
     };
     vp.addEventListener("scroll", onScroll, { passive: true });
@@ -1350,6 +1361,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     if (vp && !approvalFocus.state) {
       vp.scrollTop = vp.scrollHeight;
       atBottomRef.current = true;
+      setShowJumpBottom(false);
     }
   }, [activeId, viewport, approvalFocus.state]);
   // new activity → stick to bottom only if the user is already pinned there
@@ -1576,50 +1588,64 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
             to block so wide/unbreakable steps (long commands, code, URLs) can't blow
             out the width and defeat the truncation below — the transcript wraps to
             the panel instead of overflowing horizontally. */}
-            <ScrollArea type="auto" className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!">
-              <div className="min-w-0 max-w-full p-4" ref={contentRef}>
-                {activeState?.loadingMore && (
-                  <div className="flex items-center justify-center gap-2 pb-2 text-xs text-muted-foreground">
-                    <Loader2Icon className="size-3.5 animate-spin" />
-                    {t("Loading earlier history…")}
-                  </div>
-                )}
-                {showLoader ? (
-                  <div className="flex items-center gap-2 pl-9 text-xs text-muted-foreground">
-                    <Loader2Icon className="size-3.5 animate-spin" />
-                    {t("Loading activity stream…")}
-                  </div>
-                ) : activeState?.error ? (
-                  <div className="flex items-center gap-2 pl-9 text-xs text-red-500">
-                    <CircleXIcon className="size-3.5" />
-                    {t("Failed to load: {error}", { error: activeState.error })}
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 px-2 text-xs"
-                      onClick={() => loadSession(activeKey)}
-                    >
-                      {t("Retry")}
-                    </Button>
-                  </div>
-                ) : activity.length ? (
-                  <Transcript
-                    activity={activity}
-                    live={active.live}
-                    taskId={taskId}
-                    chat={isMain}
-                    focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
-                    streamSessionKey={active.live ? activeKey : null}
-                  />
-                ) : (
-                  <div className="pl-9 text-xs text-muted-foreground">
-                    {isMain
-                      ? t("No conversation yet. Message the main agent below to steer exploration or step into the flow.")
-                      : t("No activity records.")}
-                  </div>
-                )}
-              </div>
-            </ScrollArea>
+            <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+              <ScrollArea type="auto" className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!">
+                <div className="min-w-0 max-w-full p-4" ref={contentRef}>
+                  {activeState?.loadingMore && (
+                    <div className="flex items-center justify-center gap-2 pb-2 text-xs text-muted-foreground">
+                      <Loader2Icon className="size-3.5 animate-spin" />
+                      {t("Loading earlier history…")}
+                    </div>
+                  )}
+                  {showLoader ? (
+                    <div className="flex items-center gap-2 pl-9 text-xs text-muted-foreground">
+                      <Loader2Icon className="size-3.5 animate-spin" />
+                      {t("Loading activity stream…")}
+                    </div>
+                  ) : activeState?.error ? (
+                    <div className="flex items-center gap-2 pl-9 text-xs text-red-500">
+                      <CircleXIcon className="size-3.5" />
+                      {t("Failed to load: {error}", { error: activeState.error })}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 px-2 text-xs"
+                        onClick={() => loadSession(activeKey)}
+                      >
+                        {t("Retry")}
+                      </Button>
+                    </div>
+                  ) : activity.length ? (
+                    <Transcript
+                      activity={activity}
+                      live={active.live}
+                      taskId={taskId}
+                      chat={isMain}
+                      focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
+                      streamSessionKey={active.live ? activeKey : null}
+                    />
+                  ) : (
+                    <div className="pl-9 text-xs text-muted-foreground">
+                      {isMain
+                        ? t("No conversation yet. Message the main agent below to steer exploration or step into the flow.")
+                        : t("No activity records.")}
+                    </div>
+                  )}
+                </div>
+              </ScrollArea>
+              {showJumpBottom && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  onClick={scrollToBottom}
+                  className="absolute right-4 bottom-3 z-10 h-7 gap-1 rounded-full border bg-background/95 px-2.5 text-xs shadow-md backdrop-blur hover:bg-accent"
+                >
+                  <ArrowDownIcon className="size-3.5" />
+                  {t("Jump to latest")}
+                </Button>
+              )}
+            </div>
             {isMain ? (
               <div className="border-t p-3">
                 {attachments.length > 0 && (

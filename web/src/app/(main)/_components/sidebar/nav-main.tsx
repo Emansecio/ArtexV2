@@ -37,6 +37,7 @@ import type {
   NavMainParentItem,
 } from "@/navigation/sidebar/sidebar-items";
 import { useInterceptPendingCount } from "@/lib/intercept-pending";
+import { useRunningTasksCount } from "@/lib/running-tasks";
 
 const SIDEBAR_OPEN_KEY = "artex.sidebar.open";
 
@@ -50,6 +51,7 @@ interface NavItemProps {
   readonly isOpen: boolean;
   readonly onOpenChange: (open: boolean) => void;
   readonly pendingCount: number;
+  readonly runningCount: number;
 }
 
 interface NavLinkItemProps {
@@ -57,6 +59,7 @@ interface NavLinkItemProps {
   readonly isActive: boolean;
   readonly showIconFallback: boolean;
   readonly pendingCount: number;
+  readonly runningCount: number;
 }
 
 interface NavLinkIconProps {
@@ -99,6 +102,7 @@ function matchPath(path: string, url: string): boolean {
 export function NavMain({ items }: NavMainProps) {
   const rawPath = usePathname();
   const pendingCount = useInterceptPendingCount();
+  const runningCount = useRunningTasksCount();
   // Route segments contain Chinese, so the pathname may be percent-encoded; decode it before comparing against nav urls so highlighting hits.
   const path = (() => {
     try {
@@ -201,6 +205,7 @@ export function NavMain({ items }: NavMainProps) {
                   isOpen={Boolean(openMap[item.id])}
                   onOpenChange={(open) => handleOpenChange(item.id, open)}
                   pendingCount={pendingCount}
+                  runningCount={runningCount}
                 />
               ))}
             </SidebarMenu>
@@ -211,7 +216,7 @@ export function NavMain({ items }: NavMainProps) {
   );
 }
 
-function NavItem({ item, isItemActive, activeSubUrl, isOpen, onOpenChange, pendingCount }: NavItemProps) {
+function NavItem({ item, isItemActive, activeSubUrl, isOpen, onOpenChange, pendingCount, runningCount }: NavItemProps) {
   const { state, isMobile } = useSidebar();
   const isCollapsedDesktop = state === "collapsed" && !isMobile;
 
@@ -222,6 +227,7 @@ function NavItem({ item, isItemActive, activeSubUrl, isOpen, onOpenChange, pendi
         isActive={isItemActive(item)}
         showIconFallback={isCollapsedDesktop}
         pendingCount={pendingCount}
+        runningCount={runningCount}
       />
     );
   }
@@ -265,7 +271,22 @@ function PendingPill({ count, className }: { count: number; className?: string }
   );
 }
 
-function NavLinkItem({ item, isActive, showIconFallback, pendingCount }: NavLinkItemProps) {
+function RunningPill({ count, className }: { count: number; className?: string }) {
+  if (count <= 0) return null;
+  return (
+    <span
+      className={cn(
+        "inline-flex h-4.5 min-w-[18px] items-center justify-center gap-1 rounded-full bg-blue-500/15 px-1.5 text-[10px] font-semibold leading-none text-blue-600 tabular-nums dark:text-blue-400",
+        className,
+      )}
+    >
+      <span className="size-1.5 motion-safe:animate-pulse rounded-full bg-blue-500" />
+      {count > 99 ? "99+" : count}
+    </span>
+  );
+}
+
+function NavLinkItem({ item, isActive, showIconFallback, pendingCount, runningCount }: NavLinkItemProps) {
   return (
     <SidebarMenuItem>
       <SidebarMenuButton asChild aria-disabled={item.disabled} tooltip={item.title} isActive={isActive}>
@@ -282,6 +303,10 @@ function NavLinkItem({ item, isActive, showIconFallback, pendingCount }: NavLink
       {item.id === "approvals" && pendingCount > 0 ? (
         <SidebarMenuBadge>
           <PendingPill count={pendingCount} />
+        </SidebarMenuBadge>
+      ) : item.id === "tasks" && runningCount > 0 ? (
+        <SidebarMenuBadge>
+          <RunningPill count={runningCount} />
         </SidebarMenuBadge>
       ) : (
         <NavItemBadge badge={item.badge} />

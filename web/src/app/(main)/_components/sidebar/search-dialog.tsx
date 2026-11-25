@@ -4,7 +4,7 @@ import * as React from "react";
 
 import { useRouter } from "next/navigation";
 
-import { MessageSquare, Plus, Search, ShieldAlert, Target } from "lucide-react";
+import { Brain, MessageSquare, Plus, Search, ShieldAlert, Target } from "lucide-react";
 
 import { StatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
@@ -186,9 +186,13 @@ export function SearchDialog({ showTrigger = true }: { showTrigger?: boolean }) 
           <CommandList>
             <CommandEmpty>{t("No results found.")}</CommandEmpty>
             <CommandGroup heading={t("Quick actions")}>
-              <CommandItem value={`quick ${t("New task")}`} onSelect={() => navigate("/function/tasks")}>
+              <CommandItem value={`quick ${t("New task")}`} onSelect={() => navigate("/function/tasks?new=1")}>
                 <Plus />
                 <span>{t("New task")}</span>
+              </CommandItem>
+              <CommandItem value={`quick ${t("Models & Fallbacks")}`} onSelect={() => navigate("/models")}>
+                <Brain />
+                <span>{t("Models & Fallbacks")}</span>
               </CommandItem>
               <CommandItem value={`quick ${t("Chat")}`} onSelect={() => navigate("/chat")}>
                 <MessageSquare />
