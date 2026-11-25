@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -119,7 +120,11 @@ func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.M
 		// summary instructions ride after the dynamic boundary.
 		sys := append([]string(nil), fork.System...)
 		req.System = append(sys, summarySystemPrompt)
-		req.DynamicBoundary = fork.DynamicBoundary
+		if fork.DynamicBoundary > 0 {
+			req.DynamicBoundary = fork.DynamicBoundary
+		} else if len(fork.System) > 0 {
+			req.DynamicBoundary = len(fork.System)
+		}
 		req.Tools = fork.Tools
 		req.PromptCacheKey = fork.PromptCacheKey
 	}
@@ -147,7 +152,10 @@ func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.M
 			}
 		}
 		if callErr == nil {
-			return text, nil
+			if strings.TrimSpace(text) != "" {
+				return text, nil
+			}
+			callErr = fmt.Errorf("compaction: empty summary response")
 		}
 		if IsOverflow(callErr) {
 			return "", callErr // PTL — let the caller truncate, don't burn streaming retries

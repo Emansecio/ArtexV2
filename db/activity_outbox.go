@@ -42,7 +42,7 @@ func (s *ExplorationStore) EnqueueActivity(a Activity, cause string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO activity_outbox (exploration_id, payload, last_error) VALUES ($1, $2::jsonb, $3)`, s.expID, string(raw), cause)
+	_, err = s.db.Exec(`INSERT INTO activity_outbox (exploration_id, payload, last_error) VALUES ($1, $2::jsonb, $3)`, s.expID, string(jsonbClean(raw)), utf8Clean(cause))
 	return err
 }
 
@@ -90,6 +90,20 @@ func (s *ExplorationStore) FlushActivityOutbox() (int, error) {
 		if err != nil {
 			return stored, err
 		}
+		res, err := tx.Exec(`DELETE FROM activity_outbox WHERE id=$1`, it.id)
+		if err != nil {
+			_ = tx.Rollback()
+			return stored, err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			return stored, err
+		}
+		if affected == 0 {
+			_ = tx.Rollback()
+			continue
+		}
 		if _, err := s.appendActivity(tx, a); err != nil {
 			_ = tx.Rollback()
 			next := it.attempts + 1
@@ -100,14 +114,10 @@ func (s *ExplorationStore) FlushActivityOutbox() (int, error) {
 				}
 				continue
 			}
-			if _, updErr := s.db.Exec(`UPDATE activity_outbox SET attempts=$2, last_error=$3 WHERE id=$1`, it.id, next, err.Error()); updErr != nil {
+			if _, updErr := s.db.Exec(`UPDATE activity_outbox SET attempts=$2, last_error=$3 WHERE id=$1`, it.id, next, utf8Clean(err.Error())); updErr != nil {
 				return stored, updErr
 			}
 			continue
-		}
-		if _, err := tx.Exec(`DELETE FROM activity_outbox WHERE id=$1`, it.id); err != nil {
-			_ = tx.Rollback()
-			return stored, err
 		}
 		if err := tx.Commit(); err != nil {
 			return stored, err

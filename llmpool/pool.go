@@ -146,8 +146,8 @@ func (p *Pool) Head() *Member { return p.members[0] }
 // credit, 401 bad key, 429, 5xx) all surface during request establishment,
 // before the body is read, so they always land in the safe window.
 func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
-	order, releaseProbes := p.order(req)
 	return func(yield func(llm.StreamEvent, error) bool) {
+		order, releaseProbes := p.order(req)
 		defer releaseProbes()
 		var lastErr error
 		startIdx := 0
@@ -190,6 +190,18 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 				}
 				if err != nil {
 					return // terminal error already handed to the caller
+				}
+			}
+			if failed == nil && !emitted {
+				if ctx.Err() != nil {
+					yield(llm.StreamEvent{}, ctx.Err())
+					return
+				}
+				if shouldFailover(ctx, ErrExhausted) {
+					failed = ErrExhausted
+				} else {
+					yield(llm.StreamEvent{}, ErrExhausted)
+					return
 				}
 			}
 			if failed == nil {
@@ -275,6 +287,10 @@ func (p *Pool) streamHedgedFirstTwo(
 				return true, nil
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			yield(llm.StreamEvent{}, err)
+			return true, nil
+		}
 		p.health.RecordCall(ctx, m.ID, true, false, nil)
 		return true, nil
 	}
@@ -291,6 +307,7 @@ func (p *Pool) streamHedgedFirstTwo(
 	select {
 	case <-ctx.Done():
 		timer.Stop()
+		yield(llm.StreamEvent{}, ctx.Err())
 		return true, nil
 	case res, ok := <-ch0:
 		timer.Stop()
@@ -341,6 +358,7 @@ func (p *Pool) streamHedgedFirstTwo(
 		}
 		select {
 		case <-ctx.Done():
+			yield(llm.StreamEvent{}, ctx.Err())
 			return true, nil
 		case res, ok := <-c0:
 			if !ok {
@@ -430,26 +448,30 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 func (p *Pool) order(req llm.CompletionRequest) ([]*Member, func()) {
 	est := estimateTokens(req)
 	var open []*Member
-	var probes []int64
+	type probeClaim struct {
+		id    int64
+		token uint64
+	}
+	var probes []probeClaim
 	for _, m := range p.members {
-		usable, isProbe := p.health.AcquireUsable(m.ID)
+		usable, probeToken := p.health.acquireUsableToken(m.ID)
 		if !usable {
 			continue
 		}
 		if m.WindowTokens > 0 && est > m.WindowTokens {
-			if isProbe {
-				p.health.ReleaseProbe(m.ID)
+			if probeToken != 0 {
+				p.health.releaseProbeToken(m.ID, probeToken)
 			}
 			continue // would 400 on length — not a useful failover target
 		}
-		if isProbe {
-			probes = append(probes, m.ID)
+		if probeToken != 0 {
+			probes = append(probes, probeClaim{id: m.ID, token: probeToken})
 		}
 		open = append(open, m)
 	}
 	release := func() {
-		for _, id := range probes {
-			p.health.ReleaseProbe(id)
+		for _, pr := range probes {
+			p.health.releaseProbeToken(pr.id, pr.token)
 		}
 	}
 	if len(open) == 0 {

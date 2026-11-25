@@ -69,19 +69,36 @@ function FindingDetailInner() {
   const [loaded, setLoaded] = React.useState(false);
   const [tab, setTab] = React.useState("overview");
 
+  const loadGenRef = React.useRef(0);
   const load = React.useCallback(() => {
+    const gen = ++loadGenRef.current;
     if (!id) {
+      setFinding(null);
       setLoaded(true);
       return;
     }
     api
       .getFinding(id, contextTaskId || undefined)
-      .then((f) => setFinding(f))
-      .catch(() => setFinding(null))
-      .finally(() => setLoaded(true));
+      .then((f) => {
+        if (gen !== loadGenRef.current) return;
+        setFinding(f);
+      })
+      .catch(() => {
+        if (gen !== loadGenRef.current) return;
+        setFinding(null);
+      })
+      .finally(() => {
+        if (gen !== loadGenRef.current) return;
+        setLoaded(true);
+      });
   }, [contextTaskId, id]);
   React.useEffect(() => {
+    setFinding(null);
+    setLoaded(false);
     load();
+    return () => {
+      loadGenRef.current += 1;
+    };
   }, [load]);
 
   const changeSeverity = React.useCallback(

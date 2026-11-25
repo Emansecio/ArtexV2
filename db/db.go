@@ -88,6 +88,9 @@ func poolLimits(dsn string) (maxOpen, maxIdle int, idleTime time.Duration) {
 		idleTime = 3 * time.Minute
 	}
 	maxOpen = envPositiveInt("ARTEX_PG_MAX_OPEN_CONNS", maxOpen)
+	if maxOpen < 2 {
+		maxOpen = 2
+	}
 	maxIdle = envPositiveInt("ARTEX_PG_MAX_IDLE_CONNS", maxIdle)
 	if maxIdle > maxOpen {
 		maxIdle = maxOpen
@@ -337,7 +340,8 @@ func schemaDigest() string {
 
 func builtinsDigest() string {
 	h := sha256.New()
-	h.Write([]byte("builtins-v1\n"))
+	h.Write([]byte("builtins-v2\n"))
+	fmt.Fprintf(h, "browser:%s|%s\n", browserMCPCommand, browserMCPSeedArgs)
 	for _, a := range builtinAgents {
 		fmt.Fprintf(h, "%s|%s|%s|%s|%v|%v\n", a.key, a.name, a.role, a.desc, a.interactiveShell, a.runSeconds != nil)
 		if a.runSeconds != nil {

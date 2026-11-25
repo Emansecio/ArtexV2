@@ -265,10 +265,14 @@ VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12)
 RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, quietMode, coverageEnabled, rotate, t.TargetGate).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
-	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
+	// Run insertTaskCompanies (which updates assets) before insertTaskRelations
+	// (which takes FOR KEY SHARE on source tasks via FK) to preserve the
+	// canonical assets -> tasks lock order against DeleteTaskCascadePrepared
+	// and CompleteTaskArchive.
+	if err := insertTaskCompanies(tx, t.ID, opts.CompanyIDs); err != nil {
 		return nil, err
 	}
-	if err := insertTaskCompanies(tx, t.ID, opts.CompanyIDs); err != nil {
+	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
 		return nil, err
 	}
 	if err := insertTaskLLMProfiles(tx, t.ID, opts.LLMProfileIDs); err != nil {
@@ -291,6 +295,9 @@ func insertTaskCompanies(tx *sql.Tx, taskID int64, companyIDs []int64) error {
 	}
 	// Company scope edits rebuild assets.company_id. Serialize the creation-time
 	// snapshot with those edits so the task sees one committed attribution state.
+	// Use the exclusive advisory lock because the bulk UPDATE on assets below
+	// locks rows in heap/index order rather than AssetStore's canonical row-lock
+	// order, preventing AB-BA deadlocks with concurrent asset upserts.
 	if err := lockCompanyScopeMutation(tx); err != nil {
 		return err
 	}
@@ -609,22 +616,33 @@ func (d *DB) DeleteTaskCascadePrepared(
 		return result, err
 	}
 	defer tx.Rollback()
+	// SHARE ROW EXCLUSIVE conflicts with every INSERT/UPDATE/DELETE on these
+	// tables and with another coordinated deletion. Acquire the table locks
+	// before FOR UPDATE on tasks so deletion follows the same assets -> tasks
+	// lock order as AssetStore.Upsert*, RegisterTaskAssetScopes, and
+	// AttachAssetsToTask (which write assets first and then take FOR KEY SHARE
+	// on tasks via task_asset_links/task_scope FKs). Taking both in one fixed
+	// order prevents phantoms (a distinct asset row for the same host) as well
+	// as new ownership/anchor references until the deletion transaction commits.
+	if deleteAssets || prepare != nil {
+		if _, err := tx.Exec(`LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+			return result, err
+		}
+	} else {
+		// DELETE FROM explorations below cascades through exploration_nodes to
+		// exploration_anchors, taking ROW EXCLUSIVE on exploration_anchors.
+		// Acquire it before FOR UPDATE on tasks so every path follows the
+		// canonical exploration_anchors -> tasks lock order.
+		if _, err := tx.Exec(`LOCK TABLE exploration_anchors IN ROW EXCLUSIVE MODE`); err != nil {
+			return result, err
+		}
+	}
 	var expID int64
 	if err := tx.QueryRow(`SELECT exploration_id FROM tasks WHERE id=$1 FOR UPDATE`, id).Scan(&expID); err != nil {
 		if err == sql.ErrNoRows {
 			return result, nil // already gone
 		}
 		return result, err
-	}
-
-	// SHARE ROW EXCLUSIVE conflicts with every INSERT/UPDATE/DELETE on these
-	// tables and with another coordinated deletion. Taking both in one fixed order
-	// prevents phantoms (a distinct asset row for the same host) as well as new
-	// ownership/anchor references until the deletion transaction commits.
-	if deleteAssets || prepare != nil {
-		if _, err := tx.Exec(`LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
-			return result, err
-		}
 	}
 	if prepare != nil {
 		hosts, err := hostsForTaskDeletion(tx, id, expID)
@@ -709,5 +727,9 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 	if _, err := tx.Exec(`DELETE FROM explorations WHERE id=$1`, expID); err != nil {
 		return result, err
 	}
-	return result, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return result, err
+	}
+	d.BumpGraphVersion()
+	return result, nil
 }

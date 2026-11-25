@@ -611,7 +611,11 @@ func (t *ToolSet) computeGraphOverviewData(cacheKey, fp string) map[string]any {
 				}
 			}
 			cds, cdMore = coldDigestsRecent(t.ts, coldDigestsCap, memberOf)
-			for _, n := range rawNodes {
+			// rawNodes is ordered by id ASC (from ExplorationStore.Nodes); iterate
+			// in reverse so all partitioned slices are newest-first, matching
+			// ListByKind's ORDER BY id DESC semantics.
+			for i := len(rawNodes) - 1; i >= 0; i-- {
+				n := rawNodes[i]
 				switch n.Kind {
 				case db.KindGoal:
 					if len(goals) < 100 {

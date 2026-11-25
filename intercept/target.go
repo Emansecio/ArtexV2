@@ -49,6 +49,11 @@ func NormalizeTarget(raw string) (Target, bool) {
 		if end := strings.IndexAny(raw, "/?#"); end >= 0 {
 			raw = raw[:end]
 		}
+		// Reject backslash in URL authority (WHATWG URL parsers treat '\' as a
+		// path delimiter, which would cause authority confusion with '@').
+		if strings.ContainsRune(raw, '\\') {
+			return Target{}, false
+		}
 		raw = raw[strings.LastIndexByte(raw, '@')+1:]
 	}
 	host, port := raw, ""
@@ -103,6 +108,16 @@ func normalizeHost(raw string, numeric bool) (kind, host string, ok bool) {
 		}
 		return TargetCIDR, p.Masked().String(), true
 	}
+	// Run IDNA lookup mapping (fullwidth digits, ideographic full stops, etc.)
+	// BEFORE IP parsing so obfuscated literals like "127。0。0。1" or
+	// "０ｘ７ｆ０００００１" are classified as TargetIP rather than TargetDomain.
+	// A name the profile refuses is kept as written: it then fails to resolve and
+	// the call is blocked, instead of passing as a call without a target.
+	if !strings.Contains(h, ":") {
+		if name, err := hostProfile.ToASCII(h); err == nil && name != "" {
+			h = strings.TrimSuffix(strings.ToLower(name), ".")
+		}
+	}
 	if a, err := netip.ParseAddr(h); err == nil {
 		return TargetIP, a.Unmap().WithZone("").String(), true
 	}
@@ -110,11 +125,6 @@ func normalizeHost(raw string, numeric bool) (kind, host string, ok bool) {
 		if a, ok := parseIPv4Forms(h); ok {
 			return TargetIP, a.String(), true
 		}
-	}
-	// A name the profile refuses is kept as written: it then fails to resolve and
-	// the call is blocked, instead of passing as a call without a target.
-	if name, err := hostProfile.ToASCII(h); err == nil && name != "" {
-		h = name
 	}
 	return TargetDomain, h, true
 }

@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Expr is one leaf DSL clause.
@@ -88,8 +89,12 @@ func tokenize(s string) ([]tok, error) {
 	var tokens []tok
 	i := 0
 	for i < len(s) {
-		for i < len(s) && unicode.IsSpace(rune(s[i])) {
-			i++
+		for i < len(s) {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if !unicode.IsSpace(r) {
+				break
+			}
+			i += size
 		}
 		if i >= len(s) {
 			break
@@ -336,7 +341,14 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("task_id requires an integer value: %s", e.Value)
 		}
-		return "task_ids @> ARRAY[" + b.next(n) + "]::bigint[]", nil
+		switch e.Op {
+		case "=", "==":
+			return "task_ids @> ARRAY[" + b.next(n) + "]::bigint[]", nil
+		case "!=":
+			return "NOT (task_ids @> ARRAY[" + b.next(n) + "]::bigint[])", nil
+		default:
+			return "", fmt.Errorf("field task_id does not support operator %s", e.Op)
+		}
 	}
 
 	// company_id: exact integer
@@ -345,7 +357,14 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("company_id requires an integer value: %s", e.Value)
 		}
-		return "company_id = " + b.next(n), nil
+		switch e.Op {
+		case "=", "==":
+			return "company_id = " + b.next(n), nil
+		case "!=":
+			return "(company_id IS NULL OR company_id != " + b.next(n) + ")", nil
+		default:
+			return "", fmt.Errorf("field company_id does not support operator %s", e.Op)
+		}
 	}
 
 	// numeric fields
@@ -468,8 +487,15 @@ func readToken(s string, pos int) (string, int) {
 		return val, i
 	}
 	i := pos
-	for i < len(s) && !unicode.IsSpace(rune(s[i])) && s[i] != '(' && s[i] != ')' {
-		i++
+	for i < len(s) {
+		if s[i] == '(' || s[i] == ')' {
+			break
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if unicode.IsSpace(r) {
+			break
+		}
+		i += size
 	}
 	return s[pos:i], i
 }

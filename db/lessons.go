@@ -126,14 +126,37 @@ func (d *DB) ExtractLessonsForTask(ctx context.Context, taskID int64) (int, erro
 	}
 	defer rows.Close()
 
-	touched := map[int64]bool{}
+	type findingRow struct {
+		findingID int64
+		vulnclass string
+		name      string
+		summary   string
+		severity  string
+		status    string
+		retestID  int64
+		verdict   string
+	}
+	var findings []findingRow
 	for rows.Next() {
-		var findingID int64
-		var vulnclass, name, summary, severity, status, verdict string
-		var retestID int64
-		if err := rows.Scan(&findingID, &vulnclass, &name, &summary, &severity, &status, &retestID, &verdict); err != nil {
+		var f findingRow
+		if err := rows.Scan(&f.findingID, &f.vulnclass, &f.name, &f.summary, &f.severity, &f.status, &f.retestID, &f.verdict); err != nil {
+			rows.Close()
 			return 0, err
 		}
+		findings = append(findings, f)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	// Release the cursor's pool connection before issuing write queries so
+	// nested pool checkouts cannot deadlock under saturation.
+	rows.Close()
+
+	touched := map[int64]bool{}
+	for _, f := range findings {
+		findingID, vulnclass, name, summary, severity, status, retestID, verdict :=
+			f.findingID, f.vulnclass, f.name, f.summary, f.severity, f.status, f.retestID, f.verdict
 		cue := lessonText(vulnclass, lessonCueMax)
 		if cue == "" {
 			cue = lessonText(name, lessonCueMax)

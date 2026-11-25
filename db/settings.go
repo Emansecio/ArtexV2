@@ -20,13 +20,14 @@ type settingEntry struct {
 // SetSetting/InsertSettingIfAbsent/RotatePassword/InsertPassword invalidate.
 func (d *DB) GetSetting(key string) (value string, ok bool, err error) {
 	cacheKey := "set:" + key
-	if v, hit := d.cfgRef().get(cacheKey); hit {
+	v, hit, gen := d.cfgRef().get(cacheKey)
+	if hit {
 		e := v.(settingEntry)
 		return e.value, e.ok, nil
 	}
 	err = d.QueryRow(`SELECT value FROM settings WHERE key=$1`, key).Scan(&value)
 	if err == sql.ErrNoRows {
-		d.cfgRef().put(cacheKey, settingEntry{})
+		d.cfgRef().putIfGen(cacheKey, settingEntry{}, gen)
 		return "", false, nil
 	}
 	if err != nil {
@@ -37,7 +38,7 @@ func (d *DB) GetSetting(key string) (value string, ok bool, err error) {
 			return "", false, err
 		}
 	}
-	d.cfgRef().put(cacheKey, settingEntry{value: value, ok: true})
+	d.cfgRef().putIfGen(cacheKey, settingEntry{value: value, ok: true}, gen)
 	return value, true, nil
 }
 

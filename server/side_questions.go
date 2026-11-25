@@ -32,6 +32,7 @@ type sideRun struct {
 type sideQuestionState struct {
 	mu           sync.Mutex
 	commands     sync.Mutex // short admission / clear operations only, never inference
+	flushMu      sync.Mutex // serializes snapshot flushes without blocking commands
 	pending      map[string]sidequestion.Snapshot
 	latest       map[string]sidequestion.Snapshot
 	seen         map[string][2]int64
@@ -89,10 +90,30 @@ func (s *Server) initSideQuestions() {
 	})
 	go func() {
 		defer close(s.side.done)
+		const (
+			normalFlushDelay = 250 * time.Millisecond
+			initialRetry     = time.Second
+			maxRetry         = 30 * time.Second
+		)
 		var (
 			flushTimer *time.Timer
 			flushC     <-chan time.Time
+			retryDelay time.Duration
 		)
+		armTimer := func(d time.Duration) {
+			if flushTimer == nil {
+				flushTimer = time.NewTimer(d)
+			} else {
+				if !flushTimer.Stop() {
+					select {
+					case <-flushTimer.C:
+					default:
+					}
+				}
+				flushTimer.Reset(d)
+			}
+			flushC = flushTimer.C
+		}
 		defer func() {
 			if flushTimer != nil {
 				flushTimer.Stop()
@@ -102,16 +123,23 @@ func (s *Server) initSideQuestions() {
 			select {
 			case <-s.side.wake:
 				if flushC == nil {
-					if flushTimer == nil {
-						flushTimer = time.NewTimer(250 * time.Millisecond)
-					} else {
-						flushTimer.Reset(250 * time.Millisecond)
-					}
-					flushC = flushTimer.C
+					armTimer(normalFlushDelay)
 				}
 			case <-flushC:
 				flushC = nil
-				s.flushSideSnapshots()
+				if s.flushSideSnapshots() {
+					if retryDelay == 0 {
+						retryDelay = initialRetry
+					} else if retryDelay < maxRetry {
+						retryDelay *= 2
+						if retryDelay > maxRetry {
+							retryDelay = maxRetry
+						}
+					}
+					armTimer(retryDelay)
+				} else {
+					retryDelay = 0
+				}
 			case <-s.ctx.Done():
 				s.flushSideSnapshots()
 				return
@@ -120,13 +148,16 @@ func (s *Server) initSideQuestions() {
 	}()
 }
 
-func (s *Server) flushSideSnapshots() {
+func (s *Server) flushSideSnapshots() bool {
 	if s.side == nil || s.m.pg == nil {
-		return
+		return false
 	}
-	// Only the pending-map swap needs mutual exclusion; the snapshot writes
-	// below (up to a 3s timeout each) must not hold the global commands lock —
-	// that serialized every POST/DELETE behind the whole flush batch.
+	// Serialize flushes on flushMu (separate from commands so POST/DELETE
+	// handlers remain unblocked) so drainTaskSideQuestions waits for any
+	// in-flight background flush to finish and re-queue failed writes before
+	// inspecting s.side.pending.
+	s.side.flushMu.Lock()
+	defer s.side.flushMu.Unlock()
 	s.side.mu.Lock()
 	pending := s.side.pending
 	s.side.pending = map[string]sidequestion.Snapshot{}
@@ -148,6 +179,10 @@ func (s *Server) flushSideSnapshots() {
 			log.Printf("[btw] checkpoint persistence: %v", err)
 		}
 	}
+	s.side.mu.Lock()
+	remaining := len(s.side.pending) > 0
+	s.side.mu.Unlock()
+	return remaining
 }
 
 func (s *Server) sideSnapshot(ctx context.Context, p sidequestion.Parent) (*sidequestion.Snapshot, error) {
@@ -439,6 +474,30 @@ func (s *Server) handleSideQuestions(w http.ResponseWriter, r *http.Request, p s
 		return
 	}
 	s.side.commands.Lock()
+	if p.TaskID > 0 && s.engine.IsDeleting(strconv.FormatInt(p.TaskID, 10)) {
+		s.side.commands.Unlock()
+		writeErr(w, 409, "task is being archived or deleted")
+		return
+	}
+	s.side.mu.Lock()
+	full = len(s.side.runs) >= 4
+	busy = false
+	for _, run := range s.side.runs {
+		if run.key == key {
+			busy = true
+		}
+	}
+	s.side.mu.Unlock()
+	if busy {
+		s.side.commands.Unlock()
+		writeErr(w, 409, db.ErrSideBusy.Error())
+		return
+	}
+	if full {
+		s.side.commands.Unlock()
+		writeErr(w, 429, "side-question requests hit the concurrency limit, please retry later")
+		return
+	}
 	e, created, err := s.m.pg.StartSideRequest(r.Context(), *snap, in.ClientID, in.Question)
 	if err != nil {
 		s.side.commands.Unlock()
@@ -627,6 +686,13 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 }
 
 func (s *Server) cancelSideRequest(w http.ResponseWriter, r *http.Request) {
+	if s.pg(w) == nil {
+		return
+	}
+	if s.side == nil {
+		writeErr(w, 503, errDataSourceUnavailable)
+		return
+	}
 	e, err := s.m.pg.SideRequest(r.Context(), r.PathValue("requestID"))
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -645,6 +711,13 @@ func (s *Server) cancelSideRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sideEvents(w http.ResponseWriter, r *http.Request) {
+	if s.pg(w) == nil {
+		return
+	}
+	if s.side == nil {
+		writeErr(w, 503, errDataSourceUnavailable)
+		return
+	}
 	tok := extractToken(r)
 	if !s.sessionOK(tok) {
 		writeErr(w, 401, "token is invalid or expired")

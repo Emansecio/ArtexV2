@@ -78,11 +78,11 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "task not found")
 			return
 		}
-		if !s.engine.beginTaskOperation(id) {
+		if !s.engine.beginTaskOperation(t.ID) {
 			writeErr(w, http.StatusConflict, "Task is being deleted; cannot upload attachments")
 			return
 		}
-		defer s.engine.decInflight(id)
+		defer s.engine.decInflight(t.ID)
 		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 		base = agent.EnsureRunDir(s.m.dir, taskID, 0)
 	} else if sub == "sessions" {

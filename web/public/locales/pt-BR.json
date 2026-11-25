@@ -1560,6 +1560,7 @@
   "Password / auth code": "Senha / código de autenticação",
   "Password changed": "Senha alterada",
   "Password must be at least 12 characters": "A senha deve ter pelo menos 12 caracteres",
+  "Password sign-in": "Login com senha",
   "Past call arguments": "Argumentos de chamadas anteriores",
   "Past calls provided to the model at the time (legacy)": "Chamadas anteriores fornecidas ao modelo naquele momento (legado)",
   "Past execution result": "Resultado de execução anterior",

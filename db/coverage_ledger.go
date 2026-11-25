@@ -183,7 +183,11 @@ ON CONFLICT (task_id, surface, risk_area) DO UPDATE SET outcome=EXCLUDED.outcome
   reason=EXCLUDED.reason, worker=EXCLUDED.worker, intent_id=EXCLUDED.intent_id, updated_at=now()`, args...); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.db.BumpGraphVersion()
+	return nil
 }
 
 func nullID(id int64) any {

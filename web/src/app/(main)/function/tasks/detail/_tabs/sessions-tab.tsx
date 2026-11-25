@@ -492,6 +492,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   // latest/older interleaving). Writes are ALWAYS keyed, so a late response can only
   // touch its own session cache — never the currently-viewed one (see §7.5).
   const reqTokenRef = React.useRef<Record<string, number>>({});
+  const taskGenRef = React.useRef(0);
   // Keys with a latest-page load in flight — dedups the double trigger where the
   // first-load effect and the active-session effect both want "main" on mount (the
   // former also opens the SSE, so it must not be pre-empted).
@@ -589,6 +590,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     (key: string, viewport: () => HTMLElement | null) => {
       const st = store[key];
       if (!st || st.loadingMore || !st.hasMore || !st.earliestSeq) return;
+      const gen = taskGenRef.current;
       const vp = viewport();
       const prevH = vp?.scrollHeight ?? 0;
       const prevTop = vp?.scrollTop ?? 0;
@@ -596,6 +598,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       api
         .activityHistory(taskId, key, st.earliestSeq, PAGE)
         .then((r) => {
+          if (taskGenRef.current !== gen) return;
           patchStore(key, (s) => {
             const items = mergeBySeq(r.items, s.items);
             return {
@@ -607,11 +610,13 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
             };
           });
           requestAnimationFrame(() => {
+            if (taskGenRef.current !== gen) return;
             const v = viewport();
             if (v) v.scrollTop = prevTop + (v.scrollHeight - prevH);
           });
         })
         .catch(() => {
+          if (taskGenRef.current !== gen) return;
           patchStore(key, (s) => ({ ...s, loadingMore: false }));
         });
     },
@@ -739,6 +744,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     snapshotRef.current = 0;
     llmToastSeqRef.current = new Set();
     reqTokenRef.current = {};
+    taskGenRef.current += 1;
     // Reserve the initial main key so the active-session effect (which fires for main on
     // mount) won't double-load it and pre-empt the SSE opened here.
     loadingKeysRef.current = new Set([mainSessionKey(0)]);
@@ -848,6 +854,8 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
               for (const [k, incoming] of grouped) {
                 const cur = next[k] ?? emptyState();
                 const last = incoming[incoming.length - 1];
+                const prevMaxSeq = cur.items.length ? cur.items[cur.items.length - 1].seq : 0;
+                const newCount = incoming.reduce((acc, x) => acc + (x.seq > prevMaxSeq ? 1 : 0), 0);
                 if (!cur.loaded && !cur.loading && k !== activeK) {
                   const relevant = incoming.filter((x) => x.kind === "usage" || x.kind === "result");
                   const accountingItems = relevant.length ? mergeBySeq(cur.items, relevant).slice(-4) : cur.items;
@@ -855,7 +863,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                     ...cur,
                     items: accountingItems,
                     lastTs: last.ts,
-                    unread: cur.unread + incoming.length,
+                    unread: cur.unread + newCount,
                   };
                   continue;
                 }
@@ -868,7 +876,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                   hasMore = true;
                   earliestSeq = items[0].seq;
                 }
-                const unread = k === activeK ? 0 : cur.unread + incoming.length;
+                const unread = k === activeK ? 0 : cur.unread + newCount;
                 next[k] = { ...cur, items, lastTs: last.ts, unread, hasMore, earliestSeq };
               }
               return next;
@@ -891,16 +899,49 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
           }
         };
 
+        const catchUpFromZero = async () => {
+          if (snapshotRef.current > 0) return;
+          try {
+            const res = await api.activity(taskId, { since: snapshotRef.current });
+            if (!alive) return;
+            if (res.cursor > snapshotRef.current) {
+              snapshotRef.current = res.cursor;
+            }
+            if (res.items.length > 0) {
+              for (const a of res.items) {
+                if (a.seq > snapshotRef.current) snapshotRef.current = a.seq;
+                pendingActs.push(a);
+              }
+              scheduleFlush();
+            }
+          } catch {
+            /* transient */
+          }
+        };
+
         wsUnsubRef.current?.();
         wsUnsubRef.current = subscribeWS(`task:${taskId}`, {
           since: snapshotRef.current,
+          getSince: () => snapshotRef.current,
           onState: (open) => {
-            if (alive) setSseLive(open);
+            if (!alive) return;
+            setSseLive(open);
+            if (open && snapshotRef.current === 0) {
+              void catchUpFromZero();
+            }
           },
           onEvent: (event, data) => {
-            if (!alive || !data || typeof data !== "object") return;
+            if (!alive) return;
+            if (event === "resync") {
+              if (snapshotRef.current === 0) {
+                void catchUpFromZero();
+              }
+              return;
+            }
+            if (!data || typeof data !== "object") return;
             if (event === "activity") {
               const a = data as Activity;
+              if (a.seq > snapshotRef.current) snapshotRef.current = a.seq;
               if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
                 llmToastSeqRef.current.add(a.seq);
                 const transition = a.metadata?.llm_transition;
@@ -919,6 +960,12 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                   .catch(() => {
                     // Periodic resolver poll retries automatically.
                   });
+              }
+              if (a.kind === "text" || a.kind === "thinking" || a.kind === "tool_use" || a.kind === "result") {
+                const k = sessionKeyOf(a);
+                for (let i = pendingDeltas.length - 1; i >= 0; i--) {
+                  if (pendingDeltas[i].key === k) pendingDeltas.splice(i, 1);
+                }
               }
               pendingActs.push(a);
               scheduleFlush();
@@ -977,13 +1024,17 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   }, [taskId]);
 
   // ── worker (intent) session list — paged, poll first page lightly ───────────────
+  const intentsTaskGenRef = React.useRef(0);
   React.useEffect(() => {
     let active = true;
+    intentsTaskGenRef.current += 1;
     firstIntentsRef.current = [];
     setIntents([]);
     setOlderIntents([]);
     setFirstIntentsHasMore(false);
     setOlderIntentsHasMore(false);
+    setHasLoadedOlderIntentsPage(false);
+    setLoadingOlderIntents(false);
     const load = () =>
       api
         .intentsPage(taskId, 0, 300)
@@ -1021,10 +1072,12 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     const all = [...intents, ...olderIntents];
     const minId = all.reduce((m, n) => Math.min(m, Number(n.id)), Infinity);
     if (!Number.isFinite(minId)) return;
+    const gen = intentsTaskGenRef.current;
     setLoadingOlderIntents(true);
     api
       .intentsPage(taskId, minId, 300)
       .then((r) => {
+        if (intentsTaskGenRef.current !== gen) return;
         setOlderIntents((prev) => {
           const seen = new Set([...intents, ...prev].map((n) => n.id));
           return [...prev, ...r.items.filter((n) => !seen.has(n.id))];
@@ -1035,7 +1088,9 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       .catch(() => {
         // A later manual retry can fetch this page again.
       })
-      .finally(() => setLoadingOlderIntents(false));
+      .finally(() => {
+        if (intentsTaskGenRef.current === gen) setLoadingOlderIntents(false);
+      });
   }, [taskId, intents, olderIntents, loadingOlderIntents]);
 
   // Combined, de-duplicated worker list (newest first page + older loaded pages).

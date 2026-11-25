@@ -145,6 +145,11 @@ func TestUploadSkillZstdAndChineseNames(t *testing.T) {
 	if out["name"] != "chinese-skill" {
 		t.Fatalf("name = %v, want chinese-skill", out["name"])
 	}
+	if info, err := os.Stat(filepath.Join(dir, "chinese-skill")); err != nil {
+		t.Fatalf("stat skill dir: %v", err)
+	} else if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("skill dir perm = %04o, want 0755", perm)
+	}
 	for _, rel := range []string{"SKILL.md", "references/notes doc.md", "scripts/run.py"} {
 		if _, err := os.Stat(filepath.Join(dir, "chinese-skill", rel)); err != nil {
 			t.Errorf("missing extracted file %q: %v", rel, err)

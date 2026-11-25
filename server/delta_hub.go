@@ -22,24 +22,30 @@ type DeltaFrame struct {
 // ephemeral events ("task:<id>", "conv:<id>", "side:<id>", "logs").
 type DeltaHub struct {
 	mu   sync.RWMutex
-	subs map[string]map[chan DeltaMsg]struct{}
+	subs map[string]map[chan DeltaMsg]chan struct{}
 }
 
 func NewDeltaHub() *DeltaHub {
-	return &DeltaHub{subs: map[string]map[chan DeltaMsg]struct{}{}}
+	return &DeltaHub{subs: map[string]map[chan DeltaMsg]chan struct{}{}}
 }
 
 func (h *DeltaHub) Subscribe(channel string) (<-chan DeltaMsg, func()) {
+	ch, _, unsub := h.SubscribeResync(channel)
+	return ch, unsub
+}
+
+func (h *DeltaHub) SubscribeResync(channel string) (<-chan DeltaMsg, <-chan struct{}, func()) {
 	ch := make(chan DeltaMsg, 256)
+	ov := make(chan struct{}, 1)
 	h.mu.Lock()
 	if h.subs[channel] == nil {
-		h.subs[channel] = map[chan DeltaMsg]struct{}{}
+		h.subs[channel] = map[chan DeltaMsg]chan struct{}{}
 	}
-	h.subs[channel][ch] = struct{}{}
+	h.subs[channel][ch] = ov
 	h.mu.Unlock()
 
 	var once sync.Once
-	return ch, func() {
+	return ch, ov, func() {
 		once.Do(func() {
 			h.mu.Lock()
 			if m := h.subs[channel]; m != nil {
@@ -64,10 +70,14 @@ func (h *DeltaHub) Publish(channel string, msg DeltaMsg) {
 		h.mu.RUnlock()
 		return
 	}
-	for ch := range targets {
+	for ch, ov := range targets {
 		select {
 		case ch <- msg:
 		default:
+			select {
+			case ov <- struct{}{}:
+			default:
+			}
 		}
 	}
 	h.mu.RUnlock()

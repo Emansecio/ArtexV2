@@ -281,7 +281,7 @@ export default function AgentsPage() {
                   {editing.description || t("Prompt, config, visible resources and tool bindings")}
                 </SheetDescription>
               </SheetHeader>
-              <AgentEditor agentKey={editing.key} onSaved={reload} />
+              <AgentEditor key={editing.key} agentKey={editing.key} onSaved={reload} />
             </>
           )}
         </SheetContent>

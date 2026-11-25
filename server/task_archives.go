@@ -178,6 +178,11 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 	if err := s.drainTaskSideQuestions(drainCtx, taskID); err != nil {
 		return err
 	}
+	// Commit queued usage-activity and usage-ledger writes before snapshotting
+	// and deleting the task so archive snapshots are complete and async writers
+	// cannot hit FK violations after the live task is removed.
+	s.engine.FlushUsageActivities()
+	flushUsageLedger(s.m.pg)
 	task, err := s.m.pg.GetTask(job.TaskID)
 	if err != nil {
 		return err

@@ -169,6 +169,9 @@ RETURNING id`, name, nkey, logoVal).Scan(&id); err != nil {
 	if err := tx.Commit(); err != nil {
 		return 0, 0, 0, invalid, validationErrors, err
 	}
+	if needsAttribution {
+		s.db.BumpGraphVersion()
+	}
 	return id, added, skipped, invalid, validationErrors, nil
 }
 
@@ -255,6 +258,7 @@ func (s *CompanyStore) DeleteCompanyWithAssets(id int64, deleteAssets bool) (ass
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	s.db.BumpGraphVersion()
 	return assetsDeleted, nil
 }
 
@@ -381,6 +385,9 @@ func (s *CompanyStore) AddScopeInputsChecked(companyID int64, inputs []ScopeInpu
 	if err := tx.Commit(); err != nil {
 		return 0, 0, invalid, errors, err
 	}
+	if needsAttribution {
+		s.db.BumpGraphVersion()
+	}
 	return added, skipped, invalid, errors, nil
 }
 
@@ -427,6 +434,14 @@ func ensureCompanyExistsTx(tx *sql.Tx, companyID int64) error {
 
 func lockCompanyScopeMutation(tx *sql.Tx) error {
 	_, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, companyScopeMutationLock)
+	return err
+}
+
+// lockCompanyScopeRead acquires a shared advisory lock so concurrent asset
+// upserts run in parallel while still serializing against company_scope
+// mutations (AddCompanyScope/DeleteCompanyScope/RecomputeCompanyAttribution).
+func lockCompanyScopeRead(tx *sql.Tx) error {
+	_, err := tx.Exec(`SELECT pg_advisory_xact_lock_shared($1)`, companyScopeMutationLock)
 	return err
 }
 
@@ -498,7 +513,11 @@ func (s *CompanyStore) RecomputeAttribution() error {
 		return err
 	}
 	logAttributionWarning(warning)
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.db.BumpGraphVersion()
+	return nil
 }
 
 // recomputeAttributionTx rebuilds scope-derived ownership. It returns a warning
@@ -712,6 +731,7 @@ func (s *CompanyStore) UpdateScopeInputsChecked(companyID int64, inputs []ScopeI
 	if err := tx.Commit(); err != nil {
 		return 0, invalid, errs, err
 	}
+	s.db.BumpGraphVersion()
 	return added, invalid, errs, nil
 }
 

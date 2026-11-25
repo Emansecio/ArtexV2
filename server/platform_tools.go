@@ -3,16 +3,21 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -149,7 +154,62 @@ func (s *Server) toolCreateSkill() actool.CoreTool {
 		})
 }
 
-const maxInstallSkillBytes = 256 * 1024
+const (
+	maxInstallSkillBytes     = 256 * 1024
+	maxInstallSkillRedirects = 10
+)
+
+func isBlockedSkillFetchAddr(addr netip.Addr, allowLoopback bool) bool {
+	if !addr.IsValid() {
+		return true
+	}
+	addr = addr.Unmap().WithZone("")
+	if allowLoopback && addr.IsLoopback() {
+		return false
+	}
+	return intercept.IsNonPublicAddr(addr)
+}
+
+func validateSkillFetchURL(u *url.URL, allowLoopback bool) error {
+	if u == nil {
+		return errors.New("url must be a valid http:// or https:// URL")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if (scheme != "http" && scheme != "https") || u.Host == "" || u.Opaque != "" {
+		return errors.New("url must be a valid http:// or https:// URL")
+	}
+	if _, ok := urlEffectivePort(u); !ok {
+		return errors.New("url has an invalid port")
+	}
+	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(u.Hostname())), ".")
+	if host == "" {
+		return errors.New("url host is empty")
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if isBlockedSkillFetchAddr(addr, allowLoopback) {
+			return errors.New("target address is not allowed")
+		}
+		return nil
+	}
+	if !allowLoopback && (host == "localhost" || strings.HasSuffix(host, ".localhost")) {
+		return errors.New("target address is not allowed")
+	}
+	return nil
+}
+
+func skillFetchDialControl(allowLoopback bool) func(string, string, syscall.RawConn) error {
+	return func(_, address string, _ syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return errors.New("target address is not allowed")
+		}
+		addr, err := netip.ParseAddr(host)
+		if err != nil || isBlockedSkillFetchAddr(addr, allowLoopback) {
+			return errors.New("target address is not allowed")
+		}
+		return nil
+	}
+}
 
 func (s *Server) toolInstallSkill() actool.CoreTool {
 	return wrTool("install_skill",
@@ -177,7 +237,39 @@ func (s *Server) toolInstallSkill() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf("invalid request URL: " + err.Error()), nil
 			}
-			resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+			base, ok := http.DefaultTransport.(*http.Transport)
+			if !ok {
+				base = &http.Transport{}
+			}
+			tr := base.Clone()
+			tr.Proxy = nil
+			tr.DisableKeepAlives = true
+			defer tr.CloseIdleConnections()
+
+			client := &http.Client{
+				Timeout:   15 * time.Second,
+				Transport: tr,
+			}
+			if intercept.GateOn(ctx) {
+				tr.DialContext = intercept.PinnedDialer("install_skill", true)
+				client.CheckRedirect = intercept.RedirectCheck("install_skill")
+			} else {
+				allowLoopback := s != nil && s.allowLoopbackSkillFetch
+				if err := validateSkillFetchURL(u, allowLoopback); err != nil {
+					return actool.Errorf("fetch skill blocked: " + err.Error()), nil
+				}
+				tr.DialContext = (&net.Dialer{
+					Timeout: 10 * time.Second,
+					Control: skillFetchDialControl(allowLoopback),
+				}).DialContext
+				client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+					if len(via) >= maxInstallSkillRedirects {
+						return errors.New("stopped after 10 redirects")
+					}
+					return validateSkillFetchURL(req.URL, allowLoopback)
+				}
+			}
+			resp, err := client.Do(req)
 			if err != nil {
 				return actool.Errorf("fetch skill failed: " + err.Error()), nil
 			}

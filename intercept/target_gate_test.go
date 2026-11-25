@@ -767,6 +767,9 @@ func TestStoredExemptionVoidOnPrivateOrLoopback(t *testing.T) {
 		"mapped loopback":        {"::ffff:127.0.0.1"},
 		"metadata outside":       {"100.100.100.200"},
 		"metadata v6":            {"fd00:ec2::254"},
+		"cgnat shared space":     {"100.64.0.1"},
+		"this network 0/8":       {"0.0.0.1"},
+		"nat64 metadata":         {"64:ff9b::169.254.169.254"},
 		"one public one private": {"151.101.0.223", "10.0.0.5"},
 		"one public one v6 ULA":  {"151.101.0.223", "2a04:4e42::223", "fd12:3456::1"},
 	}
@@ -788,7 +791,6 @@ func TestStoredExemptionVoidOnPrivateOrLoopback(t *testing.T) {
 	for name, ips := range map[string][]string{
 		"public":            {"151.101.0.223"},
 		"public, dual":      {"151.101.0.223", "2a04:4e42::223"},
-		"shared space":      {"100.64.0.1"},
 		"documentation net": {"203.0.113.7"},
 	} {
 		g := newGate(t)

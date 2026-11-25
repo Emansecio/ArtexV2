@@ -69,6 +69,35 @@ func workspacePathDenied(realRoot, realPath string) bool {
 	return false
 }
 
+// workspacePathContainsDenied reports whether realPath is an ancestor of any
+// platform-internal subtree in workspaceDeniedPrefixes (for example "traffic",
+// which contains "traffic/_ca" and "traffic/_index"). Deleting such a directory
+// would recursively wipe protected internal state.
+func workspacePathContainsDenied(realRoot, realPath string) bool {
+	rel, err := filepath.Rel(realRoot, realPath)
+	if err != nil {
+		return true
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == "." || rel == "" {
+		return true
+	}
+	if rel == ".." || strings.HasPrefix(rel, "../") || strings.HasPrefix(rel, "/") {
+		return true
+	}
+	segs := strings.Split(rel, "/")
+	for i, seg := range segs {
+		segs[i] = strings.ToLower(strings.TrimRight(seg, ". "))
+	}
+	rel = strings.Join(segs, "/")
+	for _, prefix := range workspaceDeniedPrefixes {
+		if strings.HasPrefix(prefix, rel+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // wsRel renders an absolute path back as a workspace-relative path (forward slashes).
 func (s *Server) wsRel(abs string) string {
 	base, err := resolveRealRoot(s.m.dir)
@@ -235,6 +264,10 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "cannot delete the workspace root directory")
 		return
 	}
+	if workspacePathContainsDenied(cp.realRoot, cp.realPath) {
+		writeErr(w, 400, "cannot delete directory containing protected internal paths")
+		return
+	}
 	if !cp.exists {
 		writeErr(w, 404, "path does not exist")
 		return
@@ -281,6 +314,7 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "failed to parse upload or size limit exceeded: "+err.Error())
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 	files := r.MultipartForm.File["file"]
 	if len(files) == 0 {
 		writeErr(w, 400, "missing upload file (form field file)")

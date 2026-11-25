@@ -21,11 +21,15 @@ func (s *Server) ensureOAuth() *oauth.Manager {
 }
 
 // attachOAuth binds the server's OAuth manager to cfg when cfg uses an OAuth format.
-// Returns ok=false if the format requires OAuth and the account is not signed in.
+// Returns ok=false if the format requires OAuth and the account is not signed in,
+// or if a non-canonical custom base_url is configured.
 func (s *Server) attachOAuth(cfg *agent.Config) bool {
 	prov := cfg.OAuthProvider()
 	if prov == "" {
 		return true
+	}
+	if strings.TrimSpace(cfg.BaseURL) != "" && !sameLLMEndpoint(cfg.Provider(), cfg.BaseURL, cfg.Provider(), "") {
+		return false
 	}
 	mgr := s.ensureOAuth()
 	if !mgr.IsConnected(prov) {

@@ -227,9 +227,13 @@ func (t *Traffic) StartTransparentTCP(cfg TransparentTCPConfig) (string, error) 
 
 	t.transparentMu.Lock()
 	if t.transparent != nil {
+		existingAddr := ""
+		if t.transparent.ln != nil {
+			existingAddr = t.transparent.ln.Addr().String()
+		}
 		t.transparentMu.Unlock()
 		_ = ln.Close()
-		return "", fmt.Errorf("transparent TCP listener already running on %s", t.transparent.ln.Addr().String())
+		return "", fmt.Errorf("transparent TCP listener already running on %s", existingAddr)
 	}
 	t.transparent = srv
 	t.transparentMu.Unlock()

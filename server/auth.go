@@ -616,15 +616,47 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request, getSetting func(s
 }
 
 // POST /api/auth/local — passwordless session issuance for local loopback use.
-// Restricted to 127.0.0.1 / ::1 so remote callers cannot bypass authentication.
+// Restricted to same-origin direct loopback requests (no reverse-proxy headers)
+// so untrusted websites or remote callers behind a proxy cannot mint an admin JWT.
 func (s *Server) authLocal(w http.ResponseWriter, r *http.Request) {
-	ip := strings.TrimSpace(clientIP(r, nil))
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		writeErr(w, 403, "Cross-site local sign-in is forbidden")
+		return
+	}
+	if orig := strings.TrimSpace(r.Header.Get("Origin")); orig != "" && !isOriginAllowed(orig, r.Host) {
+		writeErr(w, 403, "Origin not allowed for local sign-in")
+		return
+	}
+	if strings.TrimSpace(r.Header.Get("X-Forwarded-For")) != "" || strings.TrimSpace(r.Header.Get("Forwarded")) != "" {
+		writeErr(w, 403, "Proxied local sign-in is forbidden")
+		return
+	}
+	ip := strings.TrimSpace(clientIP(r, s.trustedProxies))
 	if ip != "127.0.0.1" && ip != "::1" && ip != "localhost" {
 		writeErr(w, 403, "Local passwordless sign-in is only allowed from localhost")
 		return
 	}
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
 	if s.pwdState.Load() == pwdUnreadable {
 		s.loadPasswordVersion()
+	}
+	if s.pwdState.Load() == pwdUnreadable {
+		writeErr(w, 503, errDataSourceUnavailable)
+		return
+	}
+	if strings.TrimSpace(os.Getenv("ARTEX_ALLOW_LOCAL_BYPASS")) != "1" {
+		hash, ok, err := pg.GetSetting(s.passwordHashKey())
+		if err != nil {
+			writeErr(w, 503, errDataSourceUnavailable)
+			return
+		}
+		if ok && strings.TrimSpace(hash) != "" {
+			writeErr(w, 403, "Password is set; sign in with your password or set ARTEX_ALLOW_LOCAL_BYPASS=1")
+			return
+		}
 	}
 	ver := s.pwdVersion.Load()
 	tok, err := signJWTVersion(s.jwtKey, ver)

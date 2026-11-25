@@ -38,7 +38,11 @@ func (d *DB) WithEvidenceTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	if err = fn(tx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	d.BumpGraphVersion()
+	return nil
 }
 
 type TrafficRef struct {
@@ -392,6 +396,24 @@ type RecordedFinding struct {
 // transaction should likewise be subject to the caller's cancellation and
 // timeout constraints.
 func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
+	in.VulnClass = utf8Clean(in.VulnClass)
+	in.Name = utf8Clean(in.Name)
+	in.Severity = utf8Clean(in.Severity)
+	in.Summary = utf8Clean(in.Summary)
+	in.Evidence = utf8Clean(in.Evidence)
+	in.Worker = utf8Clean(in.Worker)
+	in.Counterevidence = utf8Clean(in.Counterevidence)
+	in.ConfidenceRationale = utf8Clean(in.ConfidenceRationale)
+
+	// Acquire ROW EXCLUSIVE on exploration_anchors before locking tasks so
+	// concurrent DeleteTaskCascadePrepared / CompleteTaskArchive (which lock
+	// assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE then tasks
+	// FOR UPDATE) cannot deadlock in AB-BA order.
+	if len(in.AssetIDs) > 0 {
+		if _, err := tx.Exec(`LOCK TABLE exploration_anchors IN ROW EXCLUSIVE MODE`); err != nil {
+			return nil, err
+		}
+	}
 	if err := LockTaskEvidenceTx(tx, in.TaskID); err != nil {
 		return nil, err
 	}
@@ -416,7 +438,7 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
 	out := &RecordedFinding{}
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
-VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(payload), in.Worker).Scan(&out.NodeID); err != nil {
+VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(jsonbClean(payload)), in.Worker).Scan(&out.NodeID); err != nil {
 		return nil, err
 	}
 	for _, asset := range in.AssetIDs {

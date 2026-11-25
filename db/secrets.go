@@ -60,10 +60,13 @@ func (c secretColumn) rowFilter() string {
 	return ""
 }
 
-// idCol names the row key: settings and tools rows are keyed by name, the rest by id.
+// idCol names the row key: settings and tools rows are keyed by name, oauth_credentials by provider, the rest by id.
 func (c secretColumn) idCol() string {
 	if c.setting != "" || c == colToolExec {
 		return "key"
+	}
+	if c.table == "oauth_credentials" {
+		return "provider"
 	}
 	return "id"
 }
@@ -95,7 +98,7 @@ var (
 	colHookSource      = secretColumn{"traffic_tamper_hooks", "source", false, ""}
 	colHookVerMatchers = secretColumn{"traffic_tamper_hook_versions", "matchers", true, ""}
 	colHookVerSource   = secretColumn{"traffic_tamper_hook_versions", "source", false, ""}
-	secretColumns      = append([]secretColumn{colLLMKey, colLLMProxy, colMCPEnv, colCredPass, colNotifConfig, colToolExec, colEvReqHead, colEvRespHead, colRewriteMatchers, colRewriteActions, colHookMatchers, colHookSource, colHookVerMatchers, colHookVerSource}, secretSettingColumns()...)
+	secretColumns      = append([]secretColumn{colLLMKey, colLLMProxy, colMCPEnv, colCredPass, colNotifConfig, colToolExec, colEvReqHead, colEvRespHead, colRewriteMatchers, colRewriteActions, colHookMatchers, colHookSource, colHookVerMatchers, colHookVerSource, colOAuthAccess, colOAuthRefresh}, secretSettingColumns()...)
 )
 
 // secretSettingKeys are the settings stored encrypted, AAD "settings.<key>".

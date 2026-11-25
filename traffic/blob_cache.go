@@ -2,6 +2,7 @@ package traffic
 
 import (
 	"container/list"
+	"strings"
 	"sync"
 )
 
@@ -56,4 +57,15 @@ func (c *trafficBlobLRU) set(key, val string) {
 		c.lru.Remove(back)
 	}
 	c.entries[key] = c.lru.PushFront(&trafficBlobEntry{key: key, val: val})
+}
+
+func (c *trafficBlobLRU) clearPrefix(prefix string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, elem := range c.entries {
+		if strings.HasPrefix(k, prefix) {
+			delete(c.entries, k)
+			c.lru.Remove(elem)
+		}
+	}
 }

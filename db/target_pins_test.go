@@ -638,7 +638,7 @@ func TestRestoreInterceptRowsWithoutTargetKey(t *testing.T) {
 	if _, err := tx.Exec(`DELETE FROM intercept_pending WHERE id=$1`, id); err != nil {
 		t.Fatal(err)
 	}
-	if err := restoreInterceptRows(tx, archived); err != nil {
+	if _, err := restoreInterceptRows(tx, archived); err != nil {
 		t.Fatal(err)
 	}
 	var key *string

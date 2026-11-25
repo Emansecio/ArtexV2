@@ -664,6 +664,7 @@ VALUES(?,?,?,?,?,?,?)`,
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("committing: %w", err)
 	}
+	t.exchangeCount.Add(1)
 	return true, nil
 }
 

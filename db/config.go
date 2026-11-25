@@ -792,19 +792,20 @@ func (d *DB) PromptVars(agentID int64) ([]PromptVar, error) {
 // run while SavePrompt is a rare UI action (which invalidates the key).
 func (d *DB) CurrentPrompt(agentID int64) (string, error) {
 	cacheKey := "prompt:" + strconv.FormatInt(agentID, 10)
-	if v, hit := d.cfgRef().get(cacheKey); hit {
+	v, hit, gen := d.cfgRef().get(cacheKey)
+	if hit {
 		return v.(string), nil
 	}
 	var tmpl sql.NullString
 	err := d.QueryRow(`SELECT p.template_text FROM agents a JOIN agent_prompts p ON p.id=a.current_prompt_id WHERE a.id=$1`, agentID).Scan(&tmpl)
 	if err == sql.ErrNoRows {
-		d.cfgRef().put(cacheKey, "")
+		d.cfgRef().putIfGen(cacheKey, "", gen)
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
-	d.cfgRef().put(cacheKey, tmpl.String)
+	d.cfgRef().putIfGen(cacheKey, tmpl.String, gen)
 	return tmpl.String, nil
 }
 
@@ -903,7 +904,8 @@ type MCPServer struct {
 // (configCacheTTL): it is re-read on every agent assembly while writes are rare
 // admin actions; SaveMCP/DeleteMCP/UpdateMCPHealth invalidate.
 func (d *DB) ListMCP() ([]*MCPServer, error) {
-	if v, hit := d.cfgRef().get("mcp:list"); hit {
+	v, hit, gen := d.cfgRef().get("mcp:list")
+	if hit {
 		// Deep-copy: the API mask step rewrites m.Env in place — shared cache
 		// pointers must be read-only to callers.
 		cached := v.([]*MCPServer)
@@ -938,12 +940,37 @@ func (d *DB) ListMCP() ([]*MCPServer, error) {
 		rows.Close()
 		return nil, err
 	}
-	rows.Close() // free the connection before the per-server tool-cache queries below
-	// Attach each server's cached tool names (best-effort; empty until discovered).
-	for _, m := range out {
-		m.Tools, _ = d.MCPToolNames(m.ID)
+	rows.Close() // free the connection before loading cached tool names in one batch
+	toolsOK := true
+	if len(out) > 0 {
+		byServer := make(map[int64][]string, len(out))
+		trows, terr := d.Query(`SELECT server_id, tool_name FROM mcp_tools_cache ORDER BY server_id, tool_name`)
+		if terr != nil {
+			toolsOK = false
+		} else {
+			for trows.Next() {
+				var sid int64
+				var tname string
+				if err := trows.Scan(&sid, &tname); err != nil {
+					toolsOK = false
+					break
+				}
+				byServer[sid] = append(byServer[sid], tname)
+			}
+			if err := trows.Err(); err != nil {
+				toolsOK = false
+			}
+			trows.Close()
+		}
+		if toolsOK {
+			for _, m := range out {
+				m.Tools = byServer[m.ID]
+			}
+		}
 	}
-	d.cfgRef().put("mcp:list", out)
+	if toolsOK {
+		d.cfgRef().putIfGen("mcp:list", out, gen)
+	}
 	cloned := make([]*MCPServer, len(out))
 	for i, m := range out {
 		cp := *m
@@ -1094,7 +1121,8 @@ func (d *DB) DeleteMCP(id int64) error {
 // writes invalidate.
 func (d *DB) AgentSkillNames(agentID int64) ([]string, error) {
 	cacheKey := "skills:" + strconv.FormatInt(agentID, 10)
-	if v, hit := d.cfgRef().get(cacheKey); hit {
+	v, hit, gen := d.cfgRef().get(cacheKey)
+	if hit {
 		cached := v.([]string)
 		out := make([]string, len(cached))
 		copy(out, cached)
@@ -1116,7 +1144,7 @@ func (d *DB) AgentSkillNames(agentID int64) ([]string, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	d.cfgRef().put(cacheKey, out)
+	d.cfgRef().putIfGen(cacheKey, out, gen)
 	outCopy := make([]string, len(out))
 	copy(outCopy, out)
 	return outCopy, nil
@@ -1207,7 +1235,8 @@ func (d *DB) DeleteSkillVisibility(skillName string) error {
 // invalidate.
 func (d *DB) AgentVisible(agentID int64, kind string) ([]int64, error) {
 	cacheKey := "vis:" + strconv.FormatInt(agentID, 10) + ":" + kind
-	if v, hit := d.cfgRef().get(cacheKey); hit {
+	v, hit, gen := d.cfgRef().get(cacheKey)
+	if hit {
 		cached := v.([]int64)
 		out := make([]int64, len(cached))
 		copy(out, cached)
@@ -1229,7 +1258,7 @@ func (d *DB) AgentVisible(agentID int64, kind string) ([]int64, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	d.cfgRef().put(cacheKey, out)
+	d.cfgRef().putIfGen(cacheKey, out, gen)
 	outCopy := make([]int64, len(out))
 	copy(outCopy, out)
 	return outCopy, nil

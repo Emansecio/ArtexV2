@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"iter"
 	"slices"
@@ -440,6 +441,7 @@ func (l *loop) run() {
 				l.hasAttemptedReactiveCompact = true
 				if msgs, ok := l.in.Compactor.Reactive(l.ctx, l.messages); ok {
 					l.messages = msgs
+					l.lastInputTokens = 0
 					l.recordNewBoundary()
 					l.lastContinue = ContinueReactiveCompactRetry
 					continue
@@ -623,6 +625,7 @@ func (l *loop) beginSettlement(reason TerminalReason) bool {
 	l.messages = append(l.messages, msg)
 	l.record(msg, llm.Usage{})
 	l.settling = true
+	l.toolCtx = l.ctx
 	l.settleReason = reason
 	l.settleTurn = 0
 	cancelSpeculative(l.in.Compactor)
@@ -845,6 +848,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		input strings.Builder
 	}
 	pending := map[int]*pendingTool{}
+	finalized := map[int]bool{}
 	var pendingOrder []int
 	finalizeToolIndex := func(idx int) bool { // false = consumer stopped
 		pt, ok := pending[idx]
@@ -852,6 +856,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 			return true
 		}
 		delete(pending, idx)
+		finalized[idx] = true
 		for i, k := range pendingOrder {
 			if k == idx {
 				pendingOrder = append(pendingOrder[:i], pendingOrder[i+1:]...)
@@ -880,6 +885,8 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		return true
 	}
 
+	defer exec.close()
+
 	for ev, e := range l.deps.CallModel(l.ctx, req) {
 		if e != nil {
 			err = e
@@ -892,7 +899,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 			if ev.Type == llm.SEToolInputJSON {
 				if pt, ok := pending[ev.ToolIndex]; ok {
 					pt.input.WriteString(ev.Text)
-				} else if len(pendingOrder) > 0 {
+				} else if !finalized[ev.ToolIndex] && len(pendingOrder) > 0 {
 					pending[pendingOrder[len(pendingOrder)-1]].input.WriteString(ev.Text)
 				}
 			}
@@ -930,6 +937,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 					}
 				}
 			}
+			delete(finalized, ev.ToolIndex)
 			pending[ev.ToolIndex] = &pendingTool{index: ev.ToolIndex, id: ev.ToolID, name: ev.ToolName}
 			pendingOrder = append(pendingOrder, ev.ToolIndex)
 			acc.Add(ev)
@@ -950,15 +958,18 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		}
 		acc.Add(ev)
 	}
+	if err != nil {
+		l.usage.Add(acc.Usage)
+		asst = acc.Message()
+		stopReason = acc.StopReason
+		return asst, exec, stopReason, err, false, false
+	}
 	if !finalizeAllTools() {
 		return asst, exec, "", nil, true, false
 	}
 	l.usage.Add(acc.Usage)
 	asst = acc.Message()
 	stopReason = acc.StopReason
-	if err != nil {
-		return asst, exec, stopReason, err, false, false
-	}
 	// Drain tools to completion (or synthesize on abort).
 	cs, ab := exec.finish()
 	if cs {
@@ -976,6 +987,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 // emission, and recorder all see identical numbers.
 func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
 	exec = newStreamExec(l)
+	defer exec.close()
 	msg, sr, usage, cerr := l.deps.CallModelSync(l.ctx, req)
 	if cerr != nil {
 		return asst, exec, "", cerr, false, false
@@ -1015,33 +1027,6 @@ func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, 
 }
 
 func jsonValid(s string) bool {
-	// minimal check used only to guard tool input assembly
 	s = strings.TrimSpace(s)
-	if s == "" {
-		return false
-	}
-	depth := 0
-	inStr := false
-	esc := false
-	for _, r := range s {
-		if inStr {
-			if esc {
-				esc = false
-			} else if r == '\\' {
-				esc = true
-			} else if r == '"' {
-				inStr = false
-			}
-			continue
-		}
-		switch r {
-		case '"':
-			inStr = true
-		case '{', '[':
-			depth++
-		case '}', ']':
-			depth--
-		}
-	}
-	return depth == 0 && !inStr
+	return s != "" && json.Valid([]byte(s))
 }

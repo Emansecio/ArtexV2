@@ -250,6 +250,9 @@ VALUES(?,?,?,?,?,?,?)`, item.ID, item.ReqHead, item.ReqBody, nullIfEmpty(item.Re
 	if err := tx.Commit(); err != nil {
 		return imported, err
 	}
+	if imported > 0 {
+		t.exchangeCount.Add(imported)
+	}
 	return imported, nil
 }
 

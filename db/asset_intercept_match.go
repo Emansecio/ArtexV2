@@ -58,14 +58,28 @@ func matchOne(r AssetInterceptRule, domains, ips, urls []string) (string, bool) 
 	}
 	switch r.Kind {
 	case "exact_domain":
+		kp := DomainKey(p)
+		if kp == "" {
+			return "", false
+		}
 		for _, d := range domains {
-			if strings.EqualFold(strings.TrimSpace(d), p) {
+			if DomainKey(d) == kp {
 				return d, true
 			}
 		}
 	case "exact_ip":
+		pip := net.ParseIP(p)
 		for _, ip := range ips {
-			if strings.TrimSpace(ip) == p {
+			tip := strings.TrimSpace(ip)
+			if pip != nil {
+				if cip := net.ParseIP(tip); cip != nil {
+					if pip.Equal(cip) {
+						return ip, true
+					}
+					continue
+				}
+			}
+			if tip == p {
 				return ip, true
 			}
 		}

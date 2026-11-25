@@ -131,7 +131,11 @@ func TestScanIngestNotableCap(t *testing.T) {
 // The path is confined to the working directory: "..", an absolute path
 // outside it, and a symlink (file or directory) leading outside are refused.
 func TestOpenScanOutputConfinement(t *testing.T) {
-	root, outside := t.TempDir(), t.TempDir()
+	base, outside := t.TempDir(), t.TempDir()
+	root := filepath.Join(base, "run")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	write := func(p string) {
 		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
@@ -159,21 +163,24 @@ func TestOpenScanOutputConfinement(t *testing.T) {
 	_ = big.Truncate(scanMaxFileBytes + 1) // sparse
 	big.Close()
 
-	for _, p := range []string{"ok.xml", filepath.Join(root, "ok.xml"), "sub/in.xml", "inner.xml"} {
-		f, err := openScanOutput(root, p)
+	for _, p := range []string{"ok.xml", filepath.Join(root, "ok.xml"), "sub/in.xml"} {
+		f, err := openScanOutput(base, root, p)
 		if err != nil {
 			t.Fatalf("%s refused: %v", p, err)
 		}
 		f.Close()
 	}
-	for _, p := range []string{"../secret.xml", "sub/../ok.xml", filepath.Join(outside, "secret.xml"), "link.xml", "dir/secret.xml", ".", "sub", "missing.xml", "big.xml", ""} {
-		if f, err := openScanOutput(root, p); err == nil {
+	for _, p := range []string{"../secret.xml", "sub/../ok.xml", filepath.Join(outside, "secret.xml"), "link.xml", "inner.xml", "dir/secret.xml", ".", "sub", "missing.xml", "big.xml", ""} {
+		if f, err := openScanOutput(base, root, p); err == nil {
 			f.Close()
 			t.Fatalf("%q was accepted", p)
 		}
 	}
-	if _, err := openScanOutput("", "ok.xml"); err == nil {
+	if _, err := openScanOutput(base, "", "ok.xml"); err == nil {
 		t.Fatal("no working directory must refuse")
+	}
+	if _, err := openScanOutput("", root, "ok.xml"); err == nil {
+		t.Fatal("no data directory must refuse")
 	}
 }
 

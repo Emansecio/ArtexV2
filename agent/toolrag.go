@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"math"
@@ -115,12 +117,33 @@ var bm25Cache = struct {
 }{m: map[string]*bm25Index{}}
 
 func bm25CatalogKey(tools []actool.CoreTool) string {
-	var b strings.Builder
-	for _, t := range tools {
-		b.WriteString(t.Name())
-		b.WriteByte(0)
+	h := sha256.New()
+	var lenBuf [8]byte
+	writePart := func(s string) {
+		binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(s)))
+		h.Write(lenBuf[:])
+		h.Write([]byte(s))
 	}
-	return b.String()
+	for _, t := range tools {
+		writePart(t.Name())
+		writePart(t.Description())
+		if props, ok := t.InputSchema()["properties"].(map[string]any); ok && len(props) > 0 {
+			keys := make([]string, 0, len(props))
+			for p := range props {
+				keys = append(keys, p)
+			}
+			sort.Strings(keys)
+			binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(keys)))
+			h.Write(lenBuf[:])
+			for _, k := range keys {
+				writePart(k)
+			}
+		} else {
+			binary.LittleEndian.PutUint64(lenBuf[:], 0)
+			h.Write(lenBuf[:])
+		}
+	}
+	return string(h.Sum(nil))
 }
 
 func getOrBuildBM25Index(tools []actool.CoreTool) *bm25Index {

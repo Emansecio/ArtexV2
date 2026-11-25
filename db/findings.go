@@ -418,6 +418,13 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 	}
 	defer tx.Rollback()
 
+	// Acquire ROW EXCLUSIVE on exploration_anchors before FOR SHARE on tasks
+	// to match the canonical assets/exploration_anchors -> tasks lock order
+	// used by DeleteTaskCascadePrepared and CompleteTaskArchive.
+	if _, err := tx.Exec(`LOCK TABLE exploration_anchors IN ROW EXCLUSIVE MODE`); err != nil {
+		return 0, Activity{}, err
+	}
+
 	var liveNodeID int64
 	err = tx.QueryRow(`SELECT n.id
 		FROM findings f
@@ -502,6 +509,7 @@ RETURNING id, created_at`, s.expID, audit.NodeID, utf8Clean(audit.Worker), utf8C
 	if err := tx.Commit(); err != nil {
 		return 0, Activity{}, err
 	}
+	s.db.BumpGraphVersion()
 	return intentID, audit, nil
 }
 
@@ -707,6 +715,13 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 // referencing it. Returns rows affected (0 = no finding with that id).
 func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 	err = d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
+		// Acquire ROW EXCLUSIVE on exploration_anchors before locking tasks via
+		// LockFindingEvidenceTx so concurrent DeleteTaskCascadePrepared /
+		// CompleteTaskArchive / RestoreTaskArchive (which lock exploration_anchors
+		// IN SHARE ROW EXCLUSIVE MODE then tasks FOR UPDATE) cannot deadlock.
+		if _, err := tx.Exec(`LOCK TABLE exploration_anchors IN ROW EXCLUSIVE MODE`); err != nil {
+			return err
+		}
 		if err := LockFindingEvidenceTx(tx, id, nil); err != nil {
 			if errors.Is(err, ErrFindingNotFound) {
 				return nil

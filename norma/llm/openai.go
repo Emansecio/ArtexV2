@@ -168,7 +168,11 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 				case BlockText:
 					text.WriteString(b.Text)
 				case BlockToolResult:
-					toolMsgs = append(toolMsgs, oaMessage{Role: "tool", ToolCallID: b.ToolUseID, Content: flattenText(b.Content)})
+					c := flattenText(b.Content)
+					if c == "" {
+						c = "(no output)"
+					}
+					toolMsgs = append(toolMsgs, oaMessage{Role: "tool", ToolCallID: b.ToolUseID, Content: c})
 				}
 			}
 			out = append(out, toolMsgs...)
@@ -269,21 +273,23 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 		thinkingType = req.Thinking
 	}
 	effort := p.cfg.ReasoningEffort
-	if req.ReasoningEffort != "" {
+	reasoningActive := (p.cfg.ReasoningEffort != "" && p.cfg.ReasoningEffort != "none") ||
+		(thinkingType != "" && thinkingType != "disabled")
+	if req.ReasoningEffort != "" && reasoningActive {
 		effort = req.ReasoningEffort
 	}
-	if req.Thinking == "disabled" {
+	if thinkingType == "disabled" {
 		effort = ""
 	}
 	// The request is in thinking mode when either a thinking type is set (a
 	// `thinking` body field goes out) or a reasoning effort is configured — the
 	// same providers that then demand reasoning_content be echoed back.
-	thinking := thinkingType != "" || effort != ""
+	thinking := (thinkingType != "" && thinkingType != "disabled") || (effort != "" && effort != "none")
 
 	msgs := toOpenAIMessages(joinSystem(req.System), req.Messages)
 	msgs = sanitizeOpenAIMessages(msgs, thinking)
 	if p.cfg.StripOldReasoning {
-		stripOldOAReasoning(msgs, thinking)
+		stripOldOAReasoning(msgs, thinking, p.cfg.OpenAICacheControl)
 	}
 
 	useCache := p.cfg.promptCacheEnabled()
@@ -354,17 +360,19 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 // tool-call loop (the assistant/tool alternation after lastUser) the history
 // stays append-only, so automatic prefix caches (DeepSeek/OpenAI/vLLM) and
 // explicit cache_control breakpoints keep hitting across turns.
-func stripOldOAReasoning(msgs []oaMessage, thinking bool) {
-	lastUser := -1
+func stripOldOAReasoning(msgs []oaMessage, thinking, preserveToolLoop bool) {
+	cutoff := -1
 	for i, m := range msgs {
 		if m.Role == "user" {
-			lastUser = i
+			cutoff = i
+		} else if !preserveToolLoop && m.Role == "assistant" {
+			cutoff = i
 		}
 	}
-	if lastUser <= 0 {
+	if cutoff <= 0 {
 		return
 	}
-	for i := 0; i < lastUser; i++ {
+	for i := 0; i < cutoff; i++ {
 		if msgs[i].Role == "assistant" && msgs[i].ReasoningContent != "" {
 			if thinking && len(msgs[i].ToolCalls) > 0 {
 				msgs[i].ReasoningContent = reasoningElidedPlaceholder
@@ -470,7 +478,11 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 				if data == "[DONE]" {
 					break
 				}
-				evs, sr, u, ok := parseOpenAIFrame(data, started)
+				evs, sr, u, ok, ferr := parseOpenAIFrame(data, started)
+				if ferr != nil {
+					streamErr = ferr
+					break
+				}
 				if sr != "" {
 					stopReason = sr
 				}
@@ -616,8 +628,8 @@ func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
 		blocks = append(blocks, TextBlock(ch.Message.Refusal))
 	}
 	for _, tc := range ch.Message.ToolCalls {
-		in := tc.Function.Arguments
-		if strings.TrimSpace(in) == "" {
+		in := strings.TrimSpace(tc.Function.Arguments)
+		if in == "" || !json.Valid([]byte(in)) {
 			in = "{}"
 		}
 		blocks = append(blocks, ContentBlock{
@@ -666,7 +678,7 @@ func pickReasoning(fields ...string) string {
 	return ""
 }
 
-func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, stopReason string, usage Usage, hasUsage bool) {
+func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, stopReason string, usage Usage, hasUsage bool, frameErr error) {
 	var f struct {
 		Choices []struct {
 			Delta struct {
@@ -686,16 +698,30 @@ func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, sto
 				CachedTokens int `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(data), &f); err != nil {
-		return nil, "", Usage{}, false
+		return nil, "", Usage{}, false, nil
+	}
+	if f.Error != nil {
+		msg := f.Error.Message
+		if msg == "" {
+			msg = f.Error.Type
+		}
+		if msg == "" {
+			msg = truncate(data, 500)
+		}
+		return nil, "", Usage{}, false, fmt.Errorf("openai: %s", msg)
 	}
 	if f.Usage != nil {
 		usage = Usage{InputTokens: f.Usage.PromptTokens, OutputTokens: f.Usage.CompletionTokens, CacheReadTokens: f.Usage.PromptTokensDetails.CachedTokens}
 		hasUsage = true
 	}
 	if len(f.Choices) == 0 {
-		return nil, "", usage, hasUsage
+		return nil, "", usage, hasUsage, nil
 	}
 	ch := f.Choices[0]
 	if think := pickReasoning(ch.Delta.ReasoningContent, ch.Delta.Reasoning, ch.Delta.ReasoningText); think != "" {
@@ -730,7 +756,7 @@ func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, sto
 	if ch.FinishReason != "" {
 		stopReason = mapOpenAIFinish(ch.FinishReason)
 	}
-	return evs, stopReason, usage, hasUsage
+	return evs, stopReason, usage, hasUsage, nil
 }
 
 func mapOpenAIFinish(r string) string {

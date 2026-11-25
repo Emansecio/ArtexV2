@@ -3,7 +3,6 @@ package server
 import (
 	"encoding/json"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,19 +28,7 @@ var wsUpgrader = websocket.Upgrader{
 	WriteBufferSize:   16384,
 	EnableCompression: true,
 	CheckOrigin: func(r *http.Request) bool {
-		orig := strings.TrimSpace(r.Header.Get("Origin"))
-		if orig == "" {
-			return true
-		}
-		u, err := url.Parse(orig)
-		if err != nil {
-			return false
-		}
-		if strings.EqualFold(u.Host, r.Host) {
-			return true
-		}
-		h := strings.ToLower(u.Hostname())
-		return h == "localhost" || h == "127.0.0.1" || h == "::1"
+		return isOriginAllowed(r.Header.Get("Origin"), r.Host)
 	},
 }
 
@@ -64,7 +51,7 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 	outCh := make(chan wsOutbound, 512)
 	doneCh := make(chan struct{})
 	var closeOnce sync.Once
-	shutdown := func() { closeOnce.Do(func() { close(doneCh) }) }
+	shutdown := func() { closeOnce.Do(func() { close(doneCh); _ = conn.Close() }) }
 	defer shutdown()
 
 	// Lossless coalescing queue for high-frequency token deltas: under backpressure
@@ -90,6 +77,17 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		return ch + "\x00" + df.Worker + "\x00" + iid + "\x00" + df.Kind
 	}
 
+	markResync := func(ch string) {
+		if ch == "" {
+			return
+		}
+		deltaMu.Lock()
+		resyncMap[ch] = struct{}{}
+		deltaMu.Unlock()
+		pingDelta()
+	}
+
+	const maxCoalescedDeltaBytes = 256 * 1024
 	enqueue := func(msg wsOutbound) {
 		if msg.Event == "delta" {
 			if df, ok := msg.Data.(DeltaFrame); ok {
@@ -97,9 +95,20 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 				deltaMu.Lock()
 				if cur, exists := deltaMap[k]; exists && !df.Reset {
 					prev := cur.Data.(DeltaFrame)
-					prev.Text += df.Text
-					cur.Data = prev
-					deltaMap[k] = cur
+					if len(prev.Text)+len(df.Text) > maxCoalescedDeltaBytes {
+						delete(deltaMap, k)
+						for i, okKey := range deltaOrder {
+							if okKey == k {
+								deltaOrder = append(deltaOrder[:i], deltaOrder[i+1:]...)
+								break
+							}
+						}
+						resyncMap[msg.Channel] = struct{}{}
+					} else {
+						prev.Text += df.Text
+						cur.Data = prev
+						deltaMap[k] = cur
+					}
 				} else {
 					if !exists {
 						deltaOrder = append(deltaOrder, k)
@@ -117,11 +126,8 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		default:
 			// Backpressure on reliable channel: mark channel for client resync so
 			// activity rows are never silently lost.
-			if msg.Channel != "" && (msg.Event == "activity" || msg.Event == "status") {
-				deltaMu.Lock()
-				resyncMap[msg.Channel] = struct{}{}
-				deltaMu.Unlock()
-				pingDelta()
+			if msg.Channel != "" && (msg.Event == "activity" || msg.Event == "status" || msg.Event == "resync") {
+				markResync(msg.Channel)
 			}
 		}
 	}
@@ -131,6 +137,7 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		for _, k := range deltaOrder {
 			if m, ok := deltaMap[k]; ok {
 				dst = append(dst, m)
+				delete(deltaMap, k)
 			}
 		}
 		deltaOrder = deltaOrder[:0]
@@ -168,15 +175,22 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	const maxWSSubsPerConn = 32
 	subscribeChannel := func(chName string, since int64) {
 		unsubChannel(chName)
+		subsMu.Lock()
+		tooMany := len(subs) >= maxWSSubsPerConn
+		subsMu.Unlock()
+		if tooMany {
+			return
+		}
 		subStop := make(chan struct{})
 		var subStopOnce sync.Once
 		var wg sync.WaitGroup
 
 		switch {
 		case chName == "global":
-			dch, dunsub := s.deltaHub.Subscribe("global")
+			dch, dov, dunsub := s.deltaHub.SubscribeResync("global")
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -187,6 +201,8 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 						return
 					case <-subStop:
 						return
+					case <-dov:
+						markResync(chName)
 					case msg, ok := <-dch:
 						if !ok {
 							return
@@ -197,7 +213,8 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 			}()
 		case chName == "logs":
 			lch, lunsub := logSink.subscribe()
-			if recent, cursor := logSink.recent(since, 1000); len(recent) > 0 {
+			// Cap initial catch-up to 256 entries so it never overflows outCh (512).
+			if recent, cursor := logSink.recent(since, 256); len(recent) > 0 {
 				for _, l := range recent {
 					enqueue(wsOutbound{Channel: chName, Event: "log", Data: l})
 				}
@@ -230,8 +247,8 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 		case strings.HasPrefix(chName, "task:"):
 			taskID := strings.TrimPrefix(chName, "task:")
 			if t := s.m.ResolveTask(taskID); t != nil {
-				ach, aunsub := s.engine.Broadcaster().Subscribe(t.ID)
-				dch, dunsub := s.deltaHub.Subscribe(chName)
+				ach, aov, aunsub := s.engine.Broadcaster().SubscribeResync(t.ID)
+				dch, dov, dunsub := s.deltaHub.SubscribeResync("task:" + t.ID)
 				lastID := since
 				if since > 0 {
 					if items, cursor, err := t.Store.ActivityList(nil, since, 200); err == nil {
@@ -241,6 +258,9 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 						if cursor > lastID {
 							lastID = cursor
 						}
+						if len(items) == 200 {
+							enqueue(wsOutbound{Channel: chName, Event: "resync"})
+						}
 					}
 				}
 				wg.Add(1)
@@ -248,14 +268,41 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 					defer wg.Done()
 					defer aunsub()
 					defer dunsub()
+					drainDeltas := func() bool {
+						for {
+							select {
+							case msg, ok := <-dch:
+								if !ok {
+									return false
+								}
+								enqueue(wsOutbound{Channel: chName, Event: msg.Event, Data: msg.Data})
+							default:
+								return true
+							}
+						}
+					}
 					for {
 						select {
 						case <-doneCh:
 							return
 						case <-subStop:
 							return
+						case <-aov:
+							markResync(chName)
+						case <-dov:
+							markResync(chName)
+						case msg, ok := <-dch:
+							if !ok {
+								return
+							}
+							enqueue(wsOutbound{Channel: chName, Event: msg.Event, Data: msg.Data})
 						case a, ok := <-ach:
 							if !ok {
+								return
+							}
+							// Drain any queued deltas before forwarding the finalized activity
+							// so deltas are never delivered after their own finalization.
+							if !drainDeltas() {
 								return
 							}
 							if a.ID <= lastID {
@@ -263,24 +310,25 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 							}
 							lastID = a.ID
 							enqueue(wsOutbound{Channel: chName, Event: "activity", Data: activityDTO(a)})
-						case msg, ok := <-dch:
-							if !ok {
-								return
-							}
-							enqueue(wsOutbound{Channel: chName, Event: msg.Event, Data: msg.Data})
 						}
 					}
 				}()
 			}
 		case strings.HasPrefix(chName, "conv:") || strings.HasPrefix(chName, "side:"):
-			dch, dunsub := s.deltaHub.Subscribe(chName)
+			dch, dov, dunsub := s.deltaHub.SubscribeResync(chName)
+			lastSeq := since
 			if strings.HasPrefix(chName, "conv:") && since > 0 && s.m.pg != nil {
 				if cid, err := strconv.ParseInt(strings.TrimPrefix(chName, "conv:"), 10, 64); err == nil {
 					if items, cursor, err := s.m.pg.ConvActivityList(cid, since, 200); err == nil {
 						for _, a := range items {
 							enqueue(wsOutbound{Channel: chName, Event: "activity", Data: activityDTO(a)})
 						}
-						since = cursor
+						if cursor > lastSeq {
+							lastSeq = cursor
+						}
+						if len(items) == 200 {
+							enqueue(wsOutbound{Channel: chName, Event: "resync"})
+						}
 					}
 				}
 			}
@@ -294,9 +342,19 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 						return
 					case <-subStop:
 						return
+					case <-dov:
+						markResync(chName)
 					case msg, ok := <-dch:
 						if !ok {
 							return
+						}
+						if msg.Event == "activity" {
+							if dto, ok := msg.Data.(ActivityDTO); ok && dto.Seq > 0 {
+								if dto.Seq <= lastSeq {
+									continue
+								}
+								lastSeq = dto.Seq
+							}
 						}
 						enqueue(wsOutbound{Channel: chName, Event: msg.Event, Data: msg.Data})
 					}
@@ -350,6 +408,9 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 			for len(batch) < 64 {
 				select {
 				case m := <-outCh:
+					// Flush any coalesced deltas enqueued before this outCh frame
+					// so a finalizing activity/status never overtakes its deltas.
+					batch = drainCoalesced(batch)
 					batch = append(batch, m)
 				default:
 					return

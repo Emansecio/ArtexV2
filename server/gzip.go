@@ -67,13 +67,13 @@ func (g *gzipResponseWriter) WriteHeader(code int) {
 	}
 	g.status = code
 	g.wroteH = true
-	if code < 200 || code == http.StatusNoContent || code == http.StatusNotModified || g.shouldBypassHeaders() {
+	if code < 200 || code == http.StatusNoContent || code == http.StatusPartialContent || code == http.StatusNotModified || g.shouldBypassHeaders() {
 		g.commitRaw()
 	}
 }
 
 func (g *gzipResponseWriter) shouldBypassHeaders() bool {
-	if g.w.Header().Get("Content-Encoding") != "" {
+	if g.w.Header().Get("Content-Encoding") != "" || g.w.Header().Get("Content-Range") != "" {
 		return true
 	}
 	ct := strings.ToLower(g.w.Header().Get("Content-Type"))

@@ -27,6 +27,157 @@ func (e *vm) checkRepeat(elemLen, cnt int64) int {
 	return int(cnt)
 }
 
+func (e *vm) checkReplaceAll(srcLen, oldLen, newLen, count int64) {
+	if count <= 0 {
+		e.alloc(srcLen)
+		return
+	}
+	delta := newLen - oldLen
+	if delta > 0 {
+		if delta > e.memLimit/count {
+			e.fail(ErrMemoryLimit)
+		}
+		add := count * delta
+		if srcLen > e.memLimit-add {
+			e.fail(ErrMemoryLimit)
+		}
+		e.alloc(srcLen + add)
+		return
+	}
+	projected := srcLen + count*delta
+	if projected < 0 {
+		projected = 0
+	}
+	e.alloc(projected)
+}
+
+func (e *vm) checkJSONBudget(v any) {
+	var est int64
+	rem := e.memLimit - e.memUsed
+	if rem < 0 {
+		e.fail(ErrMemoryLimit)
+	}
+	charge := func(n int64) {
+		if n < 0 {
+			return
+		}
+		if n > rem || est > rem-n {
+			e.fail(ErrMemoryLimit)
+		}
+		est += n
+	}
+	var walk func(x any, depth int)
+	walk = func(x any, depth int) {
+		if depth > 256 {
+			e.fail(ErrMemoryLimit)
+		}
+		switch val := x.(type) {
+		case nil, bool:
+			charge(5)
+		case int, int64, float64:
+			charge(24)
+		case string:
+			charge(int64(len(val)) + 2)
+		case []byte:
+			charge(int64(base64.StdEncoding.EncodedLen(len(val))) + 2)
+		case []any:
+			charge(2 + int64(len(val)))
+			for _, elem := range val {
+				walk(elem, depth+1)
+			}
+		case []string:
+			charge(2 + int64(len(val)))
+			for _, s := range val {
+				charge(int64(len(s)) + 2)
+			}
+		case map[string]any:
+			charge(2 + int64(len(val))*2)
+			for k, elem := range val {
+				charge(int64(len(k)) + 3)
+				walk(elem, depth+1)
+			}
+		case map[string][]string:
+			charge(2 + int64(len(val))*2)
+			for k, ss := range val {
+				charge(int64(len(k)) + 5 + int64(len(ss)))
+				for _, s := range ss {
+					charge(int64(len(s)) + 2)
+				}
+			}
+		default:
+			charge(32)
+		}
+	}
+	walk(v, 0)
+}
+
+func (e *vm) checkQueryBudget(m map[string][]string) {
+	rem := e.memLimit - e.memUsed
+	if rem < 0 {
+		e.fail(ErrMemoryLimit)
+	}
+	var est int64
+	charge := func(n int64) {
+		if n < 0 {
+			return
+		}
+		if n > rem || est > rem-n {
+			e.fail(ErrMemoryLimit)
+		}
+		est += n
+	}
+	charge3x := func(n int) {
+		l := int64(n)
+		if l > rem/3 {
+			e.fail(ErrMemoryLimit)
+		}
+		charge(l * 3)
+	}
+	for k, vs := range m {
+		for _, v := range vs {
+			charge3x(len(k))
+			charge3x(len(v))
+			charge(2) // '=' and '&'
+		}
+	}
+}
+
+func (e *vm) boundedRegexpReplaceAll(re *regexp.Regexp, s, repl string) string {
+	if !strings.Contains(repl, "$") {
+		e.alloc(int64(len(s)))
+		return re.ReplaceAllStringFunc(s, func(match string) string {
+			if d := int64(len(repl)) - int64(len(match)); d > 0 {
+				e.alloc(d)
+			}
+			return repl
+		})
+	}
+	numDollars := int64(strings.Count(repl, "$"))
+	matches := re.FindAllStringSubmatchIndex(s, -1)
+	var out []byte
+	last := 0
+	for _, m := range matches {
+		lit := s[last:m[0]]
+		e.alloc(int64(len(lit)))
+		out = append(out, lit...)
+		rem := e.memLimit - e.memUsed
+		matchLen := int64(m[1] - m[0])
+		if int64(len(repl)) > rem || (matchLen > 0 && numDollars > (rem-int64(len(repl)))/matchLen) {
+			e.fail(ErrMemoryLimit)
+		}
+		before := len(out)
+		out = re.ExpandString(out, repl, s, m)
+		if added := int64(len(out) - before); added > 0 {
+			e.alloc(added)
+		}
+		last = m[1]
+	}
+	tail := s[last:]
+	e.alloc(int64(len(tail)))
+	out = append(out, tail...)
+	return string(out)
+}
+
 func (e *vm) callPkg(pkg, fn string, args []any) any {
 	need := func(n int) {
 		if len(args) != n {
@@ -85,9 +236,9 @@ func (e *vm) callPkg(pkg, fn string, args []any) any {
 			return strings.ToUpper(s)
 		case "ReplaceAll":
 			need(3)
-			out := strings.ReplaceAll(e.str(args[0]), e.str(args[1]), e.str(args[2]))
-			e.alloc(int64(len(out)))
-			return out
+			s, old, repl := e.str(args[0]), e.str(args[1]), e.str(args[2])
+			e.checkReplaceAll(int64(len(s)), int64(len(old)), int64(len(repl)), int64(strings.Count(s, old)))
+			return strings.ReplaceAll(s, old, repl)
 		}
 	case "bytes":
 		switch fn {
@@ -121,13 +272,14 @@ func (e *vm) callPkg(pkg, fn string, args []any) any {
 			return bytes.ToUpper(b)
 		case "ReplaceAll":
 			need(3)
-			out := bytes.ReplaceAll(e.bytes(args[0]), e.bytes(args[1]), e.bytes(args[2]))
-			e.alloc(int64(len(out)))
-			return out
+			b, old, repl := e.bytes(args[0]), e.bytes(args[1]), e.bytes(args[2])
+			e.checkReplaceAll(int64(len(b)), int64(len(old)), int64(len(repl)), int64(bytes.Count(b, old)))
+			return bytes.ReplaceAll(b, old, repl)
 		}
 	case "encoding/json":
 		need(1)
 		if fn == "Marshal" {
+			e.checkJSONBudget(args[0])
 			raw, err := json.Marshal(args[0])
 			if err == nil {
 				e.alloc(int64(len(raw)))
@@ -193,6 +345,7 @@ func (e *vm) callPkg(pkg, fn string, args []any) any {
 			if !ok {
 				e.failf("url.EncodeQuery expects map[string][]string")
 			}
+			e.checkQueryBudget(m)
 			out := url.Values(m).Encode()
 			e.alloc(int64(len(out)))
 			return out
@@ -219,9 +372,7 @@ func (e *vm) callPkg(pkg, fn string, args []any) any {
 			return re.FindString(s)
 		case "ReplaceAllString":
 			need(3)
-			out := re.ReplaceAllString(s, e.str(args[2]))
-			e.alloc(int64(len(out)))
-			return out
+			return e.boundedRegexpReplaceAll(re, s, e.str(args[2]))
 		}
 	case "crypto/sha256":
 		need(1)

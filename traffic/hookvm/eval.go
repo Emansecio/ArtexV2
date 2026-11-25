@@ -327,33 +327,6 @@ func sortedMapPairs[V any](m map[string]V) []kvPair {
 }
 
 func (e *vm) execRange(s *ast.RangeStmt, sc *env) (flowSignal, any) {
-	var items []kvPair
-	switch x := e.eval(s.X, sc).(type) {
-	case []byte:
-		for i, v := range x {
-			items = append(items, kvPair{int64(i), int64(v)})
-		}
-	case []any:
-		for i, v := range x {
-			items = append(items, kvPair{int64(i), v})
-		}
-	case []string:
-		for i, v := range x {
-			items = append(items, kvPair{int64(i), v})
-		}
-	case string:
-		for i, r := range x {
-			items = append(items, kvPair{int64(i), int64(r)})
-		}
-	case map[string]any:
-		items = sortedMapPairs(x)
-	case map[string][]string:
-		items = sortedMapPairs(x)
-	case nil:
-		return flowNone, nil
-	default:
-		e.failf("cannot range over %T", x)
-	}
 	bind := func(lhs ast.Expr, v any, iterSc *env) {
 		if lhs == nil {
 			return
@@ -368,16 +341,68 @@ func (e *vm) execRange(s *ast.RangeStmt, sc *env) (flowSignal, any) {
 			e.failf("undefined variable %q", id.Name)
 		}
 	}
-	for _, it := range items {
+	runIter := func(k, v any) (flowSignal, any) {
 		e.step()
 		iterSc := newEnv(sc)
-		bind(s.Key, it.k, iterSc)
-		bind(s.Value, it.v, iterSc)
-		if sig, val := e.execBlock(s.Body, iterSc); sig == flowReturn {
-			return flowReturn, val
-		} else if sig == flowBreak {
-			break
+		bind(s.Key, k, iterSc)
+		bind(s.Value, v, iterSc)
+		return e.execBlock(s.Body, iterSc)
+	}
+	switch x := e.eval(s.X, sc).(type) {
+	case []byte:
+		for i, v := range x {
+			if sig, val := runIter(int64(i), int64(v)); sig == flowReturn {
+				return flowReturn, val
+			} else if sig == flowBreak {
+				break
+			}
 		}
+	case []any:
+		for i, v := range x {
+			if sig, val := runIter(int64(i), v); sig == flowReturn {
+				return flowReturn, val
+			} else if sig == flowBreak {
+				break
+			}
+		}
+	case []string:
+		for i, v := range x {
+			if sig, val := runIter(int64(i), v); sig == flowReturn {
+				return flowReturn, val
+			} else if sig == flowBreak {
+				break
+			}
+		}
+	case string:
+		for i, r := range x {
+			if sig, val := runIter(int64(i), int64(r)); sig == flowReturn {
+				return flowReturn, val
+			} else if sig == flowBreak {
+				break
+			}
+		}
+	case map[string]any:
+		e.alloc(int64(len(x)) * 32)
+		for _, it := range sortedMapPairs(x) {
+			if sig, val := runIter(it.k, it.v); sig == flowReturn {
+				return flowReturn, val
+			} else if sig == flowBreak {
+				break
+			}
+		}
+	case map[string][]string:
+		e.alloc(int64(len(x)) * 32)
+		for _, it := range sortedMapPairs(x) {
+			if sig, val := runIter(it.k, it.v); sig == flowReturn {
+				return flowReturn, val
+			} else if sig == flowBreak {
+				break
+			}
+		}
+	case nil:
+		return flowNone, nil
+	default:
+		e.failf("cannot range over %T", x)
 	}
 	return flowNone, nil
 }
@@ -1081,12 +1106,32 @@ func valuesEqual(a, b any) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
+	if isFloat(a) || isFloat(b) {
+		af, aok := toFloat(a)
+		bf, bok := toFloat(b)
+		if aok && bok {
+			return af == bf
+		}
+		return false
+	}
 	if an, ok := toInt(a); ok {
 		if bn, ok := toInt(b); ok {
 			return an == bn
 		}
 	}
 	return a == b
+}
+
+func toFloat(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case int64:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	}
+	return 0, false
 }
 
 func toInt(v any) (int64, bool) {

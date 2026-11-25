@@ -42,9 +42,11 @@ type bbotEvent struct {
 
 // bbotIngest is the result of parsing one output.json.
 type bbotIngest struct {
-	InScope []bbotEvent // scope_distance == 0: the only events that may feed insert_assets
-	Intel   []bbotEvent // any other scope_distance: third_party_intel, never auto-scoped
-	Skipped int         // lines that do not decode as an event
+	InScope   []bbotEvent // scope_distance == 0: the only events that may feed insert_assets
+	Intel     []bbotEvent // any other scope_distance: third_party_intel, never auto-scoped
+	Skipped   int         // lines that do not decode as an event
+	OverCap   int         // parsed events dropped after reaching scanMaxItems
+	Truncated bool        // true when OverCap > 0
 }
 
 // bbotRawEvent lists the only keys decoded; encoding/json drops every other key.

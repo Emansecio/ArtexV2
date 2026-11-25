@@ -85,10 +85,13 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   const captureOn = !!settings?.traffic_capture;
   const webSearchGlobalOn = !!settings?.web_search_enabled;
 
+  const loadGenRef = React.useRef(0);
   const reload = React.useCallback(() => {
+    const gen = ++loadGenRef.current;
     api
       .getAgent(agentKey)
       .then((d) => {
+        if (gen !== loadGenRef.current) return;
         setDetail(d);
         setPrompt(d.prompt ?? "");
         setVariables(d.variables ?? []);
@@ -111,11 +114,25 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
         setTtTurns(String(d.task_timeout_wrapup_max_turns ?? 0));
         setTtTurnsDefault(d.task_timeout_wrapup_max_turns_default ?? 5);
       })
-      .catch(() => setDetail(null))
-      .finally(() => setLoaded(true));
+      .catch(() => {
+        if (gen !== loadGenRef.current) return;
+        setDetail(null);
+      })
+      .finally(() => {
+        if (gen !== loadGenRef.current) return;
+        setLoaded(true);
+      });
   }, [agentKey]);
   React.useEffect(() => {
+    setDetail(null);
+    setLoaded(false);
+    setPreview("");
+    setViewVer(null);
+    setDiffVer(null);
     reload();
+    return () => {
+      loadGenRef.current += 1;
+    };
   }, [reload]);
 
   async function doPreview() {

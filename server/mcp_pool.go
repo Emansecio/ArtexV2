@@ -35,6 +35,7 @@ type pooledMCPEntry struct {
 	tools       []actool.CoreTool
 	toolsAt     time.Time
 	lastUsed    atomic.Int64
+	inFlight    atomic.Int64
 }
 
 func (e *pooledMCPEntry) touch() {
@@ -108,6 +109,9 @@ func (p *mcpPool) reapIdle(ttl time.Duration) {
 			delete(p.entries, id)
 			continue
 		}
+		if ent.inFlight.Load() > 0 {
+			continue
+		}
 		if last := ent.lastUsed.Load(); last > 0 && last < cutoff {
 			stale = append(stale, ent)
 			delete(p.entries, id)
@@ -157,30 +161,45 @@ func (p *mcpPool) Acquire(ctx context.Context, m *db.MCPServer, priv ExecPrivile
 	}
 	p.mu.Unlock()
 
+	type acquiredMCP struct {
+		ent   *pooledMCPEntry
+		tools []actool.CoreTool
+	}
 	key := fmt.Sprintf("%d:%s", m.ID, fp)
 	v, err, _ := p.sf.Do(key, func() (any, error) {
 		p.mu.Lock()
 		cur := p.entries[m.ID]
 		if cur != nil && cur.fingerprint == fp {
 			if time.Since(cur.toolsAt) < mcpToolsCacheTTL {
-				res := cur
+				cur.touch()
+				res := acquiredMCP{ent: cur, tools: cur.tools}
 				p.mu.Unlock()
 				return res, nil
 			}
-			// Same client, refresh tools list only.
+			// Same client, refresh tools list only. Hold inFlight across the
+			// Tools() RPC so reapIdle cannot evict and close cur mid-refresh.
+			cur.inFlight.Add(1)
+			cur.touch()
 			p.mu.Unlock()
 			tctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
 			ts, terr := cur.client.Tools(tctx)
 			cancel()
 			if terr == nil {
 				p.mu.Lock()
-				cur.tools = ts
-				cur.toolsAt = time.Now()
+				cur.touch()
+				cur.inFlight.Add(-1)
+				if p.entries[m.ID] == cur {
+					cur.tools = ts
+					cur.toolsAt = time.Now()
+					p.mu.Unlock()
+					return acquiredMCP{ent: cur, tools: ts}, nil
+				}
 				p.mu.Unlock()
-				return cur, nil
+			} else {
+				cur.inFlight.Add(-1)
+				// Broken connection: evict and reconnect below.
+				p.evictIfMatch(m.ID, cur)
 			}
-			// Broken connection: evict and reconnect below.
-			p.evictIfMatch(m.ID, cur)
 		} else {
 			p.mu.Unlock()
 		}
@@ -214,13 +233,13 @@ func (p *mcpPool) Acquire(ctx context.Context, m *db.MCPServer, priv ExecPrivile
 		if old != nil && old.client != nil {
 			go func(c mcpClient) { _ = c.Close() }(old.client)
 		}
-		return next, nil
+		return acquiredMCP{ent: next, tools: ts}, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	res := v.(*pooledMCPEntry)
-	return wrapPooledTools(p, m.ID, res, res.tools), nil
+	res := v.(acquiredMCP)
+	return wrapPooledTools(p, m.ID, res.ent, res.tools), nil
 }
 
 func (p *mcpPool) evictIfMatch(id int64, ent *pooledMCPEntry) {
@@ -278,7 +297,14 @@ type pooledMCPTool struct {
 }
 
 func (t pooledMCPTool) Call(ctx context.Context, input json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
-	t.ent.touch()
+	if t.ent != nil {
+		t.ent.inFlight.Add(1)
+		t.ent.touch()
+		defer func() {
+			t.ent.touch()
+			t.ent.inFlight.Add(-1)
+		}()
+	}
 	res, err := t.CoreTool.Call(ctx, input, tc)
 	if err != nil {
 		t.pool.evictIfMatch(t.id, t.ent)

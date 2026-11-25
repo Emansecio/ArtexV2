@@ -92,7 +92,7 @@ func TestInstallSkillTool(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	s := &Server{skillDir: dir}
+	s := &Server{skillDir: dir, allowLoopbackSkillFetch: true}
 	tool := s.toolInstallSkill()
 
 	// Non-HTTP scheme rejected.
@@ -134,5 +134,53 @@ func TestInstallSkillTool(t *testing.T) {
 	got2, err := os.ReadFile(filepath.Join(dir, "remote-skill", "SKILL.md"))
 	if err != nil || string(got2) != updatedSkill {
 		t.Fatalf("overwritten SKILL.md mismatch: err=%v got=%q", err, got2)
+	}
+}
+
+func TestInstallSkillToolSSRFGuard(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		switch r.URL.Path {
+		case "/redirect-private":
+			http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+		case "/redirect-scheme":
+			http.Redirect(w, r, "file:///etc/passwd", http.StatusFound)
+		default:
+			_, _ = w.Write([]byte("---\nname: secret\ndescription: x\n---\nbody\n"))
+		}
+	}))
+	defer srv.Close()
+
+	// Default production config (allowLoopbackSkillFetch=false) blocks loopback,
+	// private, and metadata targets when TargetGate is off.
+	s := &Server{skillDir: t.TempDir()}
+	tool := s.toolInstallSkill()
+	for _, target := range []string{
+		srv.URL + "/valid",
+		"http://localhost:8080/SKILL.md",
+		"http://10.0.0.1/SKILL.md",
+		"http://169.254.169.254/latest/meta-data/",
+	} {
+		in, _ := json.Marshal(map[string]any{"url": target})
+		res, err := tool.Call(context.Background(), in, nil)
+		if err != nil || !res.IsError {
+			t.Fatalf("expected SSRF block for %s: err=%v res=%+v", target, err, res)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("loopback server should not have been contacted, got %d hits", hits)
+	}
+
+	// Even when loopback is allowed for the initial hop, redirects to private/metadata
+	// IPs or non-http(s) schemes must be rejected.
+	sLoop := &Server{skillDir: t.TempDir(), allowLoopbackSkillFetch: true}
+	toolLoop := sLoop.toolInstallSkill()
+	for _, path := range []string{"/redirect-private", "/redirect-scheme"} {
+		in, _ := json.Marshal(map[string]any{"url": srv.URL + path})
+		res, err := toolLoop.Call(context.Background(), in, nil)
+		if err != nil || !res.IsError {
+			t.Fatalf("expected redirect block for %s: err=%v res=%+v", path, err, res)
+		}
 	}
 }

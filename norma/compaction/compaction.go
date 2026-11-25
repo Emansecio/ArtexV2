@@ -341,7 +341,13 @@ func (c *Compactor) tryTakeSpeculative(ctx context.Context, start, tailStart int
 	c.specMu.Lock()
 	job := c.spec
 	if job == nil || job.start != start || job.tail <= start || job.tail > tailStart || (tailStart-job.tail) > 12 {
+		if job != nil {
+			c.spec = nil
+		}
 		c.specMu.Unlock()
+		if job != nil && job.cancel != nil {
+			job.cancel()
+		}
 		return "", 0, 0, false
 	}
 	// Consume or await this speculative job once.
@@ -533,7 +539,7 @@ func (c *Compactor) autoCompact(ctx context.Context, msgs []llm.Message, preTok 
 		} else {
 			var err error
 			summary, err = c.summarize(ctx, toSummarize)
-			if err != nil {
+			if err != nil || strings.TrimSpace(summary) == "" {
 				c.failures++
 				if c.failures >= maxAutoCompactFails {
 					c.tripped = true

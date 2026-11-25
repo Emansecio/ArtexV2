@@ -259,6 +259,7 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 	}
 	if err := ts.SupersedeDigests(stale); err != nil {
 		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
+		return
 	}
 	c.foldBlocksParallel(ctx, ts, g, toCreate, nodeByID, cvers, active)
 }

@@ -3413,6 +3413,7 @@ function CreateTaskSheet({
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
       setInterceptRules([]);
+      setCredentials([]);
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);

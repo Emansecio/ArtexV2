@@ -54,10 +54,10 @@ func (t *Traffic) RecordRawUDPDatagram(rec RawUDPCapture, previewBytes int) (str
 		ts = time.Now().UTC()
 	}
 
-	preview, blobHash := t.spillRawDir(rec.Payload, previewBytes)
-
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
+
+	preview, blobHash := t.spillRawDir(rec.Payload, previewBytes)
 
 	id := t.newRawUDPDatagramID(ts)
 

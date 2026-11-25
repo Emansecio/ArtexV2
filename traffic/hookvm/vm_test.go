@@ -380,6 +380,35 @@ func OnRequest(req *Request) error {
 			t.Fatalf("expected regexp size limit error, got %v", err)
 		}
 	})
+
+	t.Run("encode_query_aliased_strings_bounded", func(t *testing.T) {
+		src := `package hook
+import (
+	"net/url"
+	"strings"
+)
+func OnRequest(req *Request) error {
+	s := strings.Repeat("%", 1024*1024)
+	q, err := url.ParseQuery("")
+	if err != nil {
+		return err
+	}
+	var vals []string
+	for i := 0; i < 64; i++ {
+		vals = append(vals, s)
+	}
+	q["k"] = vals
+	_ = url.EncodeQuery(q)
+	return nil
+}`
+		prog, err := Compile("request", src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := prog.RunRequest(context.Background(), &Request{}, RunOptions{}); !errors.Is(err, ErrMemoryLimit) {
+			t.Fatalf("err = %v, want ErrMemoryLimit", err)
+		}
+	})
 }
 
 func TestDeterminismAndSortedMapIteration(t *testing.T) {

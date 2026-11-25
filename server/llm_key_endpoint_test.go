@@ -164,3 +164,122 @@ func TestStoredProfileKeyOnlyForStoredEndpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestAttachOAuthRejectsCustomBaseURL(t *testing.T) {
+	s := &Server{}
+	for _, prov := range []string{"chatgpt", "anthropic-oauth"} {
+		cfg := agent.ConfigFrom(prov, "m", "https://evil.example/v1", "", "")
+		if s.attachOAuth(&cfg) {
+			t.Fatalf("attachOAuth(%q) with custom base_url returned true", prov)
+		}
+		if cfg.OAuthSource != nil {
+			t.Fatalf("attachOAuth(%q) with custom base_url attached OAuthSource", prov)
+		}
+	}
+}
+
+func TestSaveProfileRejectsOAuthCustomBaseURL(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		db.SkipPGUnavailable(t, err)
+	}
+	t.Cleanup(func() { m.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
+
+	for _, format := range []string{"chatgpt", "anthropic-oauth"} {
+		b, _ := json.Marshal(map[string]any{
+			"name":     "oauth-evil",
+			"format":   format,
+			"model":    "m",
+			"base_url": "https://evil.example/v1",
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/llm/profiles", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.pgSaveProfile(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("pgSaveProfile(%q) with custom base_url: status %d body=%s, want 400", format, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestSetLLMRejectsRebindingKeyToNewEndpoint(t *testing.T) {
+	s := &Server{}
+	s.llmCfg = agent.ConfigFrom("anthropic", "m", "https://saved.example", "global-secret", "")
+
+	b, _ := json.Marshal(map[string]any{
+		"provider": "anthropic",
+		"model":    "m",
+		"base_url": "https://evil.example",
+		"api_key":  "",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/llm", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.setLLM(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("setLLM with changed base_url and blank api_key: status %d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+	s.cfgMu.Lock()
+	gotBase := s.llmCfg.BaseURL
+	gotKey := s.llmCfg.APIKey
+	s.cfgMu.Unlock()
+	if gotBase != "https://saved.example" || gotKey != "global-secret" {
+		t.Fatalf("setLLM mutated global config on rejected request: base=%q key=%q", gotBase, gotKey)
+	}
+}
+
+func TestSaveProfileRejectsRebindingKeyToNewEndpoint(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		db.SkipPGUnavailable(t, err)
+	}
+	t.Cleanup(func() { m.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
+
+	pid, err := m.pg.SaveProfile(&db.LLMProfile{
+		Name: "pin-test", Format: "anthropic", Model: "m", BaseURL: "https://saved.example", APIKey: "profile-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.pg.Exec("DELETE FROM llm_profiles WHERE id=$1", pid) })
+
+	// Updating base_url with blank api_key must be rejected with 400.
+	b, _ := json.Marshal(map[string]any{
+		"id":       pid,
+		"name":     "pin-test",
+		"format":   "anthropic",
+		"model":    "m",
+		"base_url": "https://evil.example",
+		"api_key":  "",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/llm/profiles", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.pgSaveProfile(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("pgSaveProfile with changed base_url and blank api_key: status %d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+
+	// Updating model on the same endpoint with blank api_key must still succeed.
+	bSame, _ := json.Marshal(map[string]any{
+		"id":       pid,
+		"name":     "pin-test",
+		"format":   "anthropic",
+		"model":    "m2",
+		"base_url": "https://saved.example/",
+		"api_key":  "",
+	})
+	reqSame := httptest.NewRequest(http.MethodPost, "/api/llm/profiles", bytes.NewReader(bSame))
+	reqSame.Header.Set("Content-Type", "application/json")
+	recSame := httptest.NewRecorder()
+	s.pgSaveProfile(recSame, reqSame)
+	if recSame.Code != http.StatusOK {
+		t.Fatalf("pgSaveProfile on same endpoint with blank api_key: status %d body=%s, want 200", recSame.Code, recSame.Body.String())
+	}
+}

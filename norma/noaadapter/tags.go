@@ -44,6 +44,17 @@ var (
 // Projection calls this before hashing: a tag inside the identity would make
 // the id drift every turn the tag is re-rendered.
 func StripRefTag(s string) string {
+	trimmed := strings.TrimRight(s, " \t\r\n")
+	if !strings.HasSuffix(trimmed, "/>") {
+		return s
+	}
+	tailStart := len(trimmed) - 256
+	if tailStart < 0 {
+		tailStart = 0
+	}
+	if !strings.Contains(trimmed[tailStart:], "<noa-ref ") {
+		return s
+	}
 	return trailingTagRE.ReplaceAllString(s, "")
 }
 

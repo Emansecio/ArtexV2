@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -22,9 +23,10 @@ type sseScanner struct {
 	buf          bytes.Buffer // reused across frames to avoid per-event allocations
 	closer       io.Closer
 	timeout      time.Duration
+	mu           sync.Mutex
 	timer        *time.Timer
+	closed       bool
 	lastActivity atomic.Int64 // unix nanos of last received line
-	closed       atomic.Bool
 	timed        atomic.Bool
 }
 
@@ -42,20 +44,28 @@ func newSSEScannerWithIdleTimeout(body io.ReadCloser, idleTimeout time.Duration)
 		s.lastActivity.Store(time.Now().UnixNano())
 		var check func()
 		check = func() {
-			if s.closed.Load() {
+			s.mu.Lock()
+			if s.closed {
+				s.mu.Unlock()
 				return
 			}
 			elapsed := time.Duration(time.Now().UnixNano() - s.lastActivity.Load())
 			if elapsed >= s.timeout {
 				s.timed.Store(true)
+				s.mu.Unlock()
 				_ = body.Close()
 				return
 			}
 			// Re-arm once for the remaining idle window instead of resetting the
 			// runtime timer heap on every single SSE line.
-			s.timer.Reset(s.timeout - elapsed)
+			if s.timer != nil {
+				s.timer.Reset(s.timeout - elapsed)
+			}
+			s.mu.Unlock()
 		}
+		s.mu.Lock()
 		s.timer = time.AfterFunc(idleTimeout, check)
+		s.mu.Unlock()
 	}
 	return s
 }
@@ -67,9 +77,13 @@ func (s *sseScanner) touchWatchdog() {
 }
 
 func (s *sseScanner) Close() {
-	s.closed.Store(true)
-	if s.timer != nil {
-		s.timer.Stop()
+	s.mu.Lock()
+	s.closed = true
+	t := s.timer
+	s.timer = nil
+	s.mu.Unlock()
+	if t != nil {
+		t.Stop()
 	}
 }
 
@@ -96,6 +110,29 @@ func (s *sseScanner) next() (event, data string, err error) {
 	for {
 		s.touchWatchdog()
 		rawLine, rerr := s.readLine()
+		if len(rawLine) > 0 {
+			line := bytes.TrimRight(rawLine, "\r\n")
+			if len(line) == 0 {
+				if s.buf.Len() > 0 || event != "" {
+					if rerr != nil {
+						s.Close()
+					}
+					return event, strings.TrimRight(s.buf.String(), "\n"), nil
+				}
+			} else {
+				switch {
+				case bytes.HasPrefix(line, []byte("event:")):
+					event = string(bytes.TrimSpace(line[len("event:"):]))
+				case bytes.HasPrefix(line, []byte("data:")):
+					d := line[len("data:"):]
+					d = bytes.TrimPrefix(d, []byte(" "))
+					s.buf.Write(d)
+					s.buf.WriteByte('\n')
+				default:
+					// comment / unknown field — ignore (still refreshed watchdog above)
+				}
+			}
+		}
 		if rerr != nil {
 			if s.timed.Load() {
 				s.Close()
@@ -107,24 +144,6 @@ func (s *sseScanner) next() (event, data string, err error) {
 			}
 			s.Close()
 			return "", "", rerr
-		}
-		rawLine = bytes.TrimRight(rawLine, "\r\n")
-		if len(rawLine) == 0 {
-			if s.buf.Len() > 0 || event != "" {
-				return event, strings.TrimRight(s.buf.String(), "\n"), nil
-			}
-			continue
-		}
-		switch {
-		case bytes.HasPrefix(rawLine, []byte("event:")):
-			event = string(bytes.TrimSpace(rawLine[len("event:"):]))
-		case bytes.HasPrefix(rawLine, []byte("data:")):
-			d := rawLine[len("data:"):]
-			d = bytes.TrimPrefix(d, []byte(" "))
-			s.buf.Write(d)
-			s.buf.WriteByte('\n')
-		default:
-			// comment / unknown field — ignore (still refreshed watchdog above)
 		}
 	}
 }

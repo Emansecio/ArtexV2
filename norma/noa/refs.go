@@ -3,12 +3,8 @@ package noa
 import (
 	"fmt"
 	"maps"
-	"regexp"
-	"strconv"
 	"strings"
 )
-
-var refPattern = regexp.MustCompile(`^m0*(\d{1,5})$`)
 
 // IndexToRef renders a 1-based index as mNNNNN. Out-of-range input is a
 // programming error and yields "".
@@ -23,12 +19,32 @@ func IndexToRef(index int) string {
 // upper case, and missing zero padding (m5 == m00005). Returns ok=false for
 // anything else.
 func RefToIndex(ref string) (int, bool) {
-	m := refPattern.FindStringSubmatch(strings.ToLower(strings.TrimSpace(ref)))
-	if m == nil {
+	s := strings.TrimSpace(ref)
+	if len(s) < 2 || (s[0] != 'm' && s[0] != 'M') {
 		return 0, false
 	}
-	n, err := strconv.Atoi(m[1])
-	if err != nil || n < MinRefIndex || n > MaxRefIndex {
+	digits := s[1:]
+	// Skip leading zeros while ensuring at least one digit remains.
+	i := 0
+	for i < len(digits) && digits[i] == '0' {
+		i++
+	}
+	if i == len(digits) {
+		return 0, false
+	}
+	rem := digits[i:]
+	if len(rem) > 5 {
+		return 0, false
+	}
+	n := 0
+	for j := 0; j < len(rem); j++ {
+		c := rem[j]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n < MinRefIndex || n > MaxRefIndex {
 		return 0, false
 	}
 	return n, true

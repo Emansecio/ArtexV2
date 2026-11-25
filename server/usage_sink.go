@@ -14,7 +14,6 @@ import (
 type usageSink struct {
 	pg *db.DB
 	ch chan func()
-	wg sync.WaitGroup
 }
 
 // usageSinks holds one sink per *db.DB so the async recorder can be obtained
@@ -34,7 +33,6 @@ func usageRecorderFor(pg *db.DB) *usageSink {
 		go func() {
 			for f := range s.ch {
 				f()
-				s.wg.Done()
 			}
 		}()
 	}
@@ -42,11 +40,9 @@ func usageRecorderFor(pg *db.DB) *usageSink {
 }
 
 func (s *usageSink) enqueue(f func()) {
-	s.wg.Add(1)
 	select {
 	case s.ch <- f:
 	default:
-		s.wg.Done()
 		f() // queue full: run inline so the ledger row is not lost
 	}
 }
@@ -80,6 +76,8 @@ func flushUsageLedger(pg *db.DB) {
 		return
 	}
 	if v, ok := usageSinks.Load(pg); ok {
-		v.(*usageSink).wg.Wait()
+		done := make(chan struct{})
+		v.(*usageSink).ch <- func() { close(done) }
+		<-done
 	}
 }

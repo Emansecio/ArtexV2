@@ -136,11 +136,11 @@ func (t *Traffic) RecordRawTCPStream(rec RawTCPCapture, previewBytes int) (strin
 		durMs = 0
 	}
 
-	c2sPrev, c2sBlob := t.spillRawDir(rec.C2SData, previewBytes)
-	s2cPrev, s2cBlob := t.spillRawDir(rec.S2CData, previewBytes)
-
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
+
+	c2sPrev, c2sBlob := t.spillRawDir(rec.C2SData, previewBytes)
+	s2cPrev, s2cBlob := t.spillRawDir(rec.S2CData, previewBytes)
 
 	id := t.newRawTCPStreamID(started)
 	trunc := 0

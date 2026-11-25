@@ -716,7 +716,7 @@ type plannerPruneHook struct {
 
 var plannerPrunedToolNames = map[string]bool{
 	"Bash": true, "Write": true, "Edit": true, "MultiEdit": true,
-	"Glob": true, "Grep": true, "Sleep": true, "WebFetch": true, "web_search": true,
+	"Glob": true, "Grep": true, "sleep": true, "WebFetch": true, "web_search": true,
 	"Monitor": true, "TaskOutput": true, "TaskStop": true,
 }
 

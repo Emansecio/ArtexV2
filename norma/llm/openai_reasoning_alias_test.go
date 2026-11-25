@@ -13,7 +13,10 @@ import (
 // caller then rendered as a text-less run.
 func TestOpenAIStreamReasoningAlias(t *testing.T) {
 	started := map[int]bool{}
-	evs, _, _, _ := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"reasoning":"I need to verify"}}]}`, started)
+	evs, _, _, _, err := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"reasoning":"I need to verify"}}]}`, started)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
 	if len(evs) != 1 || evs[0].Type != SEThinkingDelta || evs[0].Text != "I need to verify" {
 		t.Fatalf("evs=%+v", evs)
 	}
@@ -23,7 +26,10 @@ func TestOpenAIStreamReasoningAlias(t *testing.T) {
 // keep their existing behaviour.
 func TestOpenAIStreamReasoningContentWins(t *testing.T) {
 	started := map[int]bool{}
-	evs, _, _, _ := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"reasoning":"alias","reasoning_content":"canonical"}}]}`, started)
+	evs, _, _, _, err := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"reasoning":"alias","reasoning_content":"canonical"}}]}`, started)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
 	if len(evs) != 1 || evs[0].Text != "canonical" {
 		t.Fatalf("evs=%+v", evs)
 	}
@@ -33,7 +39,10 @@ func TestOpenAIStreamReasoningContentWins(t *testing.T) {
 // other two are absent.
 func TestOpenAIStreamReasoningTextField(t *testing.T) {
 	started := map[int]bool{}
-	evs, _, _, _ := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"reasoning_text":"third field"}}]}`, started)
+	evs, _, _, _, err := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"reasoning_text":"third field"}}]}`, started)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
 	if len(evs) != 1 || evs[0].Type != SEThinkingDelta || evs[0].Text != "third field" {
 		t.Fatalf("evs=%+v", evs)
 	}
@@ -43,7 +52,10 @@ func TestOpenAIStreamReasoningTextField(t *testing.T) {
 // the same text in more than one field contributes it once, not concatenated.
 func TestOpenAIStreamReasoningDedup(t *testing.T) {
 	started := map[int]bool{}
-	evs, _, _, _ := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"reasoning_content":"once","reasoning":"once","reasoning_text":"once"}}]}`, started)
+	evs, _, _, _, err := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"reasoning_content":"once","reasoning":"once","reasoning_text":"once"}}]}`, started)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
 	if len(evs) != 1 || evs[0].Text != "once" {
 		t.Fatalf("evs=%+v", evs)
 	}
@@ -112,7 +124,10 @@ func TestOpenAIRefusalBecomesText(t *testing.T) {
 
 func TestOpenAIStreamRefusalBecomesText(t *testing.T) {
 	started := map[int]bool{}
-	evs, _, _, _ := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"refusal":"I can't"}}]}`, started)
+	evs, _, _, _, err := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"refusal":"I can't"}}]}`, started)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
 	if len(evs) != 1 || evs[0].Type != SETextDelta || evs[0].Text != "I can't" {
 		t.Fatalf("evs=%+v", evs)
 	}

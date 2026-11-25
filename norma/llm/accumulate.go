@@ -51,7 +51,7 @@ func (a *Accumulator) Add(ev StreamEvent) {
 			a.flushText()
 			a.thinkBuf = &strings.Builder{}
 		}
-		a.thinkSig = ev.Text
+		a.thinkSig += ev.Text
 	case SERedactedThinking:
 		a.flushText()
 		a.flushThinking()

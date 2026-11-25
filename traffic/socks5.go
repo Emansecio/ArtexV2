@@ -478,10 +478,12 @@ func (s *socks5Server) negotiateAuth(conn net.Conn) (paced bool, ok bool) {
 		}
 	}
 
-	// Prefer username/password when offered so clients carrying the pace marker
-	// (egress.PaceUser) can pass it through without requiring real credentials.
-	// Accept no-auth for loopback clients.
-	if hasUserPass {
+	// Prefer username/password when offered so loopback clients carrying the
+	// pace marker (egress.PaceUser) can pass it through without requiring real
+	// credentials. Both no-auth and unverified user/pass are restricted to
+	// loopback peers so binding to a non-loopback address never exposes an open
+	// proxy.
+	if hasUserPass && isLoopbackRemote(conn.RemoteAddr()) {
 		if _, err := conn.Write([]byte{socks5Version, socks5AuthUserPass}); err != nil {
 			return false, false
 		}

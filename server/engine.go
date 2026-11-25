@@ -167,15 +167,17 @@ type Engine struct {
 	// and they carry no pairing/ordering constraints (unlike tool_use↔tool_result),
 	// so persisting them synchronously would put a PostgreSQL insert on the
 	// critical path of every turn. Lazily started, drained by one goroutine for
-	// the process lifetime (Engine has no global shutdown).
-	usageOnce sync.Once
-	usageQ    chan usageActivityWrite
+	// the process lifetime; FlushUsageActivities provides a commit barrier before
+	// task deletion, archiving, or shutdown.
+	usageMu sync.Mutex
+	usageQ  chan usageActivityWrite
 }
 
 // usageActivityWrite is one queued "usage" activity row bound to its task.
 type usageActivityWrite struct {
-	t *Task
-	r db.Activity
+	t    *Task
+	r    db.Activity
+	done chan struct{} // non-nil sentinel used by FlushUsageActivities
 }
 
 func (e *Engine) SetDeltaHub(h *DeltaHub) { e.deltaHub = h }
@@ -324,6 +326,7 @@ func (e *Engine) Wait(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
+	e.FlushUsageActivities()
 	return nil
 }
 
@@ -770,15 +773,39 @@ func (e *Engine) Broadcaster() *Broadcaster { return e.bc }
 
 // usageWriteQueue lazily starts the usage writer and returns its queue.
 func (e *Engine) usageWriteQueue() chan usageActivityWrite {
-	e.usageOnce.Do(func() {
-		e.usageQ = make(chan usageActivityWrite, 256)
+	e.usageMu.Lock()
+	defer e.usageMu.Unlock()
+	if e.usageQ == nil {
+		q := make(chan usageActivityWrite, 256)
+		e.usageQ = q
 		go func() {
-			for w := range e.usageQ {
-				e.emitActivity(w.t, w.r)
+			for w := range q {
+				if w.done != nil {
+					close(w.done)
+					continue
+				}
+				e.emitActivitySync(w.t, w.r)
 			}
 		}()
-	})
+	}
 	return e.usageQ
+}
+
+// FlushUsageActivities waits for every queued "usage" activity write to commit.
+// No-op if the async usage writer was never started.
+func (e *Engine) FlushUsageActivities() {
+	if e == nil {
+		return
+	}
+	e.usageMu.Lock()
+	q := e.usageQ
+	e.usageMu.Unlock()
+	if q == nil {
+		return
+	}
+	done := make(chan struct{})
+	q <- usageActivityWrite{done: done}
+	<-done
 }
 
 // actEmitter is a per-run FIFO between the run's emit calls and the persist+
@@ -885,17 +912,28 @@ func (e *Engine) emitActivitiesBatch(t *Task, items []db.Activity) {
 		}
 		return
 	}
+	now := time.Now()
 	wakeSched := false
+	wakeNotify := false
 	for i, r := range persistable {
 		r.ID = ids[i]
+		if r.CreatedAt.IsZero() {
+			r.CreatedAt = now
+		}
 		e.bc.Publish(t.ID, r)
 		if r.Kind == "tool_result" {
 			wakeSched = true
+			if r.Tool == "report_finding" {
+				wakeNotify = true
+			}
 		}
 	}
 	e.touch(t.ID)
 	if wakeSched {
 		e.m.wakeScheduler()
+	}
+	if wakeNotify {
+		e.m.wakeNotifier()
 	}
 }
 
@@ -908,12 +946,16 @@ func (e *Engine) emitActivity(t *Task, r db.Activity) db.Activity {
 	// rows degrades gracefully instead of stalling the turn).
 	if r.Kind == "usage" {
 		select {
-		case e.usageWriteQueue() <- usageActivityWrite{t, r}:
+		case e.usageWriteQueue() <- usageActivityWrite{t: t, r: r}:
 		default:
 			log.Printf("[activity] task %s usage write queue full; dropping usage row", t.ID)
 		}
 		return r
 	}
+	return e.emitActivitySync(t, r)
+}
+
+func (e *Engine) emitActivitySync(t *Task, r db.Activity) db.Activity {
 	id, err := e.appendActivity(t, r)
 	if err != nil {
 		// NO LONGER SILENT: dropping a record breaks command↔result pairing in the
@@ -968,6 +1010,9 @@ func (e *Engine) emitActivity(t *Task, r db.Activity) db.Activity {
 	// an immediate step instead of waiting out the 30s tick.
 	if r.Kind == "tool_result" {
 		e.m.wakeScheduler()
+		if r.Tool == "report_finding" {
+			e.m.wakeNotifier()
+		}
 	}
 	return r
 }

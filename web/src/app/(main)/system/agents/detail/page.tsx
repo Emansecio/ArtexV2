@@ -32,7 +32,7 @@ function AgentDetailInner() {
         </div>
       </div>
       <div className="flex min-h-0 flex-1 flex-col rounded-lg border">
-        <AgentEditor agentKey={key} />
+        <AgentEditor key={key} agentKey={key} />
       </div>
     </div>
   );

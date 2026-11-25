@@ -231,7 +231,7 @@ func (t *snapTable) convertLocked(cost int64) bool {
 	t.entries--
 	t.bytes -= victim.cost
 	t.tombs++
-	*victim = reqSnap{done: victim.done, rules: victim.rules, host: victim.host, tomb: true, reason: reasonOriginalUnavailable, ruleIDs: ids}
+	*victim = reqSnap{done: victim.done, rules: victim.rules, hooks: victim.hooks, host: victim.host, tomb: true, reason: reasonOriginalUnavailable, ruleIDs: ids}
 	t.conversions.Add(1)
 	log.Printf("[traffic] rewrite snapshot of a request to %s (rules %v) released under pressure: its exchange will be recorded as original request unavailable", victim.host, ids)
 	return true
@@ -248,7 +248,7 @@ func (t *snapTable) refuseLocked(k flowKey, e *reqSnap) {
 	if full {
 		t.tombDrops.Add(1)
 	} else {
-		t.slots[k] = &reqSnap{done: e.done, rules: e.rules, host: e.host, tomb: true, reason: reasonSnapshotCapacity}
+		t.slots[k] = &reqSnap{done: e.done, rules: e.rules, hooks: e.hooks, host: e.host, tomb: true, reason: reasonSnapshotCapacity}
 		t.tombs++
 	}
 	if now := t.now(); now.Sub(t.lastFullLog) >= time.Minute {

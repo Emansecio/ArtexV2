@@ -94,7 +94,11 @@ WHERE exploration_id=$1 AND id = ANY($2::bigint[])`, s.expID, clears); err != ni
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.db.BumpGraphVersion()
+	return nil
 }
 
 // ContentVersions returns id → content_version for all nodes (§5.3 signature).
@@ -155,7 +159,11 @@ ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, id, RelC
 			return 0, err
 		}
 	}
-	return id, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.db.BumpGraphVersion()
+	return id, nil
 }
 
 // CoveredMembers maps member id → covering digest id, for ACTIVE digests only
@@ -229,7 +237,11 @@ func (s *ExplorationStore) SupersedeDigests(ids []int64) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.db.BumpGraphVersion()
+	return nil
 }
 
 // NodeAssets maps each of the given node ids → the asset ids it is anchored to

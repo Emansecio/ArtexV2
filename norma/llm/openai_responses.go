@@ -68,7 +68,7 @@ func (p *openaiResponsesProvider) buildBody(req CompletionRequest, stream bool) 
 	body := orReq{
 		Model:           p.cfg.Model,
 		Instructions:    joinSystem(req.System),
-		Input:           toResponsesInput(req.Messages),
+		Input:           toResponsesInput(PairToolBlocks(req.Messages)),
 		MaxOutputTokens: req.MaxTokens,
 		Temperature:     req.Temperature,
 		Stream:          stream,
@@ -78,14 +78,22 @@ func (p *openaiResponsesProvider) buildBody(req CompletionRequest, stream bool) 
 		body.PromptCacheKey = req.PromptCacheKey
 		body.PromptCacheRetention = p.cfg.PromptCacheRetention
 	}
-	// reasoning.effort is the Responses equivalent of reasoning_effort. A
-	// per-request "disabled" (compaction's summary call) suppresses it; otherwise
-	// req.ReasoningEffort overrides Config.ReasoningEffort when set.
+	// Effective thinking mode: a non-empty per-request override (req.Thinking)
+	// wins over Config.ThinkingType. reasoning.effort is the Responses equivalent
+	// of reasoning_effort; thinkingType == "disabled" suppresses it, and a
+	// per-request req.ReasoningEffort override only applies when reasoning or
+	// thinking is active for the profile.
+	thinkingType := p.cfg.ThinkingType
+	if req.Thinking != "" {
+		thinkingType = req.Thinking
+	}
 	effort := p.cfg.ReasoningEffort
-	if req.ReasoningEffort != "" {
+	reasoningActive := (p.cfg.ReasoningEffort != "" && p.cfg.ReasoningEffort != "none") ||
+		(thinkingType != "" && thinkingType != "disabled")
+	if req.ReasoningEffort != "" && reasoningActive {
 		effort = req.ReasoningEffort
 	}
-	if req.Thinking != "disabled" && effort != "" && effort != "none" {
+	if thinkingType != "disabled" && effort != "" && effort != "none" {
 		body.Reasoning = &orReasoning{Effort: effort}
 	}
 	var tools []orTool
@@ -136,7 +144,11 @@ func toResponsesInput(msgs []Message) []orInputItem {
 				out = append(out, orInputItem{Type: "function_call", CallID: b.ID, Name: b.Name, Arguments: args})
 			case BlockToolResult:
 				flushText()
-				out = append(out, orInputItem{Type: "function_call_output", CallID: b.ToolUseID, Output: flattenText(b.Content)})
+				output := flattenText(b.Content)
+				if output == "" {
+					output = "(no output)"
+				}
+				out = append(out, orInputItem{Type: "function_call_output", CallID: b.ToolUseID, Output: output})
 			}
 		}
 		flushText()
@@ -218,6 +230,12 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 			IncompleteDetails *struct {
 				Reason string `json:"reason"`
 			} `json:"incomplete_details"`
+			Output []struct {
+				Type string `json:"type"`
+			} `json:"output"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
 			Usage *orUsage `json:"usage"`
 		} `json:"response"`
 		Error *struct {
@@ -250,12 +268,14 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 		}
 	case "response.function_call_arguments.done":
 		return StreamEvent{Type: SEToolUseStop, ToolIndex: f.OutputIndex}, true, nil
-	case "response.output_item.done":
-		if f.Item.Type == "function_call" {
-			return StreamEvent{Type: SEToolUseStop, ToolIndex: f.OutputIndex}, true, nil
-		}
 	case "response.completed", "response.incomplete":
 		ev := StreamEvent{Type: SEMessageDelta, StopReason: "end_turn"}
+		for _, item := range f.Response.Output {
+			if item.Type == "function_call" {
+				ev.StopReason = "tool_use"
+				break
+			}
+		}
 		if f.Response.IncompleteDetails != nil && f.Response.IncompleteDetails.Reason == "max_output_tokens" {
 			ev.StopReason = "max_tokens"
 		}
@@ -265,8 +285,10 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 		return ev, true, nil
 	case "response.failed", "error":
 		msg := "stream error"
-		if f.Error != nil {
+		if f.Error != nil && f.Error.Message != "" {
 			msg = f.Error.Message
+		} else if f.Response.Error != nil && f.Response.Error.Message != "" {
+			msg = f.Response.Error.Message
 		}
 		return StreamEvent{}, false, fmt.Errorf("openai-responses: %s", msg)
 	}
@@ -382,8 +404,8 @@ func parseResponsesResponse(raw []byte) (Message, string, Usage, error) {
 				blocks = append(blocks, ContentBlock{Type: BlockThinking, Thinking: think.String()})
 			}
 		case "function_call":
-			args := item.Arguments
-			if strings.TrimSpace(args) == "" {
+			args := strings.TrimSpace(item.Arguments)
+			if args == "" || !json.Valid([]byte(args)) {
 				args = "{}"
 			}
 			blocks = append(blocks, ContentBlock{Type: BlockToolUse, ID: item.CallID, Name: item.Name, Input: []byte(args)})

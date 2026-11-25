@@ -396,7 +396,18 @@ function TaskDetailInner() {
   }, [id]);
 
   const taskLoadInFlight = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    setTask(null);
+    setLoaded(false);
+    setPaused(false);
+    setInterceptPendingCount(0);
+    taskLoadInFlight.current = null;
+  }, [id]);
   const load = React.useCallback(() => {
+    if (!id) {
+      setLoaded(true);
+      return Promise.resolve();
+    }
     if (taskLoadInFlight.current === id) return Promise.resolve();
     taskLoadInFlight.current = id;
     return Promise.all([api.task(id), api.stats(id).catch(() => null)])

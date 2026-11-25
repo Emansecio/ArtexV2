@@ -126,6 +126,7 @@ VALUES(?,?,?,?,?,?,?)`,
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing: %w", err)
 	}
+	t.exchangeCount.Add(1)
 	return nil
 }
 

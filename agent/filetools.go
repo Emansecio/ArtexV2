@@ -88,7 +88,12 @@ var (
 	errOutsideWorkDir = errors.New("outside the working directory")
 	errNotRegular     = errors.New("not a regular file")
 	errHardLinked     = errors.New("the file has other hard links, which can lead outside the working directory")
+	errFileTooLarge   = errors.New("file exceeds maximum readable size")
 )
+
+// confinedMaxReadBytes caps the size of a file read into memory by the confined
+// Read and Grep tools so a large scan dump or capture cannot OOM the server.
+const confinedMaxReadBytes = 32 << 20
 
 // openWorkRoot opens dir, which must lie strictly below base. base is set by the
 // server and resolved as is; below it every component is opened inside its parent
@@ -175,6 +180,8 @@ func (w *workRoot) readFile(rel string) ([]byte, error) {
 		return nil, err
 	} else if !fi.Mode().IsRegular() {
 		return nil, errNotRegular
+	} else if fi.Size() > confinedMaxReadBytes {
+		return nil, fmt.Errorf("%w (%d bytes, max %d)", errFileTooLarge, fi.Size(), confinedMaxReadBytes)
 	}
 	f, err := w.Open(rel)
 	if err != nil {
@@ -184,7 +191,14 @@ func (w *workRoot) readFile(rel string) ([]byte, error) {
 	if err := checkOpened(f); err != nil {
 		return nil, err
 	}
-	return io.ReadAll(f)
+	data, err := io.ReadAll(io.LimitReader(f, confinedMaxReadBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > confinedMaxReadBytes {
+		return nil, fmt.Errorf("%w (max %d bytes)", errFileTooLarge, confinedMaxReadBytes)
+	}
+	return data, nil
 }
 
 // writeFile replaces the contents of rel, creating it when missing. The checks run

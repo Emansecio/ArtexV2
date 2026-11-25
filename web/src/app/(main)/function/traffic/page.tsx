@@ -356,7 +356,11 @@ export default function TrafficPage() {
       })
       .catch((e) => {
         // Keep the confirmation open so the user can retry a failed deletion.
-        if (mode === "all") toast.error(t("Purge failed: {error}", { error: (e as Error).message }));
+        toast.error(
+          mode === "all"
+            ? t("Purge failed: {error}", { error: (e as Error).message })
+            : t("Delete failed: {error}", { error: (e as Error).message }),
+        );
       })
       .finally(() => setDeleting(false));
   };

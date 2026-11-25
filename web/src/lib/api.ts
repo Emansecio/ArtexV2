@@ -144,6 +144,7 @@ export class ApiError extends Error {
 const inflightGets = new Map<string, Promise<unknown>>();
 const ETAG_CACHE_MAX = 64;
 const etagCache = new Map<string, { etag: string; data: unknown }>();
+let mutationEpoch = 0;
 
 function setEtagEntry(path: string, etag: string, data: unknown) {
   if (etagCache.has(path)) etagCache.delete(path);
@@ -160,64 +161,78 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   }
   const method = (init?.method ?? "GET").toUpperCase();
-  if (method !== "GET" && method !== "HEAD") {
+  const isMutation = method !== "GET" && method !== "HEAD";
+  if (isMutation) {
+    mutationEpoch++;
     etagCache.clear();
+    inflightGets.clear();
   }
   const canDedupe = method === "GET" && !init?.signal && !init?.body && !init?.headers;
   if (canDedupe) {
     const existing = inflightGets.get(path);
     if (existing) return existing as Promise<T>;
   }
+  const reqEpoch = mutationEpoch;
   const reqPromise = (async () => {
-    const token = getToken();
-    const cached = canDedupe ? etagCache.get(path) : undefined;
-    const r = await fetch(`/api${path}`, {
-      ...init,
-      headers: {
-        ...(init?.body ? { "Content-Type": "application/json" } : {}),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...(cached ? { "If-None-Match": cached.etag } : {}),
-        ...(init?.headers as Record<string, string> | undefined),
-      },
-    });
-    if (r.status === 304 && cached) {
-      return cached.data as T;
-    }
-    if (r.status === 401) {
-      if (typeof window !== "undefined") {
-        localStorage.removeItem("artex_token");
-        document.cookie = "artex_token=; path=/; max-age=0";
-        window.location.href = "/welcome";
+    try {
+      const token = getToken();
+      const cached = canDedupe ? etagCache.get(path) : undefined;
+      const r = await fetch(`/api${path}`, {
+        ...init,
+        headers: {
+          ...(init?.body ? { "Content-Type": "application/json" } : {}),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(cached ? { "If-None-Match": cached.etag } : {}),
+          ...(init?.headers as Record<string, string> | undefined),
+        },
+      });
+      if (r.status === 304 && cached) {
+        return cached.data as T;
       }
-      throw new Error(t("Unauthorized"));
-    }
-    if (!r.ok) {
-      const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
-      let message = fallback;
-      try {
-        const payload = (await r.json()) as { error?: unknown };
-        if (typeof payload.error === "string" && payload.error.trim()) {
-          message = payload.error.trim();
+      if (r.status === 401 && !path.startsWith("/auth/")) {
+        if (typeof window !== "undefined") {
+          localStorage.removeItem("artex_token");
+          document.cookie = "artex_token=; path=/; max-age=0";
+          window.location.href = "/welcome";
         }
-      } catch {
-        // Keep the status-based fallback for empty or non-JSON error responses.
+        throw new Error(t("Unauthorized"));
       }
-      throw new ApiError(message, r.status);
+      if (!r.ok) {
+        const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
+        let message = fallback;
+        try {
+          const payload = (await r.json()) as { error?: unknown };
+          if (typeof payload.error === "string" && payload.error.trim()) {
+            message = payload.error.trim();
+          }
+        } catch {
+          // Keep the status-based fallback for empty or non-JSON error responses.
+        }
+        throw new ApiError(message, r.status);
+      }
+      if (r.status === 204) return undefined as T;
+      const data = (await r.json()) as T;
+      if (canDedupe && reqEpoch === mutationEpoch) {
+        const etag = r.headers.get("ETag");
+        if (etag) setEtagEntry(path, etag, data);
+      }
+      return data;
+    } finally {
+      if (isMutation) {
+        mutationEpoch++;
+        etagCache.clear();
+        inflightGets.clear();
+      }
     }
-    if (r.status === 204) return undefined as T;
-    const data = (await r.json()) as T;
-    if (canDedupe) {
-      const etag = r.headers.get("ETag");
-      if (etag) setEtagEntry(path, etag, data);
-    }
-    return data;
   })();
   if (!canDedupe) return reqPromise;
   inflightGets.set(path, reqPromise);
   try {
     return await reqPromise;
   } finally {
-    inflightGets.delete(path);
+    if (inflightGets.get(path) === reqPromise) {
+      inflightGets.delete(path);
+    }
   }
 }
 
@@ -319,7 +334,17 @@ export const api = {
   health: () => get<{ ok: boolean; service: string; version: string; latest_version?: string }>("/health"),
 
   // ---- auth ----
+  authStatus: () => get<{ initialized: boolean }>("/auth/status"),
+  login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
+  authInit: (password: string, setupToken: string) =>
+    post<{ token: string }>("/auth/init", { password, setup_token: setupToken }),
   localLogin: () => post<{ token: string }>("/auth/local", {}),
+
+  // ---- logs ----
+  logsHistory: (before?: number, limit = 200) => {
+    const qs = before && before > 0 ? `?before=${before}&limit=${limit}` : `?limit=${limit}`;
+    return get<{ items: { seq?: number; db_id?: number; ts: string; level: "info" | "warn" | "error"; tag: string; text: string }[]; has_more: boolean }>(`/logs/history${qs}`);
+  },
 
   // ---- tasks ----
   tasks: () =>

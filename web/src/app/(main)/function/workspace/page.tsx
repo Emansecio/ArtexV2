@@ -76,18 +76,26 @@ export default function WorkspacePage() {
   const [mkdirOpen, setMkdirOpen] = React.useState(false);
   const [mkdirName, setMkdirName] = React.useState("");
   const uploadRef = React.useRef<HTMLInputElement>(null);
+  const loadSeqRef = React.useRef(0);
 
   const load = React.useCallback(
     (p: string) => {
+      const seq = ++loadSeqRef.current;
       setLoading(true);
       api
         .workspaceList(p)
         .then((r) => {
+          if (loadSeqRef.current !== seq) return;
           setEntries(r.entries);
           setPath(r.path);
         })
-        .catch((e) => toast.error(t("Failed to read directory: {error}", { error: (e as Error).message })))
-        .finally(() => setLoading(false));
+        .catch((e) => {
+          if (loadSeqRef.current !== seq) return;
+          toast.error(t("Failed to read directory: {error}", { error: (e as Error).message }));
+        })
+        .finally(() => {
+          if (loadSeqRef.current === seq) setLoading(false);
+        });
     },
     [],
   );
@@ -116,17 +124,26 @@ export default function WorkspacePage() {
 
   const saveFile = () => {
     if (!edit) return;
-    setEdit({ ...edit, saving: true });
+    const savedPath = edit.file.path;
+    const savedContent = edit.content;
+    setEdit((cur) => (cur && cur.file.path === savedPath ? { ...cur, saving: true } : cur));
     api
-      .workspaceWrite(edit.file.path, edit.content)
+      .workspaceWrite(savedPath, savedContent)
       .then(() => {
         toast.success(t("Saved"));
-        setEdit((cur) => (cur ? { ...cur, dirty: false, saving: false } : cur));
+        setEdit((cur) => {
+          if (!cur || cur.file.path !== savedPath) return cur;
+          return {
+            ...cur,
+            dirty: cur.content === savedContent ? false : cur.dirty,
+            saving: false,
+          };
+        });
         load(path);
       })
       .catch((err) => {
         toast.error(t("Save failed: {error}", { error: (err as Error).message }));
-        setEdit((cur) => (cur ? { ...cur, saving: false } : cur));
+        setEdit((cur) => (cur && cur.file.path === savedPath ? { ...cur, saving: false } : cur));
       });
   };
 

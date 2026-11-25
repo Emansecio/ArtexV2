@@ -588,6 +588,9 @@ func (t *Traffic) Start() error { return t.proxy.Start() }
 // it holds a whole minutes-long budget, and finishing it is never worth delaying
 // shutdown for — the next deletion resumes it.
 func (t *Traffic) Close() error {
+	if t.proxy != nil {
+		_ = t.proxy.Close()
+	}
 	if t.closed != nil {
 		t.closeOnce.Do(func() { close(t.closed) })
 	}
@@ -917,7 +920,10 @@ func logBatchFail(items []preparedRecord, step string, err error) {
 }
 
 // writeBatch writes one batch of exchanges in a single SQLite transaction under
-// wmu (serializing blob spills + index writes against DeleteHost and gcBlobs).
+// wmu. Blob spills happen under wmu together with blob_refs insertion so
+// DeleteHost/gcBlobs can never remove a newly spilled blob before its ref is
+// committed. If the batch transaction fails, falls back to item-by-item inserts
+// so 1 bad row never drops the rest of the batch.
 func (t *Traffic) writeBatch(batch []pendingRecord) {
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
@@ -932,26 +938,62 @@ func (t *Traffic) writeBatch(batch []pendingRecord) {
 		logBatchFail(items, "beginning transaction", err)
 		return
 	}
-	defer tx.Rollback() //nolint:errcheck // no-op once committed
-
+	batchOK := true
 	for _, item := range items {
 		if step, err := t.insertPreparedRecord(tx, item); err != nil {
-			logBatchFail([]preparedRecord{item}, step, err)
-			return
+			_ = tx.Rollback()
+			batchOK = false
+			if len(items) == 1 {
+				logBatchFail([]preparedRecord{item}, step, err)
+				return
+			}
+			break
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		logBatchFail(items, "committing", err)
-		return
+	if batchOK {
+		if err := tx.Commit(); err == nil {
+			t.exchangeCount.Add(int64(len(items)))
+			return
+		}
+		_ = tx.Rollback()
 	}
-	t.exchangeCount.Add(int64(len(items)))
+
+	// Fallback: commit each valid item individually so one bad record never drops siblings.
+	var okCount int64
+	for _, item := range items {
+		itx, err := t.db.Begin()
+		if err != nil {
+			logBatchFail([]preparedRecord{item}, "beginning transaction", err)
+			continue
+		}
+		if step, err := t.insertPreparedRecord(itx, item); err != nil {
+			_ = itx.Rollback()
+			logBatchFail([]preparedRecord{item}, step, err)
+			continue
+		}
+		if err := itx.Commit(); err != nil {
+			_ = itx.Rollback()
+			logBatchFail([]preparedRecord{item}, "committing", err)
+			continue
+		}
+		okCount++
+	}
+	if okCount > 0 {
+		t.exchangeCount.Add(okCount)
+	}
 }
 
 func (t *Traffic) insertPreparedRecord(tx *sql.Tx, it preparedRecord) (string, error) {
-	// An id can repeat (seconds plus a rolling counter); the trace of the
-	// exchange it replaces must not stay attached to this one.
+	// An id can repeat (seconds plus a rolling counter); clear any prior rewrite
+	// trace and orphaned FTS5 row before INSERT OR REPLACE assigns a new rowid.
 	if _, err := tx.Exec(`DELETE FROM exchange_rewrites WHERE exchange_id=?`, it.id); err != nil {
 		return "clearing rewrite trace", err
+	}
+	if t.fts {
+		var oldRowID int64
+		if err := tx.QueryRow(`SELECT rowid FROM exchanges WHERE id=?`, it.id).Scan(&oldRowID); err == nil {
+			_, _ = tx.Exec(`DELETE FROM ex_fts WHERE rowid=?`, oldRowID)
+		}
 	}
 	// path stays empty for db-resident exchanges; a non-empty path marks a legacy
 	// row whose bodies still live in the old on-disk tree (see Get).
@@ -981,8 +1023,10 @@ VALUES(?,?,?,?,?,?,?)`,
 	}
 	if err := writeTrace(tx, it.id, it.lines, it.trace); err != nil {
 		var re *recordError
-		errors.As(err, &re)
-		return re.step, re.err
+		if errors.As(err, &re) && re != nil {
+			return re.step, re.err
+		}
+		return "writing rewrite trace", err
 	}
 	if t.fts {
 		// The index is fed from memory, so a body that spilled to _blobs is still
@@ -1048,7 +1092,7 @@ func (t *Traffic) spillAt(body []byte, contentType string, maxInline int) stored
 		if !text {
 			return ""
 		}
-		return string(clipBytes(body, maxIndexBody))
+		return collapseIndexRuns(clipBytes(body, maxIndexBody))
 	}
 	if len(body) <= maxInline {
 		return storedBody{inline: body, index: indexText()}
@@ -1065,8 +1109,23 @@ func (t *Traffic) spillAt(body []byte, contentType string, maxInline int) stored
 	}
 	blobPath := filepath.Join(blobDir, h+".bin")
 	if _, err := os.Stat(blobPath); os.IsNotExist(err) {
-		if err := os.WriteFile(blobPath, body, 0o644); err != nil {
-			log.Printf("[traffic] failed to write blob %s: %v", h, err)
+		// Atomic temp-file + rename so concurrent readers or crashes never see a truncated blob.
+		tmp, err := os.CreateTemp(blobDir, ".blob-*")
+		if err != nil {
+			log.Printf("[traffic] failed to create temp blob %s: %v", h, err)
+			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
+		}
+		tmpName := tmp.Name()
+		_, werr := tmp.Write(body)
+		cerr := tmp.Close()
+		if werr != nil || cerr != nil {
+			_ = os.Remove(tmpName)
+			log.Printf("[traffic] failed to write blob %s: %v", h, firstErr(werr, cerr))
+			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
+		}
+		if err := os.Rename(tmpName, blobPath); err != nil {
+			_ = os.Remove(tmpName)
+			log.Printf("[traffic] failed to rename blob %s: %v", h, err)
 			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
 		}
 	}
@@ -1077,6 +1136,42 @@ func (t *Traffic) spillAt(body []byte, contentType string, maxInline int) stored
 		sb.inline = []byte(binaryTag(contentType, body))
 	}
 	return sb
+}
+
+func firstErr(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// collapseIndexRuns caps consecutive identical bytes at 256 when feeding SQLite
+// FTS5 trigram indexing. Real search terms up to 256 repeated characters still
+// match, while pathological multi-megabyte repeated-byte blobs (e.g. padding or
+// 2 MiB of 'A') avoid O(N^2) trigram poslist intersection stalls.
+func collapseIndexRuns(b []byte) string {
+	if len(b) <= 256 {
+		return string(b)
+	}
+	const maxRun = 256
+	out := make([]byte, 0, len(b))
+	var prev byte
+	run := 0
+	for i, c := range b {
+		if i > 0 && c == prev {
+			run++
+			if run >= maxRun {
+				continue
+			}
+		} else {
+			prev = c
+			run = 0
+		}
+		out = append(out, c)
+	}
+	return string(out)
 }
 
 // binaryTypes are content-type prefixes whose bodies are never worth indexing or
@@ -1654,7 +1749,7 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
-	n, err := t.deleteWhere(tx, `host LIKE ?`, like)
+	n, rawN, err := t.deleteWhere(tx, `host LIKE ?`, like)
 	if err != nil {
 		return 0, err
 	}
@@ -1674,7 +1769,7 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 		}
 	}
 	t.reapStage(stageDir)
-	if n > 0 {
+	if n > 0 || rawN > 0 {
 		t.reclaim()
 		if err := t.gcBlobs(); err != nil {
 			return n, err
@@ -1711,7 +1806,7 @@ func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
 		return 0, 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
-	if deleted, err = t.deleteWhere(tx, `1=1`); err != nil {
+	if deleted, _, err = t.deleteWhere(tx, `1=1`); err != nil {
 		return 0, 0, err
 	}
 	// Staged before the commit so a filesystem failure can still abort the whole
@@ -1798,31 +1893,51 @@ func (t *Traffic) compactIndex() error {
 // deleteWhere removes every trace of the exchanges matching the condition:
 // full-text index rows, bodies, blob references, and finally the index rows.
 // Order matters — each sub-select reads exchanges, so that table is emptied last.
-func (t *Traffic) deleteWhere(tx *sql.Tx, where string, args ...any) (int64, error) {
+func (t *Traffic) deleteWhere(tx *sql.Tx, where string, args ...any) (int64, int64, error) {
 	if t.fts {
 		// ex_fts is contentless and addressed by rowid, hence the rowid sub-select.
 		if _, err := tx.Exec(`DELETE FROM ex_fts WHERE rowid IN (SELECT rowid FROM exchanges WHERE `+where+`)`, args...); err != nil {
-			return 0, fmt.Errorf("delete full-text index: %w", err)
+			return 0, 0, fmt.Errorf("delete full-text index: %w", err)
 		}
 	}
 	if _, err := tx.Exec(`DELETE FROM exchange_bodies WHERE id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
-		return 0, fmt.Errorf("delete bodies: %w", err)
+		return 0, 0, fmt.Errorf("delete bodies: %w", err)
 	}
 	if _, err := tx.Exec(`DELETE FROM stream_messages WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
-		return 0, fmt.Errorf("delete stream messages: %w", err)
+		return 0, 0, fmt.Errorf("delete stream messages: %w", err)
 	}
 	if _, err := tx.Exec(`DELETE FROM exchange_rewrites WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
-		return 0, fmt.Errorf("delete rewrite trace: %w", err)
+		return 0, 0, fmt.Errorf("delete rewrite trace: %w", err)
 	}
 	if _, err := tx.Exec(`DELETE FROM blob_refs WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
-		return 0, fmt.Errorf("delete blob references: %w", err)
+		return 0, 0, fmt.Errorf("delete blob references: %w", err)
 	}
 	res, err := tx.Exec(`DELETE FROM exchanges WHERE `+where, args...)
 	if err != nil {
-		return 0, fmt.Errorf("delete index rows: %w", err)
+		return 0, 0, fmt.Errorf("delete index rows: %w", err)
 	}
 	n, _ := res.RowsAffected()
-	return n, nil
+
+	var rawDeleted int64
+	if _, err := tx.Exec(`DELETE FROM blob_refs WHERE exchange_id IN (SELECT id FROM raw_tcp_streams WHERE `+where+`)`, args...); err != nil {
+		return 0, 0, fmt.Errorf("delete raw tcp blob references: %w", err)
+	}
+	if tcpRes, err := tx.Exec(`DELETE FROM raw_tcp_streams WHERE `+where, args...); err != nil {
+		return 0, 0, fmt.Errorf("delete raw tcp streams: %w", err)
+	} else {
+		rn, _ := tcpRes.RowsAffected()
+		rawDeleted += rn
+	}
+	if _, err := tx.Exec(`DELETE FROM blob_refs WHERE exchange_id IN (SELECT id FROM raw_udp_datagrams WHERE `+where+`)`, args...); err != nil {
+		return 0, 0, fmt.Errorf("delete raw udp blob references: %w", err)
+	}
+	if udpRes, err := tx.Exec(`DELETE FROM raw_udp_datagrams WHERE `+where, args...); err != nil {
+		return 0, 0, fmt.Errorf("delete raw udp datagrams: %w", err)
+	} else {
+		rn, _ := udpRes.RowsAffected()
+		rawDeleted += rn
+	}
+	return n, rawDeleted, nil
 }
 
 // hostTrees returns the on-disk directory of every host matching the condition.
@@ -2086,7 +2201,7 @@ func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64)
 	}
 	stage.tx = tx
 	for _, h := range unique {
-		n, err := t.deleteWhere(tx, `host=?`, h)
+		n, _, err := t.deleteWhere(tx, `host=?`, h)
 		if err != nil {
 			return fail(err)
 		}
@@ -2223,12 +2338,23 @@ func (t *Traffic) deleteArchivedHosts(hosts []string) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	var total int64
 	for _, host := range hosts {
-		if _, err := t.deleteWhere(tx, `host=?`, host); err != nil {
+		n, _, err := t.deleteWhere(tx, `host=?`, host)
+		if err != nil {
 			return err
 		}
+		total += n
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if total > 0 {
+		if t.exchangeCount.Add(-total) < 0 {
+			t.exchangeCount.Store(0)
+		}
+	}
+	return nil
 }
 
 func pathWithin(root, candidate string) bool {
@@ -2283,6 +2409,11 @@ func (s *HostDeleteStage) Commit() error {
 		s.done = true
 		s.traffic.wmu.Unlock()
 		return errors.Join(fmt.Errorf("commit traffic index deletion: %w", err), restoreErr)
+	}
+	if s.deleted > 0 {
+		if s.traffic.exchangeCount.Add(-s.deleted) < 0 {
+			s.traffic.exchangeCount.Store(0)
+		}
 	}
 	// Unlinking the staged trees is what used to hold the write lock for hours;
 	// it now runs in the background, while collection below only needs them to be
@@ -2432,6 +2563,7 @@ func (t *Traffic) reclaimChunk(ctx context.Context, conn *sql.Conn, merges *int)
 // affected entries. Callers must hold wmu so this never races a concurrent
 // record() writing a fresh blob + reference.
 func (t *Traffic) gcBlobs() error {
+	globalTrafficBlobCache.clearPrefix(t.dir + ":")
 	refs := make(map[string]struct{})
 	rows, err := t.db.Query(`SELECT DISTINCT hash FROM blob_refs`)
 	if err != nil {
@@ -2465,7 +2597,11 @@ func (t *Traffic) gcBlobs() error {
 			}
 			return nil
 		}
-		h := strings.TrimSuffix(d.Name(), ".bin")
+		name := d.Name()
+		if strings.HasPrefix(name, ".blob-") || strings.HasSuffix(name, ".tmp") {
+			return nil
+		}
+		h := strings.TrimSuffix(name, ".bin")
 		if _, ok := refs[h]; !ok {
 			os.Remove(p)
 		}
@@ -2742,7 +2878,7 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			if a.Length <= 0 || a.Length > maxBlobRead {
 				a.Length = maxBlobRead
 			}
-			blobKey := fmt.Sprintf("%s:%d:%d", a.Hash, a.Offset, a.Length)
+			blobKey := fmt.Sprintf("%s:%s:%d:%d", t.dir, a.Hash, a.Offset, a.Length)
 			if cached, ok := globalTrafficBlobCache.get(blobKey); ok {
 				return actool.Text(cached), nil
 			}

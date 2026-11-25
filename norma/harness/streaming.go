@@ -17,6 +17,7 @@ import (
 type streamExec struct {
 	l        *loop
 	toolCtx  context.Context
+	cancel   context.CancelFunc
 	settling bool
 	mu       sync.Mutex
 	tools    []*tracked
@@ -42,7 +43,14 @@ type tracked struct {
 }
 
 func newStreamExec(l *loop) *streamExec {
-	return &streamExec{l: l, toolCtx: l.toolCtx, settling: l.settling, notify: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(l.toolCtx)
+	return &streamExec{l: l, toolCtx: ctx, cancel: cancel, settling: l.settling, notify: make(chan struct{}, 1)}
+}
+
+func (e *streamExec) close() {
+	if e != nil && e.cancel != nil {
+		e.cancel()
+	}
 }
 
 func (e *streamExec) ping() {
@@ -98,8 +106,15 @@ func (e *streamExec) processQueue() {
 }
 
 func (e *streamExec) run(t *tracked) {
-	e.l.sem <- struct{}{} // bound concurrent tool execution
+	select {
+	case e.l.sem <- struct{}{}: // bound concurrent tool execution
+	case <-e.toolCtx.Done():
+		return
+	}
 	defer func() { <-e.l.sem }()
+	if e.toolCtx.Err() != nil {
+		return
+	}
 	res, extra := e.l.execOneWithCtx(e.toolCtx, t.block, e.settling, func(p tool.ProgressInfo) {
 		e.mu.Lock()
 		t.prog = append(t.prog, p.Message)
@@ -107,10 +122,16 @@ func (e *streamExec) run(t *tracked) {
 		e.ping()
 	})
 	e.mu.Lock()
-	t.result = res
-	t.extra = extra
-	t.status = stCompleted
+	alreadyYielded := t.status == stYielded
+	if !alreadyYielded {
+		t.result = res
+		t.extra = extra
+		t.status = stCompleted
+	}
 	e.mu.Unlock()
+	if alreadyYielded {
+		return
+	}
 	e.ping()
 	e.processQueue() // a slot freed
 }

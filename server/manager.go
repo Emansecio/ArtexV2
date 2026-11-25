@@ -306,6 +306,10 @@ type Manager struct {
 	// events it tracks (terminal task status, findings, met goals, tool calls,
 	// task creates) call wakeScheduler so they fire in ms, not next 30s tick.
 	schedWake func()
+
+	// notifyWake nudges the vulnerability push delivery engine into an immediate
+	// step when a finding notification event is queued.
+	notifyWake func()
 }
 
 // Settings keys the UI toggles at runtime.
@@ -2118,6 +2122,12 @@ func (t *Task) drainTriggers() []agent.TriggerEvent {
 func (m *Manager) wakeScheduler() {
 	if m != nil && m.schedWake != nil {
 		m.schedWake()
+	}
+}
+
+func (m *Manager) wakeNotifier() {
+	if m != nil && m.notifyWake != nil {
+		m.notifyWake()
 	}
 }
 

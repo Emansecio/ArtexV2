@@ -134,12 +134,20 @@ func TestThinkingParamsOpenAI(t *testing.T) {
 	// inspects the request body).
 	stub := sse(`data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}`, ``, `data: [DONE]`, ``)
 	// set → fields present
-	m := captureBody(t, Config{Format: FormatOpenAI, ThinkingType: "disabled", ReasoningEffort: "max"}, stub)
-	if th, _ := m["thinking"].(map[string]any); th["type"] != "disabled" {
+	m := captureBody(t, Config{Format: FormatOpenAI, ThinkingType: "enabled", ReasoningEffort: "max"}, stub)
+	if th, _ := m["thinking"].(map[string]any); th["type"] != "enabled" {
 		t.Fatalf("thinking=%v", m["thinking"])
 	}
 	if m["reasoning_effort"] != "max" {
 		t.Fatalf("reasoning_effort=%v", m["reasoning_effort"])
+	}
+	// thinking disabled → reasoning_effort suppressed
+	m = captureBody(t, Config{Format: FormatOpenAI, ThinkingType: "disabled", ReasoningEffort: "max"}, stub)
+	if th, _ := m["thinking"].(map[string]any); th["type"] != "disabled" {
+		t.Fatalf("thinking=%v", m["thinking"])
+	}
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Fatalf("reasoning_effort should be omitted when thinking is disabled: %v", m["reasoning_effort"])
 	}
 	// unset → both omitted
 	m = captureBody(t, Config{Format: FormatOpenAI}, stub)

@@ -411,21 +411,25 @@ export default function SkillsPage() {
   // Recent calls for the selected skill (detail panel only).
   React.useEffect(() => {
     if (!selected || selected.path !== null) { setUsageCalls([]); return; }
+    let active = true;
     const name = selected.skill;
     setUsageLoading(true);
     api.skillUsage(name, 20)
-      .then((calls) => setUsageCalls(calls))
-      .catch(() => setUsageCalls([]))
-      .finally(() => setUsageLoading(false));
+      .then((calls) => { if (active) setUsageCalls(calls); })
+      .catch(() => { if (active) setUsageCalls([]); })
+      .finally(() => { if (active) setUsageLoading(false); });
+    return () => { active = false; };
   }, [selected]);
 
   React.useEffect(() => {
     if (!selected || selected.path === null) { setFileContent(""); setDirty(false); return; }
+    let active = true;
     setFileLoading(true);
     api.readSkillFile(selected.skill, selected.path)
-      .then((c) => { setFileContent(c); setDirty(false); })
-      .catch(() => toast.error(t("Failed to read the file")))
-      .finally(() => setFileLoading(false));
+      .then((c) => { if (!active) return; setFileContent(c); setDirty(false); })
+      .catch(() => { if (active) toast.error(t("Failed to read the file")); })
+      .finally(() => { if (active) setFileLoading(false); });
+    return () => { active = false; };
   }, [selected]);
 
   // ── Expand helpers ────────────────────────────────────────────────────────

@@ -260,6 +260,7 @@ func (s *Server) notifyCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.notifier.Wake()
 	writeJSON(w, 200, map[string]any{"id": id})
 }
 
@@ -382,6 +383,7 @@ func (s *Server) notifyUpdateChannel(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
+		s.notifier.Wake()
 		writeJSON(w, 200, map[string]any{"id": id})
 		return
 	}
@@ -389,6 +391,7 @@ func (s *Server) notifyUpdateChannel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.notifier.Wake()
 	writeJSON(w, 200, map[string]any{"id": id})
 }
 
@@ -406,6 +409,7 @@ func (s *Server) notifyDeleteChannel(w http.ResponseWriter, r *http.Request) {
 		notifyChannelLookupErr(w, err)
 		return
 	}
+	s.notifier.Wake()
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -529,6 +533,7 @@ func (s *Server) notifyRetryDelivery(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	s.notifier.Wake()
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 

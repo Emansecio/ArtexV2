@@ -165,16 +165,39 @@ func (i *Interceptor) loadExemptions() (exemptions, error) {
 	return ex, nil
 }
 
+// nonPublicPrefixes lists reserved/special-purpose IP ranges that Go's
+// netip.Addr.IsPrivate/IsLoopback/IsLinkLocal/IsUnspecified do not cover.
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),       // "This network" (RFC 1122)
+	netip.MustParsePrefix("100.64.0.0/10"),   // CGNAT / Shared Address Space (RFC 6598)
+	netip.MustParsePrefix("192.0.0.0/24"),    // IETF Protocol Assignments (RFC 6890)
+	netip.MustParsePrefix("198.18.0.0/15"),   // Benchmarking (RFC 2544)
+	netip.MustParsePrefix("64:ff9b::/96"),    // NAT64 well-known prefix (RFC 6052)
+	netip.MustParsePrefix("64:ff9b:1::/48"),  // NAT64 local-use prefix (RFC 8215)
+	netip.MustParsePrefix("::ffff:0:0:0/96"), // IPv4-translated addresses (RFC 2765)
+	netip.MustParsePrefix("2001::/32"),       // Teredo tunneling (RFC 4380)
+	netip.MustParsePrefix("2002::/16"),       // 6to4 tunneling (RFC 3056)
+}
+
 // IsNonPublicAddr reports whether addr is private (RFC1918, fc00::/7 unique
 // local), loopback, link-local (including 169.254.169.254 and fe80::/10),
-// unspecified, multicast, or a known instance-metadata address.
+// unspecified, multicast, special-purpose (CGNAT, NAT64, 0/8, Teredo, 6to4),
+// or a known instance-metadata address.
 // Invalid addresses are treated as non-public (fail closed).
 func IsNonPublicAddr(addr netip.Addr) bool {
 	if !addr.IsValid() {
 		return true
 	}
 	addr = addr.Unmap().WithZone("")
-	return addr.IsPrivate() || ValidateExemptionHost(addr.String()) != nil
+	if addr.IsPrivate() || ValidateExemptionHost(addr.String()) != nil {
+		return true
+	}
+	for _, p := range nonPublicPrefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // voidsExemption reports whether one resolved address voids a stored

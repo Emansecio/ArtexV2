@@ -72,13 +72,15 @@ type Server struct {
 	authHashKey    string
 	authVersionKey string
 
-	// Test-only seams for pgListModels SSRF checks. All remain zero/nil in
-	// production (strict public-only default; only exact host:port entries in
-	// ARTEX_LLM_PRIVATE_ENDPOINTS may resolve to private addresses).
-	allowLoopbackModels bool
-	modelLookupIP       func(ctx context.Context, host string) ([]netip.Addr, error)
-	modelDialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
-	modelRootCAs        *x509.CertPool
+	// Test-only seams for pgListModels / install_skill SSRF checks. All remain
+	// zero/nil in production (strict public-only default; for pgListModels only
+	// exact host:port entries in ARTEX_LLM_PRIVATE_ENDPOINTS may resolve to
+	// private addresses).
+	allowLoopbackModels     bool
+	allowLoopbackSkillFetch bool
+	modelLookupIP           func(ctx context.Context, host string) ([]netip.Addr, error)
+	modelDialContext        func(ctx context.Context, network, addr string) (net.Conn, error)
+	modelRootCAs            *x509.CertPool
 
 	loginLimit     *loginLimiter  // per-IP attempt limit on POST /api/auth/login
 	pwdLimit       *loginLimiter  // attempt limit on POST /api/auth/change-password (IP + session token)
@@ -171,6 +173,7 @@ type Server struct {
 	deltaHub           *DeltaHub
 	mcpPool            *mcpPool
 	scheduler          *Scheduler // event-driven wake target; nil without pg
+	notifier           *Notifier  // vulnerability push delivery engine; nil without pg
 
 	txMu    sync.Mutex
 	txStore *transcript.Store
@@ -335,7 +338,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		go s.scheduler.Run(s.ctx)
 		// Vulnerability IM push delivery engine. Sits beside the Scheduler but independent: push latency demands (3s)
 		// differ from the triggers' business cadence, and neither's failures drag the other down — a stuck push must not affect agent triggers.
-		go newNotifier(s).Run(s.ctx)
+		s.notifier = newNotifier(s)
+		m.notifyWake = s.notifier.Wake
+		go s.notifier.Run(s.ctx)
 		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.
@@ -432,6 +437,10 @@ func (s *Server) Wait(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		s.engine.FlushUsageActivities()
+		if s.m != nil {
+			flushUsageLedger(s.m.pg)
+		}
 		s.mcpPool.CloseAll()
 		s.closeTranscriptStore()
 		return nil
@@ -1604,10 +1613,19 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		cfg.ContextWindowK = k
 	}
 	// Keyless formats (Ollama) need no key; the others keep/require one.
+	// A saved key is only inherited when the endpoint matches the one it was
+	// saved for, so changing provider/base_url cannot rebind a write-only key.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey // keep existing key if not re-entered
+		global := s.llmCfg
 		s.cfgMu.Unlock()
+		if global.APIKey != "" {
+			if !sameLLMEndpoint(req.Provider, req.BaseURL, global.Provider(), global.BaseURL) {
+				writeErr(w, 400, "the saved API key is only valid for its original endpoint; re-enter api_key when changing provider or base_url")
+				return
+			}
+			cfg.APIKey = global.APIKey // keep existing key if not re-entered
+		}
 	}
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		writeErr(w, 400, "api_key required")
@@ -1731,6 +1749,10 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg.UserAgent = ua
 	if cfg.OAuthProvider() != "" {
+		if strings.TrimSpace(req.BaseURL) != "" && !sameLLMEndpoint(req.Provider, req.BaseURL, req.Provider, "") {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": "OAuth credentials are only sent to the canonical provider endpoint; custom base_url is not allowed"})
+			return
+		}
 		if !s.attachOAuth(&cfg) {
 			writeJSON(w, 200, map[string]any{"ok": false, "error": "OAuth account is not signed in; click Sign in first"})
 			return
@@ -2710,7 +2732,9 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "finding not found")
 			return
 		}
-		if !notified && from != *body.Status {
+		if notified {
+			s.notifier.Wake()
+		} else if from != *body.Status {
 			log.Printf("[notify] status-change event not registered finding=%d %s→%s (status was updated)", id, from, *body.Status)
 		}
 	}
@@ -2811,13 +2835,20 @@ func (s *Server) bulkPatchFindingStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	updated, missing := 0, 0
+	anyNotified := false
 	for _, res := range results {
 		if res.Changed {
 			updated++
 		}
+		if res.Notified {
+			anyNotified = true
+		}
 		if !res.Found {
 			missing++
 		}
+	}
+	if anyNotified {
+		s.notifier.Wake()
 	}
 	writeJSON(w, 200, map[string]any{"updated": updated, "missing": missing, "results": results})
 }
@@ -3516,11 +3547,17 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	ctx := r.Context()
+	var srvDone <-chan struct{}
+	if s.ctx != nil {
+		srvDone = s.ctx.Done()
+	}
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-srvDone:
 			return
 		case l, ok := <-ch:
 			if !ok || !s.sessionOK(tok) {
@@ -3619,11 +3656,17 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	var srvDone <-chan struct{}
+	if s.ctx != nil {
+		srvDone = s.ctx.Done()
+	}
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-srvDone:
 			return
 		case a, ok := <-ch:
 			if !ok || !s.sessionOK(tok) {
@@ -4182,6 +4225,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.NotifyEnabled != nil || req.NotifyBaseURL != nil || req.NotifyDigestMins != nil || req.NotifySummaryMaxRunes != nil || req.NotifyAssetsMaxShown != nil {
+		s.notifier.Wake()
+	}
 	if req.Workers != nil {
 		if err := s.m.SetWorkers(*req.Workers); err != nil {
 			writeErr(w, 400, err.Error())
@@ -4663,12 +4709,45 @@ func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
 
 // --- utils ---
 
+// isOriginAllowed reports whether orig is same-origin with host or explicitly
+// listed in ARTEX_ALLOWED_ORIGINS (comma-separated origins, e.g. "http://localhost:3000").
+func isOriginAllowed(orig, host string) bool {
+	orig = strings.TrimSpace(orig)
+	if orig == "" {
+		return true
+	}
+	u, err := url.Parse(orig)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if strings.EqualFold(u.Host, host) {
+		return true
+	}
+	if allow := strings.TrimSpace(os.Getenv("ARTEX_ALLOWED_ORIGINS")); allow != "" {
+		for _, part := range strings.Split(allow, ",") {
+			part = strings.TrimSpace(part)
+			if part != "" && strings.EqualFold(part, orig) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		orig := strings.TrimSpace(r.Header.Get("Origin"))
+		if orig != "" && isOriginAllowed(orig, r.Host) {
+			w.Header().Set("Access-Control-Allow-Origin", orig)
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
 		if r.Method == http.MethodOptions {
+			if orig != "" && !isOriginAllowed(orig, r.Host) {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
 			w.WriteHeader(204)
 			return
 		}

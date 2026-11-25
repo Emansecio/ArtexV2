@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -158,7 +159,7 @@ func (s *AssetStore) RegisterTaskAssetScopes(taskID int64, inputs []ScopeInput) 
 		return mutation, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := lockCompanyScopeMutation(tx); err != nil {
+	if err := lockCompanyScopeRead(tx); err != nil {
 		return mutation, err
 	}
 	var taskExists bool
@@ -168,6 +169,52 @@ func (s *AssetStore) RegisterTaskAssetScopes(taskID int64, inputs []ScopeInput) 
 	if !taskExists {
 		return mutation, ErrTaskAssetTaskNotFound
 	}
+
+	// Sort deterministically to match db/assets.go's canonical row-lock order
+	// (domain -> ip -> other kinds, then lexicographically by normalized key)
+	// so concurrent scope registrations and asset upserts cannot deadlock.
+	scopeKindOrder := func(kind string) int {
+		switch kind {
+		case "domain":
+			return 0
+		case "ip":
+			return 1
+		case "cidr":
+			return 2
+		case "icp":
+			return 3
+		case "keyword":
+			return 4
+		default:
+			return 5
+		}
+	}
+	scopeSortKey := func(rule ParsedScope) string {
+		switch rule.Kind {
+		case "domain":
+			return rule.Domain
+		case "ip":
+			if ip, _, err := net.ParseCIDR(rule.Net); err == nil {
+				return ip.String()
+			}
+			return rule.Net
+		case "cidr":
+			return rule.Net
+		default:
+			return rule.Value
+		}
+	}
+	sort.SliceStable(parsed, func(i, j int) bool {
+		oi, oj := scopeKindOrder(parsed[i].Kind), scopeKindOrder(parsed[j].Kind)
+		if oi != oj {
+			return oi < oj
+		}
+		ki, kj := scopeSortKey(parsed[i]), scopeSortKey(parsed[j])
+		if ki != kj {
+			return ki < kj
+		}
+		return parsed[i].Raw < parsed[j].Raw
+	})
 
 	scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
 	for _, rule := range parsed {
@@ -247,6 +294,7 @@ func (s *AssetStore) RegisterTaskAssetScopes(taskID int64, inputs []ScopeInput) 
 	if err := tx.Commit(); err != nil {
 		return mutation, err
 	}
+	s.db.BumpGraphVersion()
 	return mutation, nil
 }
 
@@ -271,6 +319,13 @@ func (s *AssetStore) AttachAssetsToTask(taskID int64, assetIDs []int64, sourceSu
 		return mutation, err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	// Use the exclusive company-scope advisory lock because the bulk UPDATE on
+	// assets below locks rows in heap/index order rather than AssetStore's
+	// canonical row-lock order, preventing AB-BA deadlocks with concurrent
+	// asset upserts and CompanyStore mutations.
+	if err := lockCompanyScopeMutation(tx); err != nil {
+		return mutation, err
+	}
 
 	var taskExists bool
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND deleted_at IS NULL)`, taskID).Scan(&taskExists); err != nil {
@@ -308,7 +363,11 @@ SET source='manual', source_summary=EXCLUDED.source_summary, source_node_id=NULL
 	}
 	mutation.Existing = existing
 	mutation.Attached = len(assetIDs) - existing
-	return mutation, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return mutation, err
+	}
+	s.db.BumpGraphVersion()
+	return mutation, nil
 }
 
 // DetachAssetFromTask removes only the task association. The global asset and

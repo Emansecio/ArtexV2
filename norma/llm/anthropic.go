@@ -98,16 +98,15 @@ func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byt
 	// only when thinking is actively "enabled"; any other mode (incl. "disabled")
 	// strips them so Anthropic does not reject the request.
 	thinkingType := p.cfg.ThinkingType
-	thinkingEnabled := thinkingType != ""
 	if req.Thinking != "" {
 		thinkingType = req.Thinking
-		thinkingEnabled = req.Thinking == "enabled"
 	}
+	thinkingEnabled := thinkingType != "" && thinkingType != "disabled"
 	var cc map[string]any
 	if p.cfg.promptCacheEnabled() {
 		cc = anthropicCacheControl(p.cfg.PromptCacheTTL)
 	}
-	filtered := mergeAdjacentSameRole(filterThinkingBlocks(req.Messages, thinkingEnabled))
+	filtered := mergeAdjacentSameRole(PairToolBlocks(filterThinkingBlocks(req.Messages, thinkingEnabled)))
 	body := anthropicReq{
 		Model:         p.cfg.Model,
 		Messages:      toAnthropicWireMessages(filtered, cc),
@@ -127,10 +126,11 @@ func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byt
 		body.Thinking = &anthropicThinking{Type: thinkingType}
 	}
 	effort := p.cfg.ReasoningEffort
-	if req.ReasoningEffort != "" {
+	reasoningActive := (p.cfg.ReasoningEffort != "" && p.cfg.ReasoningEffort != "none") || thinkingEnabled
+	if req.ReasoningEffort != "" && reasoningActive {
 		effort = req.ReasoningEffort
 	}
-	if req.Thinking != "disabled" && effort != "" && effort != "none" {
+	if thinkingType != "disabled" && effort != "" && effort != "none" {
 		body.OutputConfig = &anthropicOutputConfig{Effort: effort}
 	}
 	return json.Marshal(body)
@@ -152,6 +152,33 @@ func toAnthropicWireMessages(msgs []Message, cc map[string]any) []anthropicWireM
 	for i, m := range msgs {
 		blocks := make([]anthropicWireBlock, len(m.Content))
 		for j, b := range m.Content {
+			input := b.Input
+			if b.Type == BlockToolUse && (len(input) == 0 || !json.Valid(input)) {
+				input = json.RawMessage("{}")
+			}
+			nested := b.Content
+			if b.Type == BlockToolResult && len(nested) > 0 {
+				hasEmptyText := false
+				for _, nb := range nested {
+					if nb.Type == BlockText && nb.Text == "" {
+						hasEmptyText = true
+						break
+					}
+				}
+				if hasEmptyText {
+					filtered := make([]ContentBlock, 0, len(nested))
+					for _, nb := range nested {
+						if nb.Type == BlockText && nb.Text == "" {
+							continue
+						}
+						filtered = append(filtered, nb)
+					}
+					if len(filtered) == 0 {
+						filtered = []ContentBlock{TextBlock("(no output)")}
+					}
+					nested = filtered
+				}
+			}
 			blocks[j] = anthropicWireBlock{
 				Type:      b.Type,
 				Text:      b.Text,
@@ -160,9 +187,9 @@ func toAnthropicWireMessages(msgs []Message, cc map[string]any) []anthropicWireM
 				Data:      b.Data,
 				ID:        b.ID,
 				Name:      b.Name,
-				Input:     b.Input,
+				Input:     input,
 				ToolUseID: b.ToolUseID,
-				Content:   b.Content,
+				Content:   nested,
 				IsError:   b.IsError,
 			}
 		}

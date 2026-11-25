@@ -1057,7 +1057,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   }
 
   // ── auth: let the demo go straight to the main UI ──
+  if (path === "/auth/status" && m === "GET") return { initialized: false };
   if (path === "/auth/local") return { token: "mock-demo" };
+  if (path === "/auth/login" && m === "POST") return { token: "mock-demo" };
+  if (path === "/auth/init" && m === "POST") return { token: "mock-demo" };
 
   // ── task cold archives ──
   if (path === "/task-archives" && m === "GET") {

@@ -45,7 +45,6 @@ func (t *ToolSet) saveTaskCredential() actool.CoreTool {
 				if err != nil || taskID <= 0 {
 					return actool.Errorf("save_task_credential is only available inside a task"), nil
 				}
-				t.taskID = taskID
 			}
 			c, err := t.ts.UpsertTaskCredential(taskID, db.TaskCredentialInput{
 				Domain: a.Domain, Username: a.Username, Password: a.Password,
@@ -76,7 +75,6 @@ func (t *ToolSet) listTaskCredentials() actool.CoreTool {
 				if err != nil || taskID <= 0 {
 					return actool.Errorf("list_task_credentials is only available inside a task"), nil
 				}
-				t.taskID = taskID
 			}
 			list, err := t.ts.TaskCredentials(taskID)
 			if err != nil {

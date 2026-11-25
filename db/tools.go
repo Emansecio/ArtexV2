@@ -166,7 +166,8 @@ func cloneTools(in []*Tool) []*Tool {
 // writes are rare. All db-level tools writes invalidate; raw-SQL repairs rely
 // on the TTL.
 func (d *DB) ListTools() ([]*Tool, error) {
-	if v, hit := d.cfgRef().get("tools:list"); hit {
+	v, hit, gen := d.cfgRef().get("tools:list")
+	if hit {
 		return cloneTools(v.([]*Tool)), nil
 	}
 	rows, err := d.Query(`SELECT ` + toolCols + ` FROM tools ORDER BY key`)
@@ -185,7 +186,7 @@ func (d *DB) ListTools() ([]*Tool, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	d.cfgRef().put("tools:list", out)
+	d.cfgRef().putIfGen("tools:list", out, gen)
 	return cloneTools(out), nil
 }
 
@@ -275,7 +276,8 @@ func (d *DB) DeleteCustomTool(key string) error {
 // ListCustomTools returns only the user-defined (system=false) tools. Cached
 // like ListTools.
 func (d *DB) ListCustomTools() ([]*Tool, error) {
-	if v, hit := d.cfgRef().get("tools:custom"); hit {
+	v, hit, gen := d.cfgRef().get("tools:custom")
+	if hit {
 		return cloneTools(v.([]*Tool)), nil
 	}
 	rows, err := d.Query(`SELECT ` + toolCols + ` FROM tools WHERE system=false ORDER BY key`)
@@ -294,7 +296,7 @@ func (d *DB) ListCustomTools() ([]*Tool, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	d.cfgRef().put("tools:custom", out)
+	d.cfgRef().putIfGen("tools:custom", out, gen)
 	return cloneTools(out), nil
 }
 

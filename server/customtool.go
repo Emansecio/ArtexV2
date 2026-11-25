@@ -668,9 +668,15 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 	tr := &http.Transport{Proxy: http.ProxyURL(pu)}
 	if caFile != "" {
 		if pem, err := os.ReadFile(caFile); err == nil {
-			pool := x509.NewCertPool()
+			pool, err := x509.SystemCertPool()
+			if err != nil || pool == nil {
+				pool = x509.NewCertPool()
+			}
 			if pool.AppendCertsFromPEM(pem) {
-				tr.TLSClientConfig = &tls.Config{RootCAs: pool}
+				tr.TLSClientConfig = &tls.Config{
+					RootCAs:    pool,
+					MinVersion: tls.VersionTLS12,
+				}
 			}
 		}
 	}

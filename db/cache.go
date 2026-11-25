@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"regexp"
 	"strings"
@@ -17,8 +18,9 @@ import (
 const configCacheTTL = 60 * time.Second
 
 type configCache struct {
-	mu sync.RWMutex
-	m  map[string]configEntry
+	mu  sync.RWMutex
+	m   map[string]configEntry
+	gen uint64
 }
 
 type configEntry struct {
@@ -26,18 +28,23 @@ type configEntry struct {
 	at time.Time
 }
 
-func (c *configCache) get(key string) (any, bool) {
+func (c *configCache) get(key string) (any, bool, uint64) {
 	c.mu.RLock()
 	e, ok := c.m[key]
+	gen := c.gen
 	c.mu.RUnlock()
 	if !ok || time.Since(e.at) > configCacheTTL {
-		return nil, false
+		return nil, false, gen
 	}
-	return e.v, true
+	return e.v, true, gen
 }
 
-func (c *configCache) put(key string, v any) {
+func (c *configCache) putIfGen(key string, v any, gen uint64) {
 	c.mu.Lock()
+	if c.gen != gen {
+		c.mu.Unlock()
+		return
+	}
 	if c.m == nil {
 		c.m = map[string]configEntry{}
 	}
@@ -47,6 +54,7 @@ func (c *configCache) put(key string, v any) {
 
 func (c *configCache) drop(keys ...string) {
 	c.mu.Lock()
+	c.gen++
 	for _, k := range keys {
 		delete(c.m, k)
 	}
@@ -56,6 +64,7 @@ func (c *configCache) drop(keys ...string) {
 // dropPrefix invalidates a whole key family (e.g. "tools:" on any tools write).
 func (c *configCache) dropPrefix(prefix string) {
 	c.mu.Lock()
+	c.gen++
 	for k := range c.m {
 		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
 			delete(c.m, k)
@@ -93,8 +102,8 @@ func (d *DB) InvalidateMCPCache() {
 // writes (migrations, repair Execs, tests that seed via d.Exec) bypass the
 // cache-aware write methods, so the Exec/Query/QueryRow wrappers below drop the
 // affected entries instead of serving stale config for up to configCacheTTL.
-var configWriteTable = regexp.MustCompile(`(?i)\b(?:insert\s+into|update|delete\s+from|truncate(?:\s+table)?)\s+(settings|tools|mcp_servers|agent_prompts|agent_visibility|agent_skill_visibility|agents)\b`)
-var graphWriteTable = regexp.MustCompile(`(?i)\b(?:insert\s+into|update|delete\s+from|truncate(?:\s+table)?)\s+(exploration_nodes|exploration_edges|assets|task_credentials|task_scope|coverage_ledger)\b`)
+var configWriteTable = regexp.MustCompile(`(?i)\b(?:insert\s+into|update|delete\s+from|truncate(?:\s+table)?)\s+(settings|tools|mcp_servers|mcp_tools_cache|agent_prompts|agent_visibility|agent_skill_visibility|agents)\b`)
+var graphWriteTable = regexp.MustCompile(`(?i)\b(?:insert\s+into|update|delete\s+from|truncate(?:\s+table)?)\s+(exploration_nodes|exploration_edges|explorations|exploration_sources|exploration_anchors|assets|task_asset_links|task_credentials|task_scope|coverage_ledger)\b`)
 
 // isPureSelect reports whether query begins with SELECT (ignoring leading
 // whitespace/comments), allowing read queries to bypass the DML invalidation
@@ -115,23 +124,25 @@ func (d *DB) invalidateConfigFor(query string) {
 	if graphWriteTable.MatchString(query) {
 		d.BumpGraphVersion()
 	}
-	m := configWriteTable.FindStringSubmatch(query)
-	if m == nil {
+	matches := configWriteTable.FindAllStringSubmatch(query, -1)
+	if len(matches) == 0 {
 		return
 	}
-	switch strings.ToLower(m[1]) {
-	case "settings":
-		d.cfgRef().dropPrefix("set:")
-	case "tools":
-		d.cfgRef().dropPrefix("tools:")
-	case "mcp_servers":
-		d.cfgRef().drop("mcp:list")
-	case "agent_prompts", "agents":
-		d.cfgRef().dropPrefix("prompt:")
-	case "agent_visibility":
-		d.cfgRef().dropPrefix("vis:")
-	case "agent_skill_visibility":
-		d.cfgRef().dropPrefix("skills:")
+	for _, m := range matches {
+		switch strings.ToLower(m[1]) {
+		case "settings":
+			d.cfgRef().dropPrefix("set:")
+		case "tools":
+			d.cfgRef().dropPrefix("tools:")
+		case "mcp_servers", "mcp_tools_cache":
+			d.cfgRef().drop("mcp:list")
+		case "agent_prompts", "agents":
+			d.cfgRef().dropPrefix("prompt:")
+		case "agent_visibility":
+			d.cfgRef().dropPrefix("vis:")
+		case "agent_skill_visibility":
+			d.cfgRef().dropPrefix("skills:")
+		}
 	}
 }
 
@@ -139,6 +150,15 @@ func (d *DB) invalidateConfigFor(query string) {
 // invalidates the matching entries.
 func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 	res, err := d.DB.Exec(query, args...)
+	if err == nil {
+		d.invalidateConfigFor(query)
+	}
+	return res, err
+}
+
+// ExecContext shadows the embedded *sql.DB.ExecContext for the same reason.
+func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	res, err := d.DB.ExecContext(ctx, query, args...)
 	if err == nil {
 		d.invalidateConfigFor(query)
 	}
@@ -155,12 +175,28 @@ func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
 	return rows, err
 }
 
+// QueryContext shadows the embedded *sql.DB.QueryContext for the same reason.
+func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	rows, err := d.DB.QueryContext(ctx, query, args...)
+	if err == nil {
+		d.invalidateConfigFor(query)
+	}
+	return rows, err
+}
+
 // QueryRow shadows the embedded *sql.DB.QueryRow for the same reason — writes
 // with RETURNING (INSERT ... RETURNING id) reach the server through QueryRow.
 // The result error is only visible at Scan, so a failed write may drop an
 // entry; that costs one re-read, never staleness.
 func (d *DB) QueryRow(query string, args ...any) *sql.Row {
 	row := d.DB.QueryRow(query, args...)
+	d.invalidateConfigFor(query)
+	return row
+}
+
+// QueryRowContext shadows the embedded *sql.DB.QueryRowContext for the same reason.
+func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	row := d.DB.QueryRowContext(ctx, query, args...)
 	d.invalidateConfigFor(query)
 	return row
 }

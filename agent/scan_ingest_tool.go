@@ -31,10 +31,15 @@ var scanReaders = map[string]func(io.Reader, *scanIngest) error{
 	"ffuf-json": readFfufJSON,
 }
 
-// openScanOutput opens path, resolved under the run's working directory root.
-// A path with a ".." element, or one that resolves outside root (a symlink
-// included), is refused, as is anything but a regular file under the size cap.
-func openScanOutput(root, path string) (*os.File, error) {
+// openScanOutput opens path, resolved under the run's working directory root
+// below base, using the same os.Root confinement as openBbotOutput and the
+// confined file tools (filetools.go). A path with a ".." element, outside root,
+// a symlink, a hard-linked file, a non-regular file (e.g. FIFO), or a file over
+// scanMaxFileBytes is refused.
+func openScanOutput(base, root, path string) (*os.File, error) {
+	if strings.TrimSpace(base) == "" {
+		return nil, errors.New("no data directory for this run")
+	}
 	if strings.TrimSpace(root) == "" {
 		return nil, errors.New("no working directory for this run: the output file cannot be located")
 	}
@@ -46,34 +51,38 @@ func openScanOutput(root, path string) (*os.File, error) {
 			return nil, errors.New("path must not contain ..")
 		}
 	}
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(root, path)
-	}
-	realRoot, err := filepath.EvalSymlinks(root)
+	w, err := openWorkRoot(base, root)
 	if err != nil {
-		return nil, fmt.Errorf("working directory: %w", err)
+		return nil, err
 	}
-	real, err := filepath.EvalSymlinks(path)
+	defer w.Close() // a file opened in the root stays open
+	rel, err := w.rel(path)
 	if err != nil {
-		return nil, errors.New("path not found under the working directory")
+		return nil, fmt.Errorf("%s is %w %s", path, err, w.dir)
 	}
-	if rel, err := filepath.Rel(realRoot, real); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, errors.New("path resolves outside the working directory " + root)
+	// Lstat: a symlink is refused even when it stays inside the working directory,
+	// and a FIFO is not opened (that would block).
+	if fi, err := w.Lstat(rel); err != nil {
+		return nil, err
+	} else if !fi.Mode().IsRegular() {
+		return nil, errNotRegular
+	} else if fi.Size() > scanMaxFileBytes {
+		return nil, fmt.Errorf("file is %d bytes, over the %d byte cap", fi.Size(), scanMaxFileBytes)
 	}
-	f, err := os.Open(real)
+	f, err := w.Open(rel)
 	if err != nil {
-		return nil, errors.New("path cannot be opened")
+		return nil, err
 	}
-	st, err := f.Stat()
-	switch {
-	case err != nil || !st.Mode().IsRegular():
-		err = errors.New("path is not a regular file")
-	case st.Size() > scanMaxFileBytes:
-		err = fmt.Errorf("file is %d bytes, over the %d byte cap", st.Size(), scanMaxFileBytes)
-	}
-	if err != nil {
+	if err := checkOpened(f); err != nil {
 		f.Close()
 		return nil, err
+	}
+	if st, err := f.Stat(); err != nil {
+		f.Close()
+		return nil, err
+	} else if st.Size() > scanMaxFileBytes {
+		f.Close()
+		return nil, fmt.Errorf("file is %d bytes, over the %d byte cap", st.Size(), scanMaxFileBytes)
 	}
 	return f, nil
 }
@@ -125,7 +134,7 @@ func (t *ToolSet) runScanIngest(ctx context.Context, in json.RawMessage, tc *act
 	if tc != nil {
 		root = tc.WorkingDir
 	}
-	f, err := openScanOutput(root, a.Path)
+	f, err := openScanOutput(t.workBase, root, a.Path)
 	if err != nil {
 		return actool.Errorf(err.Error()), nil
 	}

@@ -67,7 +67,7 @@ func hideCompressCalls(io NodeIO, _ PipelineContext) NodeIO {
 		}
 		out = append(out, m)
 	}
-	io.Messages = out
+	io.Messages = stripOrphanedReasoning(out)
 	return io
 }
 

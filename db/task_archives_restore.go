@@ -40,6 +40,12 @@ func (d *DB) CompleteTaskArchive(
 	if err := coordinateWithSchemaMigration(tx); err != nil {
 		return err
 	}
+	// Acquire the table locks before FOR UPDATE on tasks so archive compaction
+	// follows the same assets -> tasks lock order as DeleteTaskCascadePrepared,
+	// AssetStore.Upsert*, RegisterTaskAssetScopes, and AttachAssetsToTask.
+	if _, err := tx.Exec(`LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		return err
+	}
 	var taskID, expID int64
 	var state string
 	if err := tx.QueryRow(`SELECT archive.task_id,task.exploration_id,archive.state
@@ -60,17 +66,13 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	// Prevent task/asset ownership from changing while exclusivity is rechecked.
-	if _, err := tx.Exec(`LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM intercept_pending WHERE COALESCE(task_id,'')=$1`, strconv.FormatInt(taskID, 10)); err != nil {
+	if _, err := tx.Exec(`DELETE FROM intercept_pending WHERE task_id=$1`, strconv.FormatInt(taskID, 10)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM llm_records WHERE task_id=$1`, strconv.FormatInt(taskID, 10)); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM llm_usage WHERE COALESCE(task_id,'')=$1 OR exploration_id=$2`, strconv.FormatInt(taskID, 10), expID); err != nil {
+	if _, err := tx.Exec(`DELETE FROM llm_usage WHERE task_id=$1 OR exploration_id=$2`, strconv.FormatInt(taskID, 10), expID); err != nil {
 		return err
 	}
 	for _, table := range []string{"skill_usage", "tool_usage"} {
@@ -94,11 +96,13 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 		{`DELETE FROM task_scope WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_constraints WHERE exploration_id=$1`, []any{expID}},
 		{`DELETE FROM activity WHERE exploration_id=$1`, []any{expID}},
-		{`DELETE FROM exploration_nodes WHERE exploration_id=$1`, []any{expID}},
 	} {
 		if _, err := tx.Exec(statement.query, statement.args...); err != nil {
 			return err
 		}
+	}
+	if _, err := tx.Exec(`DELETE FROM exploration_nodes WHERE exploration_id=$1`, expID); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(`UPDATE assets SET task_ids=array_remove(task_ids,$1) WHERE task_ids @> ARRAY[$1]::bigint[]`, taskID); err != nil {
 		return err
@@ -134,7 +138,11 @@ WHERE id=$1`, archiveID, ArchiveReady, archivePath, sha256, originalSize, compre
 		string(countsRaw), string(statsRaw), snapshot.FormatVersion); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	d.BumpGraphVersion()
+	return nil
 }
 
 // RestoreTaskArchive restores PostgreSQL rows from a verified manifest. It is
@@ -182,6 +190,11 @@ func (d *DB) restoreTaskArchive(
 	}
 	defer tx.Rollback() //nolint:errcheck
 	if err := coordinateWithSchemaMigration(tx); err != nil {
+		return nil, err
+	}
+	// Match CompleteTaskArchive and DeleteTaskCascadePrepared lock order:
+	// assets/exploration_anchors before tasks FOR UPDATE to avoid AB-BA deadlocks.
+	if _, err := tx.Exec(`LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
 		return nil, err
 	}
 	var taskID, expID int64
@@ -272,6 +285,11 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
 	}
+	if warning, err := restoreFindingRetests(tx, remappedTables["finding_retests"]); err != nil {
+		return nil, fmt.Errorf("restore finding_retests: %w", err)
+	} else {
+		warnings = append(warnings, warning...)
+	}
 	if err := restoreFindingTrafficTx(tx, snapshot); err != nil {
 		return nil, fmt.Errorf("restore finding traffic: %w", err)
 	}
@@ -291,14 +309,20 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
 	}
-	if err := restoreInterceptRows(tx, remappedTables["intercept_pending"]); err != nil {
+	if warning, err := restoreInterceptRows(tx, remappedTables["intercept_pending"]); err != nil {
 		return nil, err
+	} else {
+		warnings = append(warnings, warning...)
 	}
 	warningsRaw, _ := json.Marshal(warnings)
 	if _, err := tx.Exec(`UPDATE task_archives SET warnings=$2,phase='database_restored',progress=85,error='' WHERE id=$1`, archiveID, string(warningsRaw)); err != nil {
 		return nil, err
 	}
-	return warnings, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	d.BumpGraphVersion()
+	return warnings, nil
 }
 
 func restoreExplorationStub(tx *sql.Tx, raw json.RawMessage, expID int64) error {
@@ -353,12 +377,35 @@ func decodeArchiveRows(raw json.RawMessage) ([]map[string]any, error) {
 }
 
 func rowExists(tx *sql.Tx, table string, id int64) bool {
-	if table != "task_categories" && table != "llm_profiles" && table != "companies" && table != "tasks" && table != "assets" {
+	if table != "task_categories" && table != "llm_profiles" && table != "companies" && table != "tasks" && table != "assets" && table != "conversations" && table != "intercept_rules" {
 		return false
 	}
 	var exists bool
 	_ = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM `+table+` WHERE id=$1)`, id).Scan(&exists)
 	return exists
+}
+
+func restoreFindingRetests(tx *sql.Tx, raw json.RawMessage) ([]string, error) {
+	if rawRowCount(raw) == 0 {
+		return nil, nil
+	}
+	rows, err := decodeArchiveRows(raw)
+	if err != nil {
+		return nil, err
+	}
+	var warnings []string
+	for _, row := range rows {
+		convID, _ := jsonInt64(row["conversation_id"])
+		if convID > 0 && !rowExists(tx, "conversations", convID) {
+			row["conversation_id"] = nil
+			warnings = append(warnings, fmt.Sprintf("finding retest conversation %d has been deleted; restored without conversation link", convID))
+		}
+	}
+	cleaned, err := json.Marshal(rows)
+	if err != nil {
+		return nil, err
+	}
+	return warnings, insertArchiveRows(tx, "finding_retests", cleaned)
 }
 
 // archiveDefaults are the columns that did not exist when older archives were
@@ -399,6 +446,7 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 	allowed := map[string]bool{
 		"exploration_nodes": true, "exploration_edges": true, "exploration_anchors": true,
 		"task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
+		"finding_retests": true,
 		"llm_records": true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
 		"side_question_sessions": true, "side_question_requests": true,
 	}
@@ -686,11 +734,12 @@ func restoreTaskLLMProfiles(tx *sql.Tx, raw json.RawMessage) ([]string, error) {
 	return warnings, nil
 }
 
-func restoreInterceptRows(tx *sql.Tx, raw json.RawMessage) error {
+func restoreInterceptRows(tx *sql.Tx, raw json.RawMessage) ([]string, error) {
 	rows, err := decodeArchiveRows(raw)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var warnings []string
 	for _, row := range rows {
 		// Archives predating approval snapshots lack this NOT NULL column.
 		if source, _ := row["decision_source"].(string); source == "" {
@@ -701,6 +750,14 @@ func restoreInterceptRows(tx *sql.Tx, raw json.RawMessage) error {
 				source = "model"
 			}
 			row["decision_source"] = source
+		}
+		if ruleID, ok := jsonInt64(row["rule_id"]); ok && ruleID > 0 && !rowExists(tx, "intercept_rules", ruleID) {
+			row["rule_id"] = nil
+			warnings = append(warnings, fmt.Sprintf("intercept rule %d has been deleted; approval history restored without rule link", ruleID))
+		}
+		if convID, ok := jsonInt64(row["conversation_id"]); ok && convID > 0 && !rowExists(tx, "conversations", convID) {
+			row["conversation_id"] = nil
+			warnings = append(warnings, fmt.Sprintf("intercept conversation %d has been deleted; approval history restored without conversation link", convID))
 		}
 		// Archives predating decided_by lack this NOT NULL column too.
 		if row["decided_by"] == nil {
@@ -722,11 +779,11 @@ func restoreInterceptRows(tx *sql.Tx, raw json.RawMessage) error {
 		}
 	}
 	if len(rows) == 0 {
-		return nil
+		return warnings, nil
 	}
 	encoded, _ := json.Marshal(rows)
 	_, err = tx.Exec(`INSERT INTO intercept_pending SELECT * FROM json_populate_recordset(NULL::intercept_pending,$1::json)`, string(encoded))
-	return err
+	return warnings, err
 }
 
 func liveTaskExists(tx *sql.Tx, id int64) bool {

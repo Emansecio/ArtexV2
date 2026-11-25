@@ -110,7 +110,7 @@ func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error
 		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := lockCompanyScopeMutation(tx); err != nil {
+	if err := lockCompanyScopeRead(tx); err != nil {
 		return 0, err
 	}
 	scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
@@ -121,6 +121,7 @@ func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	s.db.BumpGraphVersion()
 	return id, nil
 }
 
@@ -476,16 +477,21 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 		return 0, err
 	}
 
-	// side effect 1: ensure root domain exists
-	_, _ = s.UpsertRootDomain(UpsertRootDomainReq{
+	// side effect 1: ensure root domain exists (canonical order: root_domain -> subdomain -> ip)
+	if _, err := s.UpsertRootDomain(UpsertRootDomainReq{
 		Domain: rootDomain,
 		TaskID: req.TaskID,
-	})
+	}); err != nil {
+		return 0, err
+	}
 
-	// side effect 2: if A/AAAA record, upsert each IP + bind domain.
+	// Collect, deduplicate, and sort valid A/AAAA IPs lexicographically so
+	// concurrent upserts always acquire IP row locks in canonical order.
 	// RecordValue is []string; each element may itself be comma-separated (legacy).
 	var ipStr string // first valid IP, used for the subdomain row itself
+	var sortedIPs []string
 	if req.RecordType == "A" || req.RecordType == "AAAA" {
+		seenIPs := make(map[string]struct{})
 		for _, rv := range req.RecordValue {
 			for _, part := range strings.Split(rv, ",") {
 				candidate := strings.TrimSpace(part)
@@ -495,18 +501,21 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 				if ipStr == "" {
 					ipStr = candidate
 				}
-				_, _ = s.UpsertIP(UpsertIPReq{
-					IP:           candidate,
-					BoundDomains: []string{domain},
-					TaskID:       req.TaskID,
-				})
+				if _, ok := seenIPs[candidate]; !ok {
+					seenIPs[candidate] = struct{}{}
+					sortedIPs = append(sortedIPs, candidate)
+				}
 			}
 		}
+		sort.Strings(sortedIPs)
 	}
 
 	cseg := calcCSegment(ipStr)
 	if companyID == nil && ipStr != "" {
-		companyID, _ = s.resolveCompanyWithICP("", ipStr, "")
+		companyID, err = s.resolveCompanyWithICP("", ipStr, "")
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	var taskIDs string
@@ -550,7 +559,21 @@ ON CONFLICT (domain, COALESCE(record_type,'')) WHERE type = 'subdomain' DO UPDAT
     extra        = assets.extra || EXCLUDED.extra,
     last_seen    = now()
 RETURNING id`, domain, rootDomain, recordType, recordValueArr, ipVal, csegVal, icpVal, companyID, taskIDs).Scan(&id)
-	return id, err
+	if err != nil {
+		return 0, err
+	}
+
+	// side effect 2: upsert each A/AAAA IP in sorted order after locking subdomain.
+	for _, candidate := range sortedIPs {
+		if _, err := s.UpsertIP(UpsertIPReq{
+			IP:           candidate,
+			BoundDomains: []string{domain},
+			TaskID:       req.TaskID,
+		}); err != nil {
+			return 0, err
+		}
+	}
+	return id, nil
 }
 
 // =====================================================================
@@ -786,7 +809,9 @@ RETURNING id`,
 	}
 
 	// side effects: register root_domain + subdomain as their own assets too
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	if err := s.linkHostAssets(domain, rootDomain, req.TaskID); err != nil {
+		return 0, err
+	}
 	if req.IP != "" {
 		var boundDomains []string
 		if domain != "" {
@@ -796,12 +821,14 @@ RETURNING id`,
 		if port > 0 {
 			openPorts = []PortService{{Port: port, Service: serviceName}}
 		}
-		_, _ = s.UpsertIP(UpsertIPReq{
+		if _, err := s.UpsertIP(UpsertIPReq{
 			IP:           req.IP,
 			BoundDomains: boundDomains,
 			OpenPorts:    openPorts,
 			TaskID:       req.TaskID,
-		})
+		}); err != nil {
+			return 0, err
+		}
 	}
 	return id, nil
 }
@@ -920,33 +947,42 @@ RETURNING id`,
 		return 0, err
 	}
 
-	// side effects
+	// side effects (canonical row-lock order: root_domain -> subdomain -> ip)
+	if err := s.linkHostAssets(domain, rootDomain, req.TaskID); err != nil {
+		return 0, err
+	}
 	if req.IP != "" && req.Port > 0 {
 		var boundDomains []string
 		if domain != "" {
 			boundDomains = []string{domain}
 		}
-		_, _ = s.UpsertIP(UpsertIPReq{
+		if _, err := s.UpsertIP(UpsertIPReq{
 			IP:           req.IP,
 			BoundDomains: boundDomains,
 			OpenPorts:    []PortService{{Port: req.Port, Service: serviceName}},
 			TaskID:       req.TaskID,
-		})
+		}); err != nil {
+			return 0, err
+		}
 	}
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
 	return id, nil
 }
 
 // linkHostAssets ensures a service/endpoint's host is also registered as its own
 // root_domain and (when it's a real subdomain, not the apex or an IP) subdomain
-// asset — so those asset types stay populated and can anchor task scope. Best-effort.
-func (s *AssetStore) linkHostAssets(domain, rootDomain string, taskID int64) {
+// asset — so those asset types stay populated and can anchor task scope.
+func (s *AssetStore) linkHostAssets(domain, rootDomain string, taskID int64) error {
 	if rootDomain != "" {
-		_, _ = s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID})
+		if _, err := s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID}); err != nil {
+			return err
+		}
 	}
 	if domain != "" && domain != rootDomain && net.ParseIP(domain) == nil {
-		_, _ = s.UpsertSubdomain(UpsertSubdomainReq{Domain: domain, TaskID: taskID})
+		if _, err := s.UpsertSubdomain(UpsertSubdomainReq{Domain: domain, TaskID: taskID}); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // =====================================================================
@@ -1056,9 +1092,13 @@ RETURNING id`,
 	}
 	// side effects: endpoint previously registered none — register its host as
 	// root_domain + subdomain(+IP) so those asset types get populated too.
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	if err := s.linkHostAssets(domain, rootDomain, req.TaskID); err != nil {
+		return 0, err
+	}
 	if req.IP != "" {
-		_, _ = s.UpsertIP(UpsertIPReq{IP: req.IP, TaskID: req.TaskID})
+		if _, err := s.UpsertIP(UpsertIPReq{IP: req.IP, TaskID: req.TaskID}); err != nil {
+			return 0, err
+		}
 	}
 	return id, nil
 }

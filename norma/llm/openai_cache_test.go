@@ -231,4 +231,51 @@ func TestPerRequestReasoningEffortOverride(t *testing.T) {
 	if r, _ := docR["reasoning"].(map[string]any); r["effort"] != "low" {
 		t.Fatalf("responses reasoning=%v, want low", docR["reasoning"])
 	}
+
+	// Non-reasoning profiles must not emit reasoning effort or inject synthetic
+	// reasoning_content when the harness requests ReasoningEffort: "low".
+	reqWithTools := CompletionRequest{
+		Messages: []Message{
+			UserText("hi"),
+			{Role: RoleAssistant, Content: []ContentBlock{{Type: BlockToolUse, ID: "c1", Name: "f", Input: json.RawMessage(`{}`)}}},
+			{Role: RoleUser, Content: []ContentBlock{{Type: BlockToolResult, ToolUseID: "c1", Text: "ok"}}},
+		},
+		ReasoningEffort: "low",
+	}
+	opPlain := &openaiProvider{cfg: Config{Format: FormatOpenAI, Model: "gpt-4o"}}
+	rawPlainO, err := opPlain.buildBody(reqWithTools, false)
+	if err != nil {
+		t.Fatalf("plain openai buildBody: %v", err)
+	}
+	if strings.Contains(string(rawPlainO), `"reasoning_effort"`) || strings.Contains(string(rawPlainO), `"reasoning_content"`) {
+		t.Fatalf("non-reasoning openai profile should not emit reasoning_effort or reasoning_content: %s", rawPlainO)
+	}
+
+	apPlain := &anthropicProvider{cfg: Config{Format: FormatAnthropic, Model: "claude-sonnet-4"}}
+	rawPlainA, err := apPlain.buildBody(req, false)
+	if err != nil {
+		t.Fatalf("plain anthropic buildBody: %v", err)
+	}
+	if strings.Contains(string(rawPlainA), `"output_config"`) {
+		t.Fatalf("non-reasoning anthropic profile should not emit output_config: %s", rawPlainA)
+	}
+
+	rpPlain := &openaiResponsesProvider{cfg: Config{Format: FormatOpenAIResponses, Model: "gpt-4o"}}
+	rawPlainR, err := rpPlain.buildBody(req, false)
+	if err != nil {
+		t.Fatalf("plain responses buildBody: %v", err)
+	}
+	if strings.Contains(string(rawPlainR), `"reasoning"`) {
+		t.Fatalf("non-reasoning responses profile should not emit reasoning: %s", rawPlainR)
+	}
+
+	// Config.ThinkingType = "disabled" must suppress reasoning.effort on Responses API.
+	rpDisabled := &openaiResponsesProvider{cfg: Config{Format: FormatOpenAIResponses, Model: "gpt-5", ThinkingType: "disabled", ReasoningEffort: "high"}}
+	rawDisabledR, err := rpDisabled.buildBody(req, false)
+	if err != nil {
+		t.Fatalf("disabled responses buildBody: %v", err)
+	}
+	if strings.Contains(string(rawDisabledR), `"reasoning"`) {
+		t.Fatalf("thinking-disabled responses profile should not emit reasoning: %s", rawDisabledR)
+	}
 }

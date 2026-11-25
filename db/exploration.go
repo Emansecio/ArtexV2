@@ -238,6 +238,16 @@ func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority
 		return 0, err
 	}
 	defer tx.Rollback()
+	// Acquire ROW EXCLUSIVE on exploration_anchors before taking FOR KEY SHARE
+	// locks on assets (via checkFactAnchorAssets) or explorations (via FK on
+	// exploration_nodes) so concurrent DeleteTaskCascadePrepared /
+	// CompleteTaskArchive (which lock assets, exploration_anchors IN SHARE ROW
+	// EXCLUSIVE MODE before deleting assets/explorations) cannot deadlock.
+	if len(anchors) > 0 {
+		if _, err := tx.Exec(`LOCK TABLE exploration_anchors IN ROW EXCLUSIVE MODE`); err != nil {
+			return 0, err
+		}
+	}
 	// Validate fact anchors before creating a node. Key-share locks retain the
 	// checked assets through commit, closing the check/insert deletion race.
 	if kind == KindFact && len(anchors) > 0 {
@@ -249,7 +259,7 @@ func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority
 	if err := tx.QueryRow(`
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-		s.expID, kind, string(raw), priority, state, origin).Scan(&id); err != nil {
+		s.expID, kind, string(jsonbClean(raw)), priority, state, origin).Scan(&id); err != nil {
 		return 0, err
 	}
 	for _, a := range anchors {
@@ -401,7 +411,8 @@ func (s *ExplorationStore) DeleteGoal(id int64) error {
 // periodically, so a claim that was still live at startup is taken over once it
 // expires.
 func (s *ExplorationStore) ResetRunningIntents() (int64, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL, unclaim_token=NULL
+	// Use raw s.db.DB.Exec so empty periodic sweeps do not thrash overviewCache.
+	res, err := s.db.DB.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL, unclaim_token=NULL
 WHERE exploration_id=$1 AND kind='intent' AND state='running'
   AND (last_heartbeat_at IS NULL OR last_heartbeat_at < now() - $2 * INTERVAL '1 second')`, s.expID, IntentClaimTTL.Seconds())
 	if err != nil {
@@ -410,6 +421,9 @@ WHERE exploration_id=$1 AND kind='intent' AND state='running'
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, err
+	}
+	if n > 0 {
+		s.db.BumpGraphVersion()
 	}
 	return n, nil
 }
@@ -1372,7 +1386,9 @@ func (s *ExplorationStore) ClaimNextIntentToken(owner string) (*Node, string, er
 	if err != nil {
 		return nil, "", err
 	}
-	n, err := scanNode(s.db.QueryRow(`UPDATE exploration_nodes
+	// Use raw s.db.DB.QueryRow so empty frontier polls (sql.ErrNoRows) do not
+	// bump graphVer and thrash overviewCache across all tasks.
+	n, err := scanNode(s.db.DB.QueryRow(`UPDATE exploration_nodes
 SET state='running', owner=$1, unclaim_token=$2, last_heartbeat_at=now()
 WHERE id = (
 	SELECT id FROM exploration_nodes
@@ -1388,6 +1404,7 @@ RETURNING `+nodeCols, owner, token, s.expID))
 	if err != nil {
 		return nil, "", err
 	}
+	s.db.BumpGraphVersion()
 	return n, token, nil
 }
 
@@ -1395,7 +1412,9 @@ RETURNING `+nodeCols, owner, token, s.expID))
 // touches the row only while token is the running intent's current unclaim
 // token; otherwise it returns ErrIntentClaimLost and writes nothing.
 func (s *ExplorationStore) HeartbeatIntentClaim(id int64, token string) error {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET last_heartbeat_at=now()
+	// Bypass s.db.Exec so routine lease heartbeats do not invalidate overviewCache
+	// (matching migration 0013_expnodes_updated_at_trigger.sql).
+	res, err := s.db.DB.Exec(`UPDATE exploration_nodes SET last_heartbeat_at=now()
 WHERE id=$1 AND exploration_id=$2 AND kind='intent' AND state='running' AND unclaim_token=$3`, id, s.expID, token)
 	if err != nil {
 		return err
@@ -1567,7 +1586,7 @@ func (s *ExplorationStore) AppendActivitiesBatch(items []Activity) ([]int64, err
 		args = append(args,
 			s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool),
 			utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),
-			metadata, a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens, a.MainSeg,
+			json.RawMessage(jsonbClean(metadata)), a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens, a.MainSeg,
 		)
 	}
 	sb.WriteString(` RETURNING id`)
@@ -1670,7 +1689,7 @@ func (s *ExplorationStore) appendActivity(q queryRower, a Activity) (int64, erro
 INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, main_seg)
 VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,$15)
 RETURNING id`, s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),
-		metadata, a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens, a.MainSeg).Scan(&id)
+		json.RawMessage(jsonbClean(metadata)), a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens, a.MainSeg).Scan(&id)
 	return id, err
 }
 

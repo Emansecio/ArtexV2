@@ -59,32 +59,38 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 	}
 	s.dbOnce.Do(func() {
 		ch := make(chan dbWriteReq, 2000)
-		s.mu.Lock()
-		s.dbCh = ch
-		s.mu.Unlock()
 
-		// Restore last 100 rows from DB → prepend to ring as history context.
-		if logs, err := pg.RecentLogs(100); err == nil && len(logs) > 0 {
-			s.mu.Lock()
-			restored := make([]LogLine, 0, len(logs))
-			for _, l := range logs {
-				s.seq++
-				restored = append(restored, LogLine{
-					Seq:   s.seq,
+		// Restore last 100 rows from DB → prepend to ring as history context
+		// before wiring s.dbCh so any shifted sequences never conflict with
+		// already-enqueued dbWriteReq entries.
+		logs, err := pg.RecentLogs(100)
+
+		s.mu.Lock()
+		if err == nil && len(logs) > 0 {
+			shift := int64(len(logs))
+			restored := make([]LogLine, len(logs))
+			for i, l := range logs {
+				restored[i] = LogLine{
+					Seq:   int64(i + 1),
 					DBID:  l.ID,
 					TS:    l.CreatedAt.Format(time.RFC3339),
 					Level: l.Level,
 					Tag:   l.Tag,
 					Text:  l.Text,
-				})
+				}
 			}
+			for i := range s.ring {
+				s.ring[i].Seq += shift
+			}
+			s.seq += shift
 			// Prepend history before any in-memory startup logs already in ring.
 			s.ring = append(restored, s.ring...)
 			if len(s.ring) > s.cap {
 				s.ring = s.ring[len(s.ring)-s.cap:]
 			}
-			s.mu.Unlock()
 		}
+		s.dbCh = ch
+		s.mu.Unlock()
 
 		// Async writer: batches pending DB rows (up to 64 per batch or 50ms) and
 		// inserts via a single multi-row SQL statement, stamping DBIDs back in O(1).
@@ -219,11 +225,10 @@ func (s *logSinkT) add(l LogLine) {
 		s.ring[s.cap-1] = l
 	}
 	ch := s.dbCh
-	var subs []chan LogLine
-	if len(s.subs) > 0 {
-		subs = make([]chan LogLine, 0, len(s.subs))
-		for sub := range s.subs {
-			subs = append(subs, sub)
+	for sub := range s.subs {
+		select {
+		case sub <- l:
+		default:
 		}
 	}
 	s.mu.Unlock()
@@ -232,13 +237,6 @@ func (s *logSinkT) add(l LogLine) {
 	if ch != nil {
 		select {
 		case ch <- dbWriteReq{seq: l.Seq, ll: l}:
-		default:
-		}
-	}
-
-	for _, sub := range subs {
-		select {
-		case sub <- l:
 		default:
 		}
 	}

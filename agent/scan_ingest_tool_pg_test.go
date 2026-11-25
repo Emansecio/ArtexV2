@@ -32,7 +32,12 @@ func TestIngestScanOutputPG(t *testing.T) {
 	tsx.SetTaskID(task.ID)
 	tsx.SetAssetStore(d.Assets(), d.Companies())
 
-	dir := t.TempDir()
+	base := t.TempDir()
+	tsx.SetWorkBase(base)
+	dir := filepath.Join(base, "run")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "scan.xml"), []byte(nmapFixture), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +141,12 @@ func TestIngestScanOutputJSONPG(t *testing.T) {
 	tsx := NewToolSet(store, "worker-1")
 	tsx.SetTaskID(task.ID)
 	tsx.SetAssetStore(d.Assets(), d.Companies())
-	dir := t.TempDir()
+	base := t.TempDir()
+	tsx.SetWorkBase(base)
+	dir := filepath.Join(base, "run")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	tool := tsx.ingestScanOutput()
 	formats := map[string]string{"nuclei-jsonl": nucleiFixture, "httpx-jsonl": httpxFixture, "ffuf-json": ffufFixture}
 	ingest := func(format string) map[string]any {
@@ -219,7 +229,12 @@ func TestIngestScanOutputUserinfoPG(t *testing.T) {
 	tsx := NewToolSet(store, "worker-1")
 	tsx.SetTaskID(task.ID)
 	tsx.SetAssetStore(d.Assets(), d.Companies())
-	dir := t.TempDir()
+	base := t.TempDir()
+	tsx.SetWorkBase(base)
+	dir := filepath.Join(base, "run")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	tool := tsx.ingestScanOutput()
 	ingest := func(format, content string) map[string]any {
 		t.Helper()

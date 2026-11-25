@@ -31,6 +31,14 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 }
 
 func (l *loop) execOneWithCtx(toolCtx context.Context, use llm.ContentBlock, settling bool, emitProgress func(tool.ProgressInfo)) (llm.ContentBlock, []llm.Message) {
+	if toolCtx == nil {
+		toolCtx = l.ctx
+	}
+	if toolCtx != nil {
+		if err := toolCtx.Err(); err != nil {
+			return llm.ToolResultText(use.ID, "Error: "+err.Error(), true), nil
+		}
+	}
 	t, ok := l.in.Tools.Get(use.Name)
 	if !ok {
 		return llm.ToolResultText(use.ID, fmt.Sprintf("Error: unknown tool %q", use.Name), true), nil
@@ -62,11 +70,27 @@ func (l *loop) execOneWithCtx(toolCtx context.Context, use llm.ContentBlock, set
 		Allowed:    l.in.Allowed,
 		Disallowed: l.in.Disallowed,
 	}
-	dec := permission.Evaluate(l.ctx, permission.Request{
+
+	isReadOnly := t.IsReadOnly(input)
+	var (
+		innerTool   tool.CoreTool
+		innerName   string
+		innerParams json.RawMessage
+	)
+	if use.Name == tool.ExecuteExtraToolName {
+		var errMsg string
+		innerTool, innerName, innerParams, errMsg = l.resolveExtraTool(settling, input)
+		if errMsg != "" {
+			return llm.ToolResultText(use.ID, errMsg, true), nil
+		}
+		isReadOnly = innerTool.IsReadOnly(innerParams)
+	}
+
+	dec := permission.Evaluate(toolCtx, permission.Request{
 		ToolName:     use.Name,
 		Input:        input,
-		IsReadOnly:   t.IsReadOnly(input),
-		ToolDecision: t.CheckPermissions(l.ctx, input, pc),
+		IsReadOnly:   isReadOnly,
+		ToolDecision: t.CheckPermissions(toolCtx, input, pc),
 		Ctx:          pc,
 		Ask:          l.in.CanUseTool,
 	})
@@ -79,14 +103,59 @@ func (l *loop) execOneWithCtx(toolCtx context.Context, use llm.ContentBlock, set
 	}
 	if len(dec.UpdatedInput) > 0 {
 		input = dec.UpdatedInput
+		if use.Name == tool.ExecuteExtraToolName {
+			var errMsg string
+			innerTool, innerName, innerParams, errMsg = l.resolveExtraTool(settling, input)
+			if errMsg != "" {
+				return llm.ToolResultText(use.ID, errMsg, true), nil
+			}
+		}
+	}
+	if innerTool != nil {
+		innerDec := permission.Evaluate(toolCtx, permission.Request{
+			ToolName:     innerName,
+			Input:        innerParams,
+			IsReadOnly:   innerTool.IsReadOnly(innerParams),
+			ToolDecision: innerTool.CheckPermissions(toolCtx, innerParams, pc),
+			Ctx:          pc,
+			Ask:          l.in.CanUseTool,
+		})
+		if innerDec.Behavior != permission.Allow {
+			msg := innerDec.Message
+			if msg == "" {
+				msg = "denied"
+			}
+			return llm.ToolResultText(use.ID, "Tool call was not permitted: "+msg, true), nil
+		}
+		if len(innerDec.UpdatedInput) > 0 {
+			rewritten, err := marshalExtraToolInput(innerName, innerDec.UpdatedInput)
+			if err != nil {
+				return llm.ToolResultText(use.ID, "Error: invalid rewritten tool input: "+err.Error(), true), nil
+			}
+			innerParams = normalizeExtraParams(innerDec.UpdatedInput)
+			input = rewritten
+		}
 	}
 
 	// Pre-tool hook.
 	if l.in.Hooks != nil {
-		if block, msg, updated := l.in.Hooks.PreToolUse(l.ctx, use.Name, input); block {
-			return llm.ToolResultText(use.ID, "Blocked by hook: "+msg, true), nil
-		} else if len(updated) > 0 {
-			input = updated
+		if innerTool != nil {
+			if block, msg, updated := l.in.Hooks.PreToolUse(toolCtx, innerName, innerParams); block {
+				return llm.ToolResultText(use.ID, "Blocked by hook: "+msg, true), nil
+			} else if len(updated) > 0 {
+				rewritten, err := marshalExtraToolInput(innerName, updated)
+				if err != nil {
+					return llm.ToolResultText(use.ID, "Error: invalid rewritten tool input: "+err.Error(), true), nil
+				}
+				innerParams = normalizeExtraParams(updated)
+				input = rewritten
+			}
+		} else {
+			if block, msg, updated := l.in.Hooks.PreToolUse(toolCtx, use.Name, input); block {
+				return llm.ToolResultText(use.ID, "Blocked by hook: "+msg, true), nil
+			} else if len(updated) > 0 {
+				input = updated
+			}
 		}
 	}
 
@@ -122,14 +191,65 @@ func (l *loop) execOneWithCtx(toolCtx context.Context, use llm.ContentBlock, set
 
 	if l.in.Hooks != nil {
 		raw, _ := json.Marshal(res.Flatten())
-		l.in.Hooks.PostToolUse(l.ctx, use.Name, input, raw, res.IsError)
+		if innerTool != nil {
+			l.in.Hooks.PostToolUse(toolCtx, innerName, innerParams, raw, res.IsError)
+		} else {
+			l.in.Hooks.PostToolUse(toolCtx, use.Name, input, raw, res.IsError)
+		}
 	}
 
-	content := res.Content
+	var content []llm.ContentBlock
+	for _, b := range res.Content {
+		if b.Type == llm.BlockText && b.Text == "" {
+			continue
+		}
+		content = append(content, b)
+	}
 	if len(content) == 0 {
 		content = []llm.ContentBlock{llm.TextBlock("(no output)")}
 	}
 	return llm.ContentBlock{Type: llm.BlockToolResult, ToolUseID: use.ID, Content: content, IsError: res.IsError}, res.Extra
+}
+
+func (l *loop) resolveExtraTool(settling bool, input json.RawMessage) (tool.CoreTool, string, json.RawMessage, string) {
+	var extraArgs struct {
+		ToolName string          `json:"tool_name"`
+		Params   json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(input, &extraArgs); err != nil {
+		return nil, "", nil, "Error: invalid tool input: " + err.Error()
+	}
+	if extraArgs.ToolName == "" {
+		return nil, "", nil, "Error: tool_name is required"
+	}
+	if extraArgs.ToolName == tool.ExecuteExtraToolName {
+		return nil, "", nil, "Error: nested ExecuteExtraTool calls are not permitted"
+	}
+	innerTool, innerOK := l.in.Tools.Get(extraArgs.ToolName)
+	if !innerOK {
+		return nil, "", nil, fmt.Sprintf("Error: unknown tool %q", extraArgs.ToolName)
+	}
+	if l.isDisabledDuringSettlement(settling, extraArgs.ToolName) {
+		return nil, "", nil, fmt.Sprintf("Error: tool %q is disabled during wrap-up; persist findings and summarize without calling it.", extraArgs.ToolName)
+	}
+	return innerTool, extraArgs.ToolName, normalizeExtraParams(extraArgs.Params), ""
+}
+
+func normalizeExtraParams(params json.RawMessage) json.RawMessage {
+	if len(params) == 0 || string(params) == "null" {
+		return json.RawMessage("{}")
+	}
+	return params
+}
+
+func marshalExtraToolInput(toolName string, params json.RawMessage) (json.RawMessage, error) {
+	return json.Marshal(struct {
+		ToolName string          `json:"tool_name"`
+		Params   json.RawMessage `json:"params"`
+	}{
+		ToolName: toolName,
+		Params:   normalizeExtraParams(params),
+	})
 }
 
 // capOutput runs every text block of a tool result through the idempotent

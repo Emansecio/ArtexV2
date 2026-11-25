@@ -162,6 +162,9 @@ func (n *Notifier) Run(ctx context.Context) {
 		case <-n.wake:
 			n.step(ctx)
 		case <-t.C:
+			n.mu.Lock()
+			n.cfgAt = time.Time{}
+			n.mu.Unlock()
 			n.step(ctx)
 		}
 	}
@@ -169,7 +172,7 @@ func (n *Notifier) Run(ctx context.Context) {
 
 func (n *Notifier) loadConfig(ctx context.Context) (bool, []*db.NotificationChannel, string, error) {
 	n.mu.Lock()
-	if !n.cfgAt.IsZero() && time.Since(n.cfgAt) < 30*time.Second {
+	if !n.cfgAt.IsZero() && time.Since(n.cfgAt) < 25*time.Second {
 		en, chs, base := n.cfgEnabled, n.cfgChannels, n.cfgBaseURL
 		n.mu.Unlock()
 		return en, chs, base, nil

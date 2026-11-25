@@ -17,6 +17,22 @@ func TestActivityOutboxKeepsDetail(t *testing.T) {
 	}
 }
 
+func TestActivityOutboxStripsNULBytes(t *testing.T) {
+	in := Activity{Worker: "worker", Kind: "tool_result", Summary: "sum\x00mary", Detail: "bin\x00data"}
+	raw, err := marshalActivity(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleaned := jsonbClean(raw)
+	out, err := unmarshalActivity(cleaned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Summary != "summary" || out.Detail != "bindata" {
+		t.Fatalf("cleaned round trip = %+v, want NULs stripped", out)
+	}
+}
+
 func TestFlushActivityOutboxReplaysOnce(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {

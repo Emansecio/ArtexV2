@@ -235,10 +235,12 @@ func (i *Interceptor) RequestTargets(ctx context.Context, scope TargetScope, too
 func (i *Interceptor) openTargetRequest(ctx context.Context, ref db.TargetScopeRef, scope TargetScope, toolName string, input []byte, t TargetRequest, ask *Decision) (*targetWaiter, error) {
 	i.mu.RLock()
 	proxied := i.upstreamProxy
+	toolProxy := i.toolProxy
 	i.mu.RUnlock()
-	// Behind the upstream proxy the proxy chooses the address: the approval is
-	// for the name, and the pin created from this row says so.
-	nameOnly := proxied != nil && proxied()
+	// Behind the upstream proxy or a tool-level proxy the proxy chooses the
+	// address: the approval is for the name, and the pin created from this row
+	// says so.
+	nameOnly := (proxied != nil && proxied()) || (toolProxy != nil && toolProxy(toolName))
 
 	dec := Decision{Action: "ask"}
 	if ask != nil {

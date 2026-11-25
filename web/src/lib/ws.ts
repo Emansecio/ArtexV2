@@ -2,12 +2,14 @@ import { sseUrl } from "@/lib/api";
 
 export interface WSSubscribeOpts {
   since?: number;
+  getSince?: () => number;
   onEvent: (event: string, data: unknown) => void;
   onState?: (connected: boolean) => void;
 }
 
 interface SubEntry {
   since: number;
+  getSince?: () => number;
   onEvent: (event: string, data: unknown) => void;
   onState?: (connected: boolean) => void;
 }
@@ -87,7 +89,8 @@ function ensureSocket() {
     for (const [ch, subs] of channels) {
       let minSince = 0;
       for (const s of subs) {
-        if (s.since > 0 && (minSince === 0 || s.since < minSince)) minSince = s.since;
+        const curSince = s.getSince ? s.getSince() : s.since;
+        if (curSince > 0 && (minSince === 0 || curSince < minSince)) minSince = curSince;
       }
       sendControl({ op: "sub", channel: ch, since: minSince || undefined });
     }
@@ -106,6 +109,16 @@ function ensureSocket() {
     const event = msg.event;
     if (!ch || !event) return;
     if (event === "resync") {
+      const subs = channels.get(ch);
+      if (subs && subs.size > 0) {
+        let minSince = 0;
+        for (const s of subs) {
+          const curSince = s.getSince ? s.getSince() : s.since;
+          if (curSince > 0 && (minSince === 0 || curSince < minSince)) minSince = curSince;
+          s.onEvent(event, msg.data);
+        }
+        sendControl({ op: "sub", channel: ch, since: minSince || undefined });
+      }
       notifyDirty(ch);
       return;
     }
@@ -122,6 +135,7 @@ function ensureSocket() {
   };
 
   ws.onmessage = (ev) => {
+    if (socket !== ws) return;
     if (typeof ev.data !== "string") return;
     let msg: { channel?: string; event?: string; data?: unknown };
     try {
@@ -141,6 +155,7 @@ function ensureSocket() {
 
   ws.onclose = handleClose;
   ws.onerror = () => {
+    if (socket !== ws) return;
     for (const subs of channels.values()) {
       for (const s of subs) s.onState?.(false);
     }
@@ -179,6 +194,7 @@ export function onWSDirty(fn: (channel: string, topic?: string) => void): () => 
 export function subscribeWS(channel: string, opts: WSSubscribeOpts): () => void {
   const entry: SubEntry = {
     since: opts.since ?? 0,
+    getSince: opts.getSince,
     onEvent: opts.onEvent,
     onState: opts.onState,
   };
@@ -192,7 +208,10 @@ export function subscribeWS(channel: string, opts: WSSubscribeOpts): () => void 
 
   if (connected) {
     entry.onState?.(true);
-    if (first) sendControl({ op: "sub", channel, since: entry.since || undefined });
+    if (first) {
+      const curSince = entry.getSince ? entry.getSince() : entry.since;
+      sendControl({ op: "sub", channel, since: curSince || undefined });
+    }
   } else {
     ensureSocket();
   }

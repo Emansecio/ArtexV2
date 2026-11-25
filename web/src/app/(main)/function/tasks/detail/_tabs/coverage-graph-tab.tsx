@@ -483,11 +483,15 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
     edges: [],
   });
 
+  const requestIdRef = React.useRef(0);
+
   const fetchGraph = React.useCallback(() => {
+    const reqId = ++requestIdRef.current;
     setLoading(true);
     api
       .taskCoverageGraph(taskId)
       .then((g) => {
+        if (requestIdRef.current !== reqId) return;
         // Asset coverage disabled (B1): the graph still renders (in-scope assets/company links remain visible), but
         // tested state is flattened away — no test progress and no tested highlight.
         const nodes = coverageEnabled ? (g.nodes ?? []) : (g.nodes ?? []).map((n) => ({ ...n, tested: false }));
@@ -496,11 +500,16 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
       .catch(() => {
         /* keep the previous data */
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (requestIdRef.current === reqId) setLoading(false);
+      });
   }, [taskId, coverageEnabled]);
 
   React.useEffect(() => {
     fetchGraph();
+    return () => {
+      requestIdRef.current++;
+    };
   }, [fetchGraph]);
 
   const { renderNodes, renderEdges } = React.useMemo(
@@ -518,14 +527,23 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
     [renderNodes, renderEdges],
   );
 
-  // Maintain gDataRef + renderMapRef (read by events and graph data application).
-  gDataRef.current = {
-    nodes: toG6Nodes(renderNodes),
-    edges: renderEdges.map((e) => ({ source: e.src, target: e.dst })),
-  };
-  const rmap = new Map<string, RenderNode>();
-  for (const rn of renderNodes) rmap.set(rn.key, rn);
-  renderMapRef.current = rmap;
+  // Memoize G6 graph payload and render-node map instead of rebuilding on every UI render.
+  const { gData, rmap } = React.useMemo(() => {
+    const map = new Map<string, RenderNode>();
+    for (const rn of renderNodes) map.set(rn.key, rn);
+    return {
+      gData: {
+        nodes: toG6Nodes(renderNodes),
+        edges: renderEdges.map((e) => ({ source: e.src, target: e.dst })),
+      },
+      rmap: map,
+    };
+  }, [renderNodes, renderEdges]);
+
+  React.useEffect(() => {
+    gDataRef.current = gData;
+    renderMapRef.current = rmap;
+  }, [gData, rmap]);
 
   const applyData = React.useCallback(() => {
     const graph = graphRef.current;

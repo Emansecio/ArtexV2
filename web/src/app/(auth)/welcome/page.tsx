@@ -26,7 +26,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { type Locale, LOCALES, locale, setLocale, t } from "@/i18n";
-import { api } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
 import { auth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
@@ -111,6 +111,8 @@ function saveWelcomePrefs(prefs: WelcomePrefs) {
   }
 }
 
+type AuthMode = "local" | "login" | "setup";
+
 export default function WelcomePage() {
   const [prefs, setPrefs] = React.useState<WelcomePrefs>(DEFAULT_PREFS);
   const [hydrated, setHydrated] = React.useState(false);
@@ -119,6 +121,12 @@ export default function WelcomePage() {
   const [backendOk, setBackendOk] = React.useState<boolean | null>(null);
   const [version, setVersion] = React.useState("");
   const [error, setError] = React.useState("");
+  const [authMode, setAuthMode] = React.useState<AuthMode>("local");
+  const passwordInitializedRef = React.useRef<boolean | null>(null);
+  const [username, setUsername] = React.useState("ARTEX");
+  const [password, setPassword] = React.useState("");
+  const [confirmPassword, setConfirmPassword] = React.useState("");
+  const [setupToken, setSetupToken] = React.useState("");
 
   const enterWorkspace = React.useCallback(async (target: StartRoute) => {
     setEntering(true);
@@ -128,10 +136,69 @@ export default function WelcomePage() {
       auth.setToken(token);
       window.location.replace(target);
     } catch (e) {
-      setError((e as Error).message || t("Unable to connect to the backend service"));
+      if (e instanceof ApiError && e.status === 403) {
+        let initialized = passwordInitializedRef.current;
+        if (initialized === null) {
+          try {
+            const st = await api.authStatus();
+            initialized = st.initialized;
+            passwordInitializedRef.current = initialized;
+          } catch {
+            initialized = true;
+          }
+        }
+        setAuthMode(initialized ? "login" : "setup");
+        setError(e.message);
+      } else {
+        setError((e as Error).message || t("Unable to connect to the backend service"));
+      }
       setEntering(false);
     }
   }, []);
+
+  async function handlePasswordLogin(e: React.FormEvent) {
+    e.preventDefault();
+    setEntering(true);
+    setError("");
+    try {
+      const { token } = await api.login(username.trim(), password);
+      auth.setToken(token);
+      window.location.replace(prefs.defaultRoute);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403 && /not initialized/i.test(err.message)) {
+        passwordInitializedRef.current = false;
+        setAuthMode("setup");
+      }
+      setError((err as Error).message || t("Unable to connect to the backend service"));
+      setEntering(false);
+    }
+  }
+
+  async function handlePasswordInit(e: React.FormEvent) {
+    e.preventDefault();
+    setError("");
+    if (password.length < 12) {
+      setError(t("Password must be at least 12 characters"));
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError(t("The two passwords do not match"));
+      return;
+    }
+    setEntering(true);
+    try {
+      const { token } = await api.authInit(password, setupToken.trim());
+      auth.setToken(token);
+      window.location.replace(prefs.defaultRoute);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403 && /already set/i.test(err.message)) {
+        passwordInitializedRef.current = true;
+        setAuthMode("login");
+      }
+      setError((err as Error).message || t("Unable to connect to the backend service"));
+      setEntering(false);
+    }
+  }
 
   React.useEffect(() => {
     const loaded = loadWelcomePrefs();
@@ -145,18 +212,31 @@ export default function WelcomePage() {
       return;
     }
 
-    api
-      .health()
-      .then((h) => {
-        setBackendOk(true);
-        setVersion((h.version ?? "").replace(/^v(?=\d)/, ""));
-        if (loaded.autoEnter) {
-          void enterWorkspace(loaded.defaultRoute);
+    let cancelled = false;
+    void Promise.allSettled([api.health(), api.authStatus()]).then(([healthRes, statusRes]) => {
+      if (cancelled) return;
+      const ok = healthRes.status === "fulfilled";
+      setBackendOk(ok);
+      if (ok) {
+        setVersion((healthRes.value.version ?? "").replace(/^v(?=\d)/, ""));
+      }
+      let initialized: boolean | null = null;
+      if (statusRes.status === "fulfilled") {
+        initialized = Boolean(statusRes.value.initialized);
+        passwordInitializedRef.current = initialized;
+        if (initialized) {
+          setAuthMode("login");
+          return;
         }
-      })
-      .catch(() => {
-        setBackendOk(false);
-      });
+      }
+      if (ok && loaded.autoEnter) {
+        void enterWorkspace(loaded.defaultRoute);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, [enterWorkspace]);
 
   function updatePrefs(patch: Partial<WelcomePrefs>) {
@@ -240,7 +320,11 @@ export default function WelcomePage() {
               />
               {backendOk === false
                 ? t("Backend offline")
-                : t("Local mode · No password required")}
+                : authMode === "login"
+                  ? t("Password sign-in")
+                  : authMode === "setup"
+                    ? t("Set password and sign in")
+                    : t("Local mode · No password required")}
             </div>
 
             <div className="space-y-3">
@@ -255,28 +339,134 @@ export default function WelcomePage() {
             </div>
 
             {/* Primary action */}
-            <div className="flex flex-wrap items-center gap-3">
-              <Button
-                size="lg"
-                disabled={entering || backendOk === false}
-                onClick={() => void enterWorkspace(prefs.defaultRoute)}
-                className="h-11 gap-2 px-6 transition-transform duration-150 hover:-translate-y-0.5 active:translate-y-0"
+            {authMode === "local" ? (
+              <div className="flex flex-wrap items-center gap-3">
+                <Button
+                  size="lg"
+                  disabled={entering || backendOk === false}
+                  onClick={() => void enterWorkspace(prefs.defaultRoute)}
+                  className="h-11 gap-2 px-6 transition-transform duration-150 hover:-translate-y-0.5 active:translate-y-0"
+                >
+                  {entering ? <Loader2 className="size-4 animate-spin" /> : null}
+                  {entering ? t("Opening workspace…") : t("Open workspace")}
+                  {!entering && <ArrowRight className="size-4" />}
+                </Button>
+                <Button
+                  type="button"
+                  size="lg"
+                  variant="outline"
+                  className="h-11 gap-2 px-5 transition-transform duration-150 hover:-translate-y-0.5 active:translate-y-0"
+                  onClick={() => setCustomizing((v) => !v)}
+                >
+                  <SlidersHorizontal className="size-4" />
+                  {t("Customize welcome")}
+                </Button>
+              </div>
+            ) : authMode === "login" ? (
+              <form
+                onSubmit={(e) => void handlePasswordLogin(e)}
+                className="grid max-w-md gap-3.5 rounded-2xl border bg-card p-5 shadow-xs"
               >
-                {entering ? <Loader2 className="size-4 animate-spin" /> : null}
-                {entering ? t("Opening workspace…") : t("Open workspace")}
-                {!entering && <ArrowRight className="size-4" />}
-              </Button>
-              <Button
-                type="button"
-                size="lg"
-                variant="outline"
-                className="h-11 gap-2 px-5 transition-transform duration-150 hover:-translate-y-0.5 active:translate-y-0"
-                onClick={() => setCustomizing((v) => !v)}
+                <div className="grid gap-1.5">
+                  <Label htmlFor="w-username">{t("Username")}</Label>
+                  <Input
+                    id="w-username"
+                    autoComplete="username"
+                    required
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="w-password">{t("Password")}</Label>
+                  <Input
+                    id="w-password"
+                    type="password"
+                    autoComplete="current-password"
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                  <Button type="submit" disabled={entering || backendOk === false} className="gap-2 px-5">
+                    {entering ? <Loader2 className="size-4 animate-spin" /> : null}
+                    {entering ? t("Signing in...") : t("Sign in")}
+                    {!entering && <ArrowRight className="size-4" />}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="gap-2"
+                    onClick={() => setCustomizing((v) => !v)}
+                  >
+                    <SlidersHorizontal className="size-4" />
+                    {t("Customize welcome")}
+                  </Button>
+                </div>
+              </form>
+            ) : (
+              <form
+                onSubmit={(e) => void handlePasswordInit(e)}
+                className="grid max-w-md gap-3.5 rounded-2xl border bg-card p-5 shadow-xs"
               >
-                <SlidersHorizontal className="size-4" />
-                {t("Customize welcome")}
-              </Button>
-            </div>
+                <p className="text-muted-foreground text-xs leading-relaxed">
+                  {t(
+                    "First time using ARTEX? Enter the setup token from the server log, then set a login password for the account (at least 12 characters)",
+                  )}
+                </p>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="w-setup-token">{t("Setup token")}</Label>
+                  <Input
+                    id="w-setup-token"
+                    autoComplete="off"
+                    required
+                    value={setupToken}
+                    onChange={(e) => setSetupToken(e.target.value)}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="w-new-password">{t("New password")}</Label>
+                  <Input
+                    id="w-new-password"
+                    type="password"
+                    autoComplete="new-password"
+                    required
+                    minLength={12}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="w-confirm-password">{t("Confirm password")}</Label>
+                  <Input
+                    id="w-confirm-password"
+                    type="password"
+                    autoComplete="new-password"
+                    required
+                    minLength={12}
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                  <Button type="submit" disabled={entering || backendOk === false} className="gap-2 px-5">
+                    {entering ? <Loader2 className="size-4 animate-spin" /> : null}
+                    {entering ? t("Signing in...") : t("Set password and sign in")}
+                    {!entering && <ArrowRight className="size-4" />}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="gap-2"
+                    onClick={() => setCustomizing((v) => !v)}
+                  >
+                    <SlidersHorizontal className="size-4" />
+                    {t("Customize welcome")}
+                  </Button>
+                </div>
+              </form>
+            )}
 
             {error && (
               <p role="alert" className="text-sm text-destructive">
@@ -300,7 +490,7 @@ export default function WelcomePage() {
                       disabled={entering}
                       onClick={() => {
                         updatePrefs({ defaultRoute: dest.route });
-                        if (!customizing) void enterWorkspace(dest.route);
+                        if (!customizing && authMode === "local") void enterWorkspace(dest.route);
                       }}
                       className={cn(
                         "group flex items-start gap-3 rounded-xl border bg-card p-3.5 text-left transition-all duration-200 hover:-translate-y-0.5 hover:border-foreground/30 hover:shadow-xs active:translate-y-0",

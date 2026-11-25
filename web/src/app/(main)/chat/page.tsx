@@ -494,6 +494,7 @@ function ChatView({
   agents,
   profiles,
   initial,
+  onInitialConsumed,
   onTitleMaybeChanged,
   onConvUpdated,
   leadingControl,
@@ -504,6 +505,7 @@ function ChatView({
   // pending text + already-uploaded attachments handed off from a draft that
   // created this conversation via the paperclip (consumed once, on mount).
   initial?: { input?: string; attachments?: ChatAttachment[] };
+  onInitialConsumed?: () => void;
   onTitleMaybeChanged: () => void;
   onConvUpdated: () => void;
   leadingControl?: React.ReactNode;
@@ -517,6 +519,10 @@ function ChatView({
   const [stopping, setStopping] = React.useState(false);
   // Upload method 1: already-uploaded attachments (stored under sessions/conv-<id>/uploads/) are sent with the next message.
   const [attachments, setAttachments] = React.useState<ChatAttachment[]>(initial?.attachments ?? []);
+  React.useEffect(() => {
+    if (initial) onInitialConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [uploading, setUploading] = React.useState(false);
   const cursorRef = React.useRef(0); // newest loaded id — incremental-tail anchor
   const earliestRef = React.useRef(0); // earliest loaded id — reverse-pagination anchor
@@ -594,11 +600,14 @@ function ChatView({
 
   // Real-time SSE token & activity stream while a turn is running, with graceful polling fallback.
   React.useEffect(() => {
-    if (!running) {
+    if (!running || !historyLoaded) {
       setStreamingDelta(null);
       return;
     }
     let live = true;
+    let wsOpen = false;
+    let polling = false;
+    let pollGen = 0;
     let pollTimer: ReturnType<typeof setTimeout> | undefined;
     let unsubWS: (() => void) | null = null;
     const pendingActs: Activity[] = [];
@@ -633,8 +642,11 @@ function ChatView({
     };
 
     const startFallbackPoll = () => {
-      if (!live || pollTimer) return;
+      if (!live || wsOpen || polling) return;
+      polling = true;
+      const gen = ++pollGen;
       const tick = async () => {
+        pollTimer = undefined;
         let keepPolling = true;
         try {
           const r = await api.conversationMessages(conv.id, cursorRef.current);
@@ -650,29 +662,84 @@ function ChatView({
         } catch {
           /* transient */
         } finally {
-          if (live && keepPolling) pollTimer = setTimeout(() => void tick(), 2000);
+          if (live && polling && !wsOpen && keepPolling && gen === pollGen) {
+            pollTimer = setTimeout(() => void tick(), 2000);
+          } else if (gen === pollGen) {
+            polling = false;
+          }
         }
       };
       void tick();
     };
 
+    const finishRun = () => {
+      if (rafId) {
+        window.cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+      pendingDeltas.length = 0;
+      if (pendingActs.length > 0) {
+        const acts = pendingActs.splice(0, pendingActs.length);
+        const last = acts[acts.length - 1];
+        cursorRef.current = Math.max(cursorRef.current, last.seq);
+        setMessages((prev) => mergeActivities(prev, acts));
+      }
+      setRunning(false);
+      setStreamingDelta(null);
+      onTitleMaybeChanged();
+    };
+
+    const catchUp = async () => {
+      try {
+        const r = await api.conversationMessages(conv.id, cursorRef.current);
+        if (!live) return;
+        if (r.items.length) {
+          setMessages((prev) => mergeActivities(prev, r.items));
+        }
+        cursorRef.current = Math.max(cursorRef.current, r.cursor);
+        if (!r.running) {
+          finishRun();
+        }
+      } catch {
+        /* transient */
+      }
+    };
+
     unsubWS = subscribeWS(`conv:${conv.id}`, {
       since: cursorRef.current,
+      getSince: () => cursorRef.current,
       onState: (open) => {
         if (!live) return;
+        wsOpen = open;
         if (open) {
+          polling = false;
+          pollGen++;
           if (pollTimer !== undefined) {
             clearTimeout(pollTimer);
             pollTimer = undefined;
           }
+          // One-shot catch-up fetch on initial subscribe and WS reconnect so
+          // messages/status emitted before the sub frame (including seq 1 on a
+          // new conversation where since=0 skips server replay) are never missed.
+          void catchUp();
         } else {
           startFallbackPoll();
         }
       },
       onEvent: (event, data) => {
-        if (!live || !data || typeof data !== "object") return;
+        if (!live) return;
+        if (event === "resync") {
+          void catchUp();
+          return;
+        }
+        if (!data || typeof data !== "object") return;
         if (event === "activity") {
-          pendingActs.push(data as Activity);
+          const a = data as Activity;
+          if (a.seq > cursorRef.current) cursorRef.current = a.seq;
+          if (a.kind === "text" || a.kind === "thinking" || a.kind === "tool_use" || a.kind === "result") {
+            pendingDeltas.length = 0;
+          }
+          pendingActs.push(a);
           schedule();
         } else if (event === "delta") {
           const df = data as { kind?: string; text?: string };
@@ -682,9 +749,7 @@ function ChatView({
         } else if (event === "status") {
           const st = data as { running?: boolean };
           if (st.running === false) {
-            setRunning(false);
-            setStreamingDelta(null);
-            onTitleMaybeChanged();
+            finishRun();
           }
         }
       },
@@ -692,11 +757,13 @@ function ChatView({
 
     return () => {
       live = false;
+      polling = false;
+      pollGen++;
       if (rafId) window.cancelAnimationFrame(rafId);
-      if (pollTimer) clearTimeout(pollTimer);
+      if (pollTimer !== undefined) clearTimeout(pollTimer);
       unsubWS?.();
     };
-  }, [running, conv.id, onTitleMaybeChanged]);
+  }, [running, historyLoaded, conv.id, onTitleMaybeChanged]);
 
   const loadFocusPage = React.useCallback((before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE), [conv.id]);
   const mergeFocusPage = React.useCallback((page: { items: Activity[]; hasMore: boolean }) => {
@@ -1659,6 +1726,15 @@ export default function ChatPage() {
               agents={agents}
               profiles={profiles}
               initial={pendingByConv[selected.id]}
+              onInitialConsumed={() => {
+                const id = selected.id;
+                setPendingByConv((prev) => {
+                  if (!(id in prev)) return prev;
+                  const next = { ...prev };
+                  delete next[id];
+                  return next;
+                });
+              }}
               onTitleMaybeChanged={reloadConvs}
               onConvUpdated={reloadConvs}
               leadingControl={

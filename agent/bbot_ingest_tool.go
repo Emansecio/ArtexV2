@@ -22,14 +22,29 @@ const bbotMaxLineBytes = 64 << 10
 
 // readBbotJSONL reads bbot JSONL from r one line at a time and parses each line
 // through parseBbotJSONL. It returns the merged result and the number of lines
-// skipped for exceeding bbotMaxLineBytes.
+// skipped for exceeding bbotMaxLineBytes. Total buffered events are capped at
+// scanMaxItems to prevent unbounded memory growth.
 func readBbotJSONL(r io.Reader) (bbotIngest, int, error) {
 	var out bbotIngest
 	oversized, err := readJSONLines(r, func(line []byte) {
 		res, _ := parseBbotJSONL(bytes.NewReader(line)) // a bytes.Reader never fails
-		out.InScope = append(out.InScope, res.InScope...)
-		out.Intel = append(out.Intel, res.Intel...)
 		out.Skipped += res.Skipped
+		for _, ev := range res.InScope {
+			if len(out.InScope)+len(out.Intel) < scanMaxItems {
+				out.InScope = append(out.InScope, ev)
+			} else {
+				out.OverCap++
+				out.Truncated = true
+			}
+		}
+		for _, ev := range res.Intel {
+			if len(out.InScope)+len(out.Intel) < scanMaxItems {
+				out.Intel = append(out.Intel, ev)
+			} else {
+				out.OverCap++
+				out.Truncated = true
+			}
+		}
 	})
 	return out, oversized, err
 }
@@ -75,6 +90,8 @@ func openBbotOutput(base, dir, p string) (*os.File, error) {
 		return nil, err
 	} else if !fi.Mode().IsRegular() {
 		return nil, errNotRegular
+	} else if fi.Size() > scanMaxFileBytes {
+		return nil, fmt.Errorf("file is %d bytes, over the %d byte cap", fi.Size(), scanMaxFileBytes)
 	}
 	f, err := w.Open(rel)
 	if err != nil {
@@ -83,6 +100,13 @@ func openBbotOutput(base, dir, p string) (*os.File, error) {
 	if err := checkOpened(f); err != nil {
 		f.Close()
 		return nil, err
+	}
+	if st, err := f.Stat(); err != nil {
+		f.Close()
+		return nil, err
+	} else if st.Size() > scanMaxFileBytes {
+		f.Close()
+		return nil, fmt.Errorf("file is %d bytes, over the %d byte cap", st.Size(), scanMaxFileBytes)
 	}
 	return f, nil
 }
@@ -133,7 +157,7 @@ func (t *ToolSet) runIngestBbot(ctx context.Context, in json.RawMessage, tc *act
 		return actool.Errorf("open: " + err.Error()), nil
 	}
 	defer f.Close()
-	res, oversized, err := readBbotJSONL(f)
+	res, oversized, err := readBbotJSONL(io.LimitReader(f, scanMaxFileBytes))
 	if err != nil {
 		return actool.Errorf("read: " + err.Error()), nil
 	}
@@ -143,6 +167,10 @@ func (t *ToolSet) runIngestBbot(ctx context.Context, in json.RawMessage, tc *act
 		"in_scope_not_asset": len(res.InScope) - len(items),
 		"skipped_lines":      res.Skipped,
 		"oversized_lines":    oversized,
+	}
+	if res.Truncated {
+		out["over_cap"] = res.OverCap
+		out["truncated"] = true
 	}
 	if len(items) > 0 {
 		raw, _ := json.Marshal(map[string]any{"assets": items})

@@ -12,26 +12,34 @@ import (
 // same Publish call, so they never diverge.
 type Broadcaster struct {
 	mu   sync.Mutex
-	subs map[string]map[chan db.Activity]struct{} // task id -> set of subscriber channels
+	subs map[string]map[chan db.Activity]chan struct{} // task id -> (sub ch -> optional overflow signal ch)
 }
 
 func NewBroadcaster() *Broadcaster {
-	return &Broadcaster{subs: map[string]map[chan db.Activity]struct{}{}}
+	return &Broadcaster{subs: map[string]map[chan db.Activity]chan struct{}{}}
 }
 
 // Subscribe returns a buffered channel of activities for a task plus an
 // unsubscribe func the caller must invoke (defer) to release it.
 func (b *Broadcaster) Subscribe(task string) (<-chan db.Activity, func()) {
+	ch, _, unsub := b.SubscribeResync(task)
+	return ch, unsub
+}
+
+// SubscribeResync is like Subscribe but also returns a 1-buffered overflow
+// notification channel signalled whenever an event is dropped for this subscriber.
+func (b *Broadcaster) SubscribeResync(task string) (<-chan db.Activity, <-chan struct{}, func()) {
 	ch := make(chan db.Activity, 256)
+	ov := make(chan struct{}, 1)
 	b.mu.Lock()
 	if b.subs[task] == nil {
-		b.subs[task] = map[chan db.Activity]struct{}{}
+		b.subs[task] = map[chan db.Activity]chan struct{}{}
 	}
-	b.subs[task][ch] = struct{}{}
+	b.subs[task][ch] = ov
 	b.mu.Unlock()
 
 	var once sync.Once
-	return ch, func() {
+	return ch, ov, func() {
 		once.Do(func() {
 			b.mu.Lock()
 			if m := b.subs[task]; m != nil {
@@ -47,16 +55,19 @@ func (b *Broadcaster) Subscribe(task string) (<-chan db.Activity, func()) {
 }
 
 // Publish fans an activity out to all subscribers of a task. Non-blocking: if a
-// subscriber's buffer is full the event is dropped — the client reconnects with
-// its last seq cursor and catches up the gap from the DB, so liveness never
-// stalls the engine.
+// subscriber's buffer is full the event is dropped and its overflow signal is
+// raised so WebSocket clients immediately resync from the DB.
 func (b *Broadcaster) Publish(task string, a db.Activity) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for ch := range b.subs[task] {
+	for ch, ov := range b.subs[task] {
 		select {
 		case ch <- a:
 		default:
+			select {
+			case ov <- struct{}{}:
+			default:
+			}
 		}
 	}
 }

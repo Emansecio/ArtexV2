@@ -254,8 +254,10 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, err.Error())
 		return
 	}
-	// Commit queued usage-ledger writes before the cascade can remove their
-	// task row — the async recorder must not outlive its FK target.
+	// Commit queued usage-activity and usage-ledger writes before the cascade
+	// can remove their task/exploration row — async recorders must not outlive
+	// their FK target.
+	s.engine.FlushUsageActivities()
 	flushUsageLedger(s.m.pg)
 	result, err := s.m.DeleteTask(id, opts)
 	if err != nil {
@@ -1658,6 +1660,10 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.RemoveAll(tmp) // no-op after a successful rename
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
 
 	var total int64
 	entries := 0
@@ -1705,6 +1711,10 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 		rc.Close()
 		if err != nil {
 			writeErr(w, 500, err.Error())
+			return
+		}
+		if n > maxSkillFileBytes {
+			writeErr(w, 400, "file too large: "+rel)
 			return
 		}
 		total += n
@@ -2142,17 +2152,38 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := body.LLMProfile
-	p.APIKey = body.APIKey
+	p.APIKey = strings.TrimSpace(body.APIKey)
 	p.Streaming = body.Streaming == nil || *body.Streaming
+	var stored *db.LLMProfile
 	// The list returns the proxy masked: the placeholder sent back keeps the
 	// stored proxy and is never stored itself.
 	if isMaskedSecret(p.Proxy) {
-		stored, err := pg.ProfileByID(p.ID)
+		var err error
+		stored, err = pg.ProfileByID(p.ID)
 		if p.ID == 0 || err != nil || stored == nil {
 			writeErr(w, 400, "proxy is a masked placeholder but no stored proxy to keep; enter the proxy or clear it")
 			return
 		}
 		p.Proxy = stored.Proxy
+	}
+	// Updating an existing profile with a blank api_key preserves the stored
+	// write-only key in PostgreSQL. Only allow that when the endpoint matches
+	// the one the key was saved for, so changing provider/base_url cannot rebind
+	// the secret to a different host.
+	if p.ID != 0 && p.APIKey == "" {
+		if stored == nil {
+			var err error
+			stored, err = pg.ProfileByID(p.ID)
+			if err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+		}
+		if stored != nil && strings.TrimSpace(stored.APIKey) != "" &&
+			!sameLLMEndpoint(p.Format, p.BaseURL, stored.Format, stored.BaseURL) {
+			writeErr(w, 400, "the saved API key is only valid for its original endpoint; re-enter api_key when changing provider or base_url")
+			return
+		}
 	}
 	// Output cap: negative values are meaningless, clamp to zero (= do not send the
 	// field). The field-name switch only matters for Chat Completions — anthropic and
@@ -2171,6 +2202,11 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.UserAgent = ua
+	if cfg := agent.ConfigFrom(p.Format, "", p.BaseURL, "", ""); cfg.OAuthProvider() != "" &&
+		strings.TrimSpace(p.BaseURL) != "" && !sameLLMEndpoint(p.Format, p.BaseURL, p.Format, "") {
+		writeErr(w, 400, "OAuth credentials are only sent to the canonical provider endpoint; custom base_url is not allowed")
+		return
+	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2584,6 +2620,10 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	provider := strings.TrimSpace(req.Provider)
 	// Resolve live OAuth access tokens for subscription-backed providers.
 	if provider == "chatgpt" || provider == "anthropic-oauth" {
+		if strings.TrimSpace(req.BaseURL) != "" && !sameLLMEndpoint(provider, req.BaseURL, provider, "") {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": "OAuth credentials are only sent to the canonical provider endpoint; custom base_url is not allowed"})
+			return
+		}
 		oauthProv := "chatgpt"
 		if provider == "anthropic-oauth" {
 			oauthProv = "anthropic"

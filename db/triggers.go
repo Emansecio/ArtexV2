@@ -189,8 +189,15 @@ ORDER BY n.id`, lastID)
 	return out, rows.Err()
 }
 
+// TimedOutTasks returns all live tasks that reached status='timeout'
+// (the scheduler filters out ones already fired via the persisted fired-set).
+func (d *DB) TimedOutTasks() ([]TaskEvent, error) {
+	return d.TimedOutTasksSince(0)
+}
+
 // TimedOutTasksSince returns tasks that reached status='timeout' with id > lastID,
-// ordered by id (monotonic watermark → no double-fire across restarts).
+// ordered by id. Prefer TimedOutTasks with a persisted fired-set for trigger
+// tracking because tasks do not necessarily time out in id order.
 func (d *DB) TimedOutTasksSince(lastID int64) ([]TaskEvent, error) {
 	rows, err := d.Query(`
 SELECT id, description, goal FROM tasks

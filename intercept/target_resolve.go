@@ -137,6 +137,24 @@ func (c *resolveCache) fly(r Resolver, host string, f *resolveFlight) {
 	c.mu.Lock()
 	delete(c.flights, host)
 	if f.err == nil {
+		const maxResolveCacheEntries = 4096
+		if len(c.entries) >= maxResolveCacheEntries {
+			now := c.now()
+			var oldestKey string
+			var oldestAt time.Time
+			for k, v := range c.entries {
+				if now.Sub(v.at) >= resolveCacheTTL {
+					delete(c.entries, k)
+					continue
+				}
+				if oldestKey == "" || v.at.Before(oldestAt) {
+					oldestKey, oldestAt = k, v.at
+				}
+			}
+			if len(c.entries) >= maxResolveCacheEntries && oldestKey != "" {
+				delete(c.entries, oldestKey)
+			}
+		}
 		c.entries[host] = f.res
 	}
 	c.mu.Unlock()

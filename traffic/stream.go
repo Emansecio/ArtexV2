@@ -150,9 +150,12 @@ func (s *sink) startStream(f *mproxy.Flow, kind string) {
 	s.applyStreamResponse(f, res)
 	if err != nil {
 		if rewritten, ruleIDs := appliedRules(lines); rewritten {
+			step := "recording"
 			var re *recordError
-			errors.As(err, &re)
-			log.Printf("[traffic] failed to record a rewritten %s stream of %s (%s; rules %v)", kind, f.Request.URL.Hostname(), re.step, ruleIDs)
+			if errors.As(err, &re) && re != nil {
+				step = re.step
+			}
+			log.Printf("[traffic] failed to record a rewritten %s stream of %s (%s; rules %v)", kind, f.Request.URL.Hostname(), step, ruleIDs)
 			return
 		}
 		log.Printf("[traffic] failed to record %s stream %s: %v", kind, f.Request.URL, err)
@@ -361,6 +364,7 @@ VALUES(?,?,?,?,?,NULL,NULL)`, id, reqHead, reqB.inline, nullIfEmpty(reqB.hash), 
 	if err := tx.Commit(); err != nil {
 		return "", &recordError{"committing", err}
 	}
+	t.exchangeCount.Add(1)
 	return id, nil
 }
 

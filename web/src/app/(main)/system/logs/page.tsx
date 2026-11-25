@@ -4,6 +4,7 @@ import * as React from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { subscribeWS } from "@/lib/ws";
+import { api } from "@/lib/api";
 import { MOCK } from "@/lib/mock/enabled";
 import type { LogLine } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -48,6 +49,7 @@ export default function LogsPage() {
   const stick = React.useRef(true);
   const pausedRef = React.useRef(false);
   pausedRef.current = paused;
+  const exhaustedRef = React.useRef(false);
 
   // Minimum db_id seen — used as the cursor for loading older history.
   const minDbId = React.useMemo(() => {
@@ -103,28 +105,30 @@ export default function LogsPage() {
       onEvent: (ev, data) => {
         if (ev !== "log" || pausedRef.current || !data || typeof data !== "object") return;
         pending.push(data as LogLine);
-        if (!rafId) rafId = window.requestAnimationFrame(flush);
+        if (!rafId) {
+          rafId = window.setTimeout(() => {
+            rafId = 0;
+            flush();
+          }, 100);
+        }
       },
     });
     return () => {
-      if (rafId) window.cancelAnimationFrame(rafId);
+      if (rafId) window.clearTimeout(rafId);
       unsub();
     };
   }, []);
 
-  // Mark "has more" once we have any db_id in view.
+  // Mark "has more" once we have any db_id in view, unless older history is already exhausted.
   React.useEffect(() => {
-    if (minDbId > 1) setHasMore(true);
+    if (!exhaustedRef.current && minDbId > 1) setHasMore(true);
   }, [minDbId]);
 
   async function loadOlderHistory() {
     if (loadingHistory) return;
     setLoadingHistory(true);
     try {
-      const params = minDbId > 0 ? `?before=${minDbId}&limit=200` : `?limit=200`;
-      const res = await fetch(`/api/logs/history${params}`);
-      if (!res.ok) return;
-      const data = await res.json() as { items: LogLine[]; has_more: boolean };
+      const data = await api.logsHistory(minDbId > 0 ? minDbId : undefined, 200);
       if (data.items?.length) {
         // Assign synthetic seq numbers below current minimum to keep dedup working.
         setLines((prev) => {
@@ -145,7 +149,11 @@ export default function LogsPage() {
           return deduped.slice(-5000);
         });
       }
-      setHasMore(data.has_more ?? false);
+      const more = data.has_more ?? false;
+      if (!more) exhaustedRef.current = true;
+      setHasMore(more);
+    } catch {
+      /* ignore transient history fetch errors */
     } finally {
       setLoadingHistory(false);
     }
@@ -209,7 +217,16 @@ export default function LogsPage() {
           >
             {paused ? t("Paused") : t("Pause")}
           </Button>
-          <Button size="sm" variant="outline" className="h-8" onClick={() => setLines([])}>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8"
+            onClick={() => {
+              exhaustedRef.current = false;
+              setHasMore(false);
+              setLines([]);
+            }}
+          >
             {t("Clear")}
           </Button>
           <span className="ml-auto text-xs text-muted-foreground">
@@ -250,6 +267,7 @@ export default function LogsPage() {
               return (
                 <div
                   key={l.seq}
+                  style={index >= 30 ? { contentVisibility: "auto", containIntrinsicSize: "0 20px" } : undefined}
                   className={cn(
                     "flex items-start gap-2 px-1 py-0.5 hover:bg-muted/40",
                     index >= 30 && "defer-render",

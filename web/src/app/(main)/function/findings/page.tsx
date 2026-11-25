@@ -325,7 +325,7 @@ export default function FindingsPage() {
       await api.exportFindings({
         format: exportFormat,
         scope: exportScope,
-        filters: { severity, status, reportState, verificationStatus, vulnclass, task, query, sort },
+        filters: { severity, status, reportState, verificationStatus, vulnclass, task, query, sort, assetScope: activeAssetScope ?? undefined },
         ids: [...selectedIds],
       });
       setExportOpen(false);

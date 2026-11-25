@@ -51,9 +51,10 @@ const softTripAfter = 3
 // (saving an unrelated profile, toggling a setting) never clears what we've learned
 // about which backends are broken.
 type Registry struct {
-	mu      sync.Mutex
-	m       map[int64]*State
-	probing map[int64]bool // true while one single-flight half-open probe is active
+	mu        sync.Mutex
+	m         map[int64]*State
+	probing   map[int64]uint64 // non-zero probe token while one single-flight half-open probe is active
+	nextProbe uint64
 
 	// persist / forget mirror state to the DB so a cooling-off window survives a
 	// restart. Both may be nil (no DB). Both run while r.mu is held, so a later
@@ -104,7 +105,7 @@ func (r *Registry) coolFor(trips int) time.Duration {
 func NewRegistry(persist func(id int64, st State), forget func(id int64)) *Registry {
 	return &Registry{
 		m:       map[int64]*State{},
-		probing: map[int64]bool{},
+		probing: map[int64]uint64{},
 		persist: persist,
 		forget:  forget,
 	}
@@ -137,27 +138,34 @@ func (r *Registry) IsOpen(id int64) bool { return r.Get(id).Open() }
 // Returns (usable, isProbe). When isProbe is true, caller should ReleaseProbe(id)
 // if it returns without calling RecordCall (e.g. consumer broke early).
 func (r *Registry) AcquireUsable(id int64) (usable bool, isProbe bool) {
+	usable, tok := r.acquireUsableToken(id)
+	return usable, tok != 0
+}
+
+func (r *Registry) acquireUsableToken(id int64) (usable bool, probeToken uint64) {
 	if id == 0 {
-		return true, false
+		return true, 0
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := r.m[id]
 	if st == nil {
-		return true, false
+		return true, 0
 	}
 	if time.Now().Before(st.OpenUntil) {
-		return false, false
+		return false, 0
 	}
 	// Expired breaker window (or half-open state): allow only a single probe in flight.
 	if st.Trips > 0 || !st.OpenUntil.IsZero() {
-		if r.probing[id] {
-			return false, false
+		if r.probing[id] != 0 {
+			return false, 0
 		}
-		r.probing[id] = true
-		return true, true
+		r.nextProbe++
+		tok := r.nextProbe
+		r.probing[id] = tok
+		return true, tok
 	}
-	return true, false
+	return true, 0
 }
 
 // ReleaseProbe clears an active half-open probe slot without changing breaker state.
@@ -167,6 +175,19 @@ func (r *Registry) ReleaseProbe(id int64) {
 	}
 	r.mu.Lock()
 	delete(r.probing, id)
+	r.mu.Unlock()
+}
+
+// releaseProbeToken clears an active half-open probe slot only if it is still
+// owned by token, preventing a stale deferred release from evicting a newer probe.
+func (r *Registry) releaseProbeToken(id int64, token uint64) {
+	if id == 0 || token == 0 {
+		return
+	}
+	r.mu.Lock()
+	if r.probing[id] == token {
+		delete(r.probing, id)
+	}
 	r.mu.Unlock()
 }
 
