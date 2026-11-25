@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -673,6 +674,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// intent block → intent-anchored assets block → launch instruction stay in the
 	// per-intent dynamic suffix after DynamicBoundary.
 	dynamicTail += renderIntentTask(intent)
+	var autoScopeWG sync.WaitGroup
+	defer autoScopeWG.Wait()
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
@@ -689,8 +692,13 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 				// When the asset-coverage feature is off, the test scope (denominator) is no
 				// longer accumulated. A failed flag read is treated as on, so an outage
 				// still writes, including for a task whose stored flag is off.
-				// Offload idempotent auto-scope upserts off the pre-TTFT critical path.
-				go writeIntentAutoScope(as, taskID, assets, coverageEnabled)
+				// Offload idempotent auto-scope upserts off the pre-TTFT critical path,
+				// tracked by autoScopeWG so they always finish before execute() returns.
+				autoScopeWG.Add(1)
+				go func(list []*db.Asset) {
+					defer autoScopeWG.Done()
+					writeIntentAutoScope(as, taskID, list, coverageEnabled)
+				}(assets)
 			}
 		}
 	}

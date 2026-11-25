@@ -147,12 +147,13 @@ func (t *cachedWebFetchTool) Call(ctx context.Context, input json.RawMessage, tc
 	if cached, ok := t.cache.get(key); ok {
 		return cached, nil
 	}
-	// Deduplicate concurrent in-flight GET probes for the same URL across workers.
-	res, err := t.cache.flight.Do(key, func() (actool.Result, error) {
+	// Deduplicate concurrent in-flight GET probes for the same URL across workers
+	// while isolating per-caller context cancellation.
+	res, err := t.cache.flight.DoContext(ctx, key, func(fctx context.Context) (actool.Result, error) {
 		if cached, ok := t.cache.get(key); ok {
 			return cached, nil
 		}
-		r, callErr := t.CoreTool.Call(ctx, input, tc)
+		r, callErr := t.CoreTool.Call(fctx, input, tc)
 		if callErr == nil && !r.IsError {
 			t.cache.set(key, r)
 		}

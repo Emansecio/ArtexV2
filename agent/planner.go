@@ -618,11 +618,11 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		Tools:                  plannerTools,
 		DeferredTools:          def.Deferred,
 		UnlockSet:              def.Unlock,
-		DisableBackgroundTasks: pruned,
+		DisableBackgroundTasks: false, // keep tool schemas stable across rounds for prompt-cache hits; pruned via plannerPruneHook
 		PermissionMode:         permission.ModeBypass,
 		// Web search (optional). ddgs needs no key; brave-free needs BraveKey; tavily needs TavilyKey.
 		// WebSearchProxy is a dedicated egress proxy (http/https/socks5), unrelated to the traffic-recording MITM proxy; empty = direct.
-		EnableWebSearch:       p.webSearch.Enabled && !pruned,
+		EnableWebSearch:       p.webSearch.Enabled, // keep schema stable; plannerPruneHook blocks after facts > 0
 		WebSearchBackend:      p.webSearch.Backend,
 		BraveSearchAPIKey:     p.webSearch.BraveKey,
 		TavilySearchAPIKey:    p.webSearch.TavilyKey,
@@ -717,6 +717,7 @@ type plannerPruneHook struct {
 var plannerPrunedToolNames = map[string]bool{
 	"Bash": true, "Write": true, "Edit": true, "MultiEdit": true,
 	"Glob": true, "Grep": true, "Sleep": true, "WebFetch": true, "web_search": true,
+	"Monitor": true, "TaskOutput": true, "TaskStop": true,
 }
 
 func (h *plannerPruneHook) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {

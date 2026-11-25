@@ -346,8 +346,7 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 			batch = batch[:0]
 			return err == nil
 		}
-		drainMore := func() {
-			batch = drainCoalesced(batch)
+		drainOutCh := func() {
 			for len(batch) < 64 {
 				select {
 				case m := <-outCh:
@@ -364,13 +363,18 @@ func (s *Server) wsStream(w http.ResponseWriter, r *http.Request) {
 			case <-s.ctx.Done():
 				return
 			case msg := <-outCh:
+				// Flush any coalesced deltas BEFORE appending an outCh activity/status
+				// frame so the UI never processes a stale delta after the activity
+				// that finalized and cleared it.
+				batch = drainCoalesced(batch)
 				batch = append(batch, msg)
-				drainMore()
+				drainOutCh()
 				if !flushBatch() {
 					return
 				}
 			case <-deltaNotify:
-				drainMore()
+				batch = drainCoalesced(batch)
+				drainOutCh()
 				if !flushBatch() {
 					return
 				}

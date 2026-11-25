@@ -88,17 +88,36 @@ func TestNonSafeToolsRunExclusively(t *testing.T) {
 	}
 }
 
-func TestSafeToolsBreakHoLBehindQueuedExclusive(t *testing.T) {
-	safeProbe := &concurrencyProbe{}
-	exclProbe := &concurrencyProbe{}
+func TestExclusiveToolActsAsOrderingBarrier(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	record := func(tag string) tool.CoreTool {
+		safe := tag != "excl"
+		return tool.Build(tool.Spec{
+			Name:       tag,
+			Schema:     map[string]any{"type": "object"},
+			ReadOnly:   func(json.RawMessage) bool { return safe },
+			Concurrent: func(json.RawMessage) bool { return safe },
+			Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
+				return permission.Allowed()
+			},
+			Run: func(_ context.Context, _ json.RawMessage, _ *tool.ToolContext) (tool.Result, error) {
+				time.Sleep(20 * time.Millisecond)
+				mu.Lock()
+				order = append(order, tag)
+				mu.Unlock()
+				return tool.Text("ok"), nil
+			},
+		})
+	}
 	turn := []llm.StreamEvent{
-		{Type: llm.SEToolUseStart, ToolID: "s1", ToolName: "safe", ToolIndex: 0},
+		{Type: llm.SEToolUseStart, ToolID: "s1", ToolName: "safe1", ToolIndex: 0},
 		{Type: llm.SEToolInputJSON, Text: `{}`, ToolIndex: 0},
 		{Type: llm.SEToolUseStop, ToolIndex: 0},
 		{Type: llm.SEToolUseStart, ToolID: "e1", ToolName: "excl", ToolIndex: 1},
 		{Type: llm.SEToolInputJSON, Text: `{}`, ToolIndex: 1},
 		{Type: llm.SEToolUseStop, ToolIndex: 1},
-		{Type: llm.SEToolUseStart, ToolID: "s2", ToolName: "safe", ToolIndex: 2},
+		{Type: llm.SEToolUseStart, ToolID: "s2", ToolName: "safe2", ToolIndex: 2},
 		{Type: llm.SEToolInputJSON, Text: `{}`, ToolIndex: 2},
 		{Type: llm.SEToolUseStop, ToolIndex: 2},
 		{Type: llm.SEMessageDelta, StopReason: "tool_use"},
@@ -107,13 +126,10 @@ func TestSafeToolsBreakHoLBehindQueuedExclusive(t *testing.T) {
 	m := &scriptedModel{turns: [][]llm.StreamEvent{turn, textTurn("done")}}
 	in := QueryInput{
 		Messages: []llm.Message{llm.UserText("go")}, PermissionMode: permission.ModeBypass,
-		Tools: tool.NewRegistry(probeTool("safe", true, safeProbe), probeTool("excl", false, exclProbe)),
+		Tools: tool.NewRegistry(record("safe1"), record("excl"), record("safe2")),
 	}
 	drain(t, in, QueryDeps{CallModel: m.call})
-	if safeProbe.maxSeen != 2 {
-		t.Fatalf("safe tools behind queued exclusive tool should overlap (maxSeen=%d, want 2)", safeProbe.maxSeen)
-	}
-	if exclProbe.maxSeen != 1 {
-		t.Fatalf("exclusive tool must run alone (maxSeen=%d, want 1)", exclProbe.maxSeen)
+	if len(order) != 3 || order[0] != "safe1" || order[1] != "excl" || order[2] != "safe2" {
+		t.Fatalf("exclusive tool must preserve causality barrier (order=%v, want [safe1 excl safe2])", order)
 	}
 }

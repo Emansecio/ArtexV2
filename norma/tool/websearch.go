@@ -196,7 +196,7 @@ type webSearchCacheEntry struct {
 }
 
 type webSearchFlight struct {
-	wg   sync.WaitGroup
+	done chan struct{}
 	text string
 	err  error
 }
@@ -256,33 +256,43 @@ func (c *webSearchCache) set(key, text string) {
 	c.entries[key] = c.lru.PushFront(ent)
 }
 
-func (c *webSearchCache) do(key string, fn func() (string, error)) (string, error) {
+func (c *webSearchCache) do(ctx context.Context, key string, fn func(context.Context) (string, error)) (string, error) {
 	if text, ok := c.get(key); ok {
 		return text, nil
 	}
 	c.mu.Lock()
 	if f, ok := c.inflight[key]; ok {
 		c.mu.Unlock()
-		f.wg.Wait()
-		return f.text, f.err
+		select {
+		case <-f.done:
+			return f.text, f.err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	}
-	f := &webSearchFlight{}
-	f.wg.Add(1)
+	f := &webSearchFlight{done: make(chan struct{})}
 	c.inflight[key] = f
 	c.mu.Unlock()
 
-	defer func() {
-		c.mu.Lock()
-		delete(c.inflight, key)
-		c.mu.Unlock()
-		f.wg.Done()
+	go func() {
+		defer func() {
+			c.mu.Lock()
+			delete(c.inflight, key)
+			c.mu.Unlock()
+			close(f.done)
+		}()
+		f.text, f.err = fn(context.WithoutCancel(ctx))
+		if f.err == nil && f.text != "" {
+			c.set(key, f.text)
+		}
 	}()
 
-	f.text, f.err = fn()
-	if f.err == nil && f.text != "" {
-		c.set(key, f.text)
+	select {
+	case <-f.done:
+		return f.text, f.err
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
-	return f.text, f.err
 }
 
 func webSearchRunner(prov searchProvider) func(context.Context, json.RawMessage, *ToolContext) (Result, error) {
@@ -306,7 +316,7 @@ func webSearchRunner(prov searchProvider) func(context.Context, json.RawMessage,
 			limit = 20
 		}
 		cacheKey := prov.Name() + "|" + strings.ToLower(query) + "|" + strconv.Itoa(limit)
-		text, err := globalWebSearchCache.do(cacheKey, func() (string, error) {
+		text, err := globalWebSearchCache.do(ctx, cacheKey, func(fctx context.Context) (string, error) {
 			// Hard wall-clock cap so a slow/rate-limited backend can't hang the agent
 			// loop. A backend that runs a model call per search (deepseek) declares a
 			// longer cap of its own; plain HTTP backends keep the 30s default.
@@ -314,7 +324,7 @@ func webSearchRunner(prov searchProvider) func(context.Context, json.RawMessage,
 			if tp, ok := prov.(interface{ Timeout() time.Duration }); ok {
 				wall = tp.Timeout()
 			}
-			cctx, cancel := context.WithTimeout(ctx, wall)
+			cctx, cancel := context.WithTimeout(fctx, wall)
 			defer cancel()
 			results, err := prov.Search(cctx, query, limit)
 			if err != nil {

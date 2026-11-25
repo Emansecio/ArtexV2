@@ -922,7 +922,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 				for _, idx := range slices.Clone(pendingOrder) {
 					if pt := pending[idx]; pt != nil {
 						raw := strings.TrimSpace(pt.input.String())
-						if raw != "" && jsonValid(raw) {
+						if strings.HasPrefix(raw, "{") && strings.HasSuffix(raw, "}") && jsonValid(raw) {
 							if !finalizeToolIndex(idx) {
 								return asst, exec, "", nil, true, false
 							}

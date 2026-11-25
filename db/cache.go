@@ -94,7 +94,7 @@ func (d *DB) InvalidateMCPCache() {
 // cache-aware write methods, so the Exec/Query/QueryRow wrappers below drop the
 // affected entries instead of serving stale config for up to configCacheTTL.
 var configWriteTable = regexp.MustCompile(`(?i)\b(?:insert\s+into|update|delete\s+from|truncate(?:\s+table)?)\s+(settings|tools|mcp_servers|agent_prompts|agent_visibility|agent_skill_visibility|agents)\b`)
-var graphWriteTable = regexp.MustCompile(`(?i)\b(?:insert\s+into|update|delete\s+from|truncate(?:\s+table)?)\s+(exploration_nodes|exploration_edges)\b`)
+var graphWriteTable = regexp.MustCompile(`(?i)\b(?:insert\s+into|update|delete\s+from|truncate(?:\s+table)?)\s+(exploration_nodes|exploration_edges|assets|task_credentials|task_scope|coverage_ledger)\b`)
 
 // isPureSelect reports whether query begins with SELECT (ignoring leading
 // whitespace/comments), allowing read queries to bypass the DML invalidation
