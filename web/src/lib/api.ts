@@ -187,7 +187,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       if (typeof window !== "undefined") {
         localStorage.removeItem("artex_token");
         document.cookie = "artex_token=; path=/; max-age=0";
-        window.location.href = "/login";
+        window.location.href = "/welcome";
       }
       throw new Error(t("Unauthorized"));
     }
@@ -319,13 +319,7 @@ export const api = {
   health: () => get<{ ok: boolean; service: string; version: string; latest_version?: string }>("/health"),
 
   // ---- auth ----
-  authStatus: () => get<{ initialized: boolean }>("/auth/status"),
-  login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
   localLogin: () => post<{ token: string }>("/auth/local", {}),
-  initPassword: (password: string, setupToken: string) =>
-    post<{ token: string }>("/auth/init", { password, setup_token: setupToken }),
-  changePassword: (oldPassword: string, newPassword: string) =>
-    post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
 
   // ---- tasks ----
   tasks: () =>
@@ -982,7 +976,7 @@ export const api = {
       if (typeof window !== "undefined") {
         localStorage.removeItem("artex_token");
         document.cookie = "artex_token=; path=/; max-age=0";
-        window.location.href = "/login";
+        window.location.href = "/welcome";
       }
       throw new Error(t("Unauthorized"));
     }

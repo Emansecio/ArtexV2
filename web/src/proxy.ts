@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
-const AUTH_PAGES = ["/login", "/setup"];
+const AUTH_PAGES = ["/welcome", "/login"];
 
 export function proxy(request: NextRequest) {
   // Mock demo: no real login; allow every page (the client-side auth guard also allows through).
@@ -11,12 +11,12 @@ export function proxy(request: NextRequest) {
   const token = request.cookies.get("artex_token")?.value;
   const isAuthPage = AUTH_PAGES.some((p) => pathname === p || pathname.startsWith(`${p}/`));
 
-  // Not logged in → redirect to the login page
+  // Not logged in → redirect to the welcome page
   if (!token && !isAuthPage) {
-    return NextResponse.redirect(new URL("/login", request.url));
+    return NextResponse.redirect(new URL("/welcome", request.url));
   }
 
-  // Logged in while visiting the login/setup pages → redirect to the main UI
+  // Logged in while visiting the welcome/login pages → redirect to the main UI
   if (token && isAuthPage) {
     return NextResponse.redirect(new URL("/function/tasks", request.url));
   }

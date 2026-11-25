@@ -50,7 +50,7 @@ export function NavUser({
 
   function openWelcome() {
     auth.clearToken();
-    window.location.href = "/login";
+    window.location.href = "/welcome";
   }
 
   return (

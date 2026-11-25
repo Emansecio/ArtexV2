@@ -42,7 +42,7 @@ export default function Layout({ children }: Readonly<{ children: ReactNode }>) 
       // by "cookie exists" alone, would bounce us from /login back to the main UI and ping-pong with this guard
       // in an infinite redirect → blank screen (triggered when cookie and localStorage disagree).
       auth.clearToken();
-      window.location.href = "/login";
+      window.location.href = "/welcome";
     }
   }, []);
 

@@ -4,7 +4,9 @@ package server
 
 import (
 	"compress/gzip"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"io"
 	"io/fs"
 	"mime"
@@ -13,6 +15,21 @@ import (
 	"strings"
 	"time"
 )
+
+func embeddedAssetETag(fsys fs.FS, resolvedName string) string {
+	f, err := fsys.Open(resolvedName)
+	if err != nil {
+		ver := BuildVersion
+		if ver == "" {
+			ver = "dev"
+		}
+		return `W/"` + ver + `"`
+	}
+	defer f.Close()
+	h := sha256.New()
+	_, _ = io.Copy(h, f)
+	return `W/"` + hex.EncodeToString(h.Sum(nil)[:8]) + `"`
+}
 
 // webuiDist holds the statically-exported frontend (built with
 // `cd web && npm run build:static`, then copied into server/webui/dist). Compiled
@@ -70,26 +87,32 @@ func openRegular(fsys fs.FS, name string) (fs.File, bool) {
 // HTTP cache headers and zero-CPU pre-compressed delivery.
 func serveFileIfExists(w http.ResponseWriter, r *http.Request, fsys fs.FS, name string) bool {
 	var (
-		f        fs.File
-		encoding string
-		gunzip   bool
-		ok       bool
+		f            fs.File
+		resolvedName string
+		encoding     string
+		gunzip       bool
+		ok           bool
 	)
 	if acceptsEncoding(r, "br") {
 		if f, ok = openRegular(fsys, name+".br"); ok {
+			resolvedName = name + ".br"
 			encoding = "br"
 		}
 	}
 	if !ok && acceptsEncoding(r, "gzip") {
 		if f, ok = openRegular(fsys, name+".gz"); ok {
+			resolvedName = name + ".gz"
 			encoding = "gzip"
 		}
 	}
 	if !ok {
-		f, ok = openRegular(fsys, name)
+		if f, ok = openRegular(fsys, name); ok {
+			resolvedName = name
+		}
 	}
 	if !ok {
 		if f, ok = openRegular(fsys, name+".gz"); ok {
+			resolvedName = name + ".gz"
 			gunzip = true
 		}
 	}
@@ -101,11 +124,7 @@ func serveFileIfExists(w http.ResponseWriter, r *http.Request, fsys fs.FS, name 
 	if strings.HasPrefix(name, "_next/static/") {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	} else {
-		ver := BuildVersion
-		if ver == "" {
-			ver = "dev"
-		}
-		etag := `W/"` + ver + `"`
+		etag := embeddedAssetETag(fsys, resolvedName)
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("ETag", etag)
 		if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {

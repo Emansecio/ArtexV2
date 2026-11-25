@@ -31,7 +31,7 @@ export function AccountSwitcher({
 
   function openWelcome() {
     auth.clearToken();
-    window.location.href = "/login";
+    window.location.href = "/welcome";
   }
 
   if (!activeUser) {
