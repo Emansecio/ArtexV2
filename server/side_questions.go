@@ -124,8 +124,9 @@ func (s *Server) flushSideSnapshots() {
 	if s.side == nil || s.m.pg == nil {
 		return
 	}
-	s.side.commands.Lock()
-	defer s.side.commands.Unlock()
+	// Only the pending-map swap needs mutual exclusion; the snapshot writes
+	// below (up to a 3s timeout each) must not hold the global commands lock —
+	// that serialized every POST/DELETE behind the whole flush batch.
 	s.side.mu.Lock()
 	pending := s.side.pending
 	s.side.pending = map[string]sidequestion.Snapshot{}
@@ -382,8 +383,12 @@ func (s *Server) handleSideQuestions(w http.ResponseWriter, r *http.Request, p s
 		writeErr(w, 400, "question must be 1–4000 characters with a valid request ID")
 		return
 	}
-	s.side.commands.Lock()
-	defer s.side.commands.Unlock()
+	// Everything up to StartSideRequest is read-only preparation or an
+	// idempotent write — running it under the global commands lock serialized
+	// every side-question POST behind several Postgres round-trips (profile
+	// load, mention expansion, snapshot write). StartSideRequest is itself
+	// transactional (FOR UPDATE + client-id dedup), so the lock only guards the
+	// insert+register critical section against a concurrent DELETE/clear.
 	if p.TaskID > 0 && s.engine.IsDeleting(strconv.FormatInt(p.TaskID, 10)) {
 		writeErr(w, 409, "task is being archived or deleted")
 		return
@@ -433,8 +438,10 @@ func (s *Server) handleSideQuestions(w http.ResponseWriter, r *http.Request, p s
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.side.commands.Lock()
 	e, created, err := s.m.pg.StartSideRequest(r.Context(), *snap, in.ClientID, in.Question)
 	if err != nil {
+		s.side.commands.Unlock()
 		writeErr(w, 409, err.Error())
 		return
 	}
@@ -445,6 +452,7 @@ func (s *Server) handleSideQuestions(w http.ResponseWriter, r *http.Request, p s
 		s.side.mu.Unlock()
 		go s.runSide(ctx, cancel, *e, p, provider, *snap, agentQuestion)
 	}
+	s.side.commands.Unlock()
 	writeJSON(w, 202, e)
 }
 
@@ -463,6 +471,9 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 		sideSess = e.ID
 	}
 	ctx = transcript.WithSessionID(ctx, fmt.Sprintf("exp%d-btw-%s", parent.ExplorationID, sideSess))
+	// Keep session-sticky cache routing on the parent's shard: the btw id only
+	// distinguishes this sidechain in transcripts/llmrec.
+	ctx = transcript.WithSessionHeaderID(ctx, sideSess)
 	if parent.TaskID > 0 {
 		ctx = llmrec.WithTaskID(ctx, strconv.FormatInt(parent.TaskID, 10))
 	}
@@ -549,6 +560,8 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 	var answer sidequestion.Answer
 	if runErr == nil {
 		summaryProv, _, _ := agent.SummaryProviderFromEnv()
+		var answerBuf strings.Builder
+		answerSynced := true
 		answer, e.Context, runErr = (sidequestion.SideQuestionService{Provider: provider, SummaryProvider: summaryProv}).Respond(ctx, snapshot, agentQuestion, sidequestion.Replay{
 			Memory: memory,
 			Load: func(ctx context.Context, after int64) ([]sidequestion.Exchange, error) {
@@ -559,9 +572,20 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 			},
 		}, sidequestion.ContextOptions{OutputTokens: s.side.outputTokens}, func(a sidequestion.Answer, info sidequestion.ContextInfo) {
 			phaseChanged := e.Context.Phase != info.Phase
-			e.Answer, e.Usage, e.Context = a.Text, a.Usage, info
+			// Append the streamed delta; the full answer is materialized into
+			// e.Answer only when a throttled push actually fires — rebuilding
+			// the whole string per token made streaming O(N²).
+			if a.Delta != "" {
+				answerBuf.WriteString(a.Delta)
+				answerSynced = false
+			}
+			e.Usage, e.Context = a.Usage, info
 			if phaseChanged || lastPush.IsZero() || time.Since(lastPush) >= 40*time.Millisecond {
 				lastPush = time.Now()
+				if !answerSynced {
+					e.Answer = answerBuf.String()
+					answerSynced = true
+				}
 				e.Sequence++
 				snap := e
 				if s.deltaHub != nil {
@@ -572,7 +596,6 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 		})
 	}
 	close(saveStop)
-	<-saveDone
 	e.Answer, e.Usage = answer.Text, answer.Usage
 	e.Status = "completed"
 	if ctx.Err() != nil {
@@ -587,9 +610,12 @@ func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sideq
 		e.Error = runErr.Error()
 	}
 	e.Sequence++
+	// Deliver the terminal state to SSE subscribers BEFORE draining the queued
+	// intermediate writes — subscribers waited on the save backlog otherwise.
 	if s.deltaHub != nil {
 		s.deltaHub.Publish("side:"+e.ID, DeltaMsg{Event: "side", Data: e})
 	}
+	<-saveDone
 	for attempt := 0; attempt < 3; attempt++ {
 		if _, err := persistSync(e); err == nil {
 			break

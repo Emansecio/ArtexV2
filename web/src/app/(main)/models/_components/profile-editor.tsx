@@ -1,0 +1,876 @@
+"use client";
+
+import * as React from "react";
+
+import {
+  BrainIcon,
+  CheckIcon,
+  ChevronDownIcon,
+  CpuIcon,
+  ExternalLinkIcon,
+  KeyRoundIcon,
+  Loader2Icon,
+  LogInIcon,
+  LogOutIcon,
+  PlugZapIcon,
+  PlusIcon,
+  RefreshCwIcon,
+  SaveIcon,
+  ServerIcon,
+  SlidersHorizontalIcon,
+  SparklesIcon,
+  TerminalIcon,
+} from "lucide-react";
+import { toast } from "sonner";
+
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Switch } from "@/components/ui/switch";
+import { t } from "@/i18n";
+import { api } from "@/lib/api";
+import type { LLMProfile, LLMRetryOverride, OAuthProviderStatus } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+import {
+  CONTEXT_PRESETS,
+  EFFORT_LEVELS,
+  fromStore,
+  MAX_TOKENS_FIELD_HINTS,
+  MAX_TOKENS_FIELDS,
+  NONE,
+  normalizeFormat,
+  PROVIDERS,
+  type ProfileFormat,
+  providerMeta,
+  rich,
+  THINKING_TYPES,
+  toStore,
+} from "./llm-helpers";
+import { ProfileRetryFields, ZERO_OVERRIDE } from "./retry-panel";
+
+function StepBadge({ step, title }: { step: number; title: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-primary/10 font-mono font-semibold text-primary text-xs">
+        {step}
+      </span>
+      <h3 className="font-medium text-sm tracking-tight">{title}</h3>
+    </div>
+  );
+}
+
+export function ProfileEditorSheet({
+  profile,
+  open,
+  onOpenChange,
+  onSaved,
+  oauthMap,
+  onReloadOAuth,
+}: {
+  profile: LLMProfile | null;
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  onSaved: (id: string) => void;
+  oauthMap: Map<string, OAuthProviderStatus>;
+  onReloadOAuth: () => Promise<void>;
+}) {
+  const isNew = !profile;
+  const [name, setName] = React.useState("");
+  const [format, setFormat] = React.useState<ProfileFormat>("anthropic");
+  const [model, setModel] = React.useState("");
+  const [baseUrl, setBaseUrl] = React.useState("");
+  const [proxy, setProxy] = React.useState("");
+  const [apiKey, setApiKey] = React.useState("");
+  const [keyHint, setKeyHint] = React.useState("");
+  const [rps, setRps] = React.useState("0");
+  const [rpm, setRpm] = React.useState("0");
+  const [cw, setCw] = React.useState("0");
+  const [thinkingType, setThinkingType] = React.useState(NONE);
+  const [effort, setEffort] = React.useState(NONE);
+  const [priority, setPriority] = React.useState("0");
+  const [poolExclude, setPoolExclude] = React.useState(false);
+  const [streaming, setStreaming] = React.useState(true);
+  const [maxTokens, setMaxTokens] = React.useState("0");
+  const [maxTokensField, setMaxTokensField] = React.useState(NONE);
+  const [sessionHeaderKey, setSessionHeaderKey] = React.useState("");
+  const [userAgent, setUserAgent] = React.useState("");
+  const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE);
+  const [advancedOpen, setAdvancedOpen] = React.useState(false);
+  const [testing, setTesting] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [models, setModels] = React.useState<string[]>([]);
+  const [loadingModels, setLoadingModels] = React.useState(false);
+  const [modelsOpen, setModelsOpen] = React.useState(false);
+  const [modelQuery, setModelQuery] = React.useState("");
+  const [oauthBusy, setOauthBusy] = React.useState(false);
+  const [manualCode, setManualCode] = React.useState("");
+  const [manualOpen, setManualOpen] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!open) return;
+    setName(profile?.name ?? "");
+    setFormat(normalizeFormat(profile?.format));
+    setModel(profile?.model ?? "");
+    setBaseUrl(profile?.base_url ?? "");
+    setProxy(profile?.proxy ?? "");
+    setRps(String(profile?.rate_per_second ?? 0));
+    setRpm(String(profile?.rate_per_minute ?? 0));
+    setCw(String(profile?.context_window_k ?? 0));
+    setThinkingType(fromStore(profile?.thinking_type));
+    setEffort(fromStore(profile?.reasoning_effort));
+    setPriority(String(profile?.priority ?? 0));
+    setPoolExclude(profile?.pool_exclude ?? false);
+    setStreaming(profile?.streaming ?? true);
+    setMaxTokens(String(profile?.max_tokens ?? 0));
+    setMaxTokensField(fromStore(profile?.max_tokens_field));
+    setSessionHeaderKey(profile?.session_header_key ?? "");
+    setUserAgent(profile?.user_agent ?? "");
+    setRetry(profile?.retry ?? ZERO_OVERRIDE);
+    setApiKey("");
+    setKeyHint(profile?.api_key_hint ?? "");
+    setModels([]);
+    setModelsOpen(false);
+    setModelQuery("");
+    setAdvancedOpen(false);
+  }, [open, profile]);
+
+  const profileId = profile ? Number(profile.id) : undefined;
+  const meta = providerMeta(format);
+  const oauthProv = meta.oauthProvider ?? null;
+  const oauthStatus = oauthProv ? oauthMap.get(oauthProv) : undefined;
+
+  // Poll OAuth status while a browser login is pending in this drawer.
+  React.useEffect(() => {
+    if (!open || !oauthProv || !oauthStatus?.pending) return;
+    const timer = window.setInterval(() => void onReloadOAuth(), 2000);
+    return () => window.clearInterval(timer);
+  }, [open, oauthProv, oauthStatus?.pending, onReloadOAuth]);
+
+  async function startOAuth() {
+    if (!oauthProv || oauthBusy) return;
+    setOauthBusy(true);
+    try {
+      const res = await api.startLLMOAuth(oauthProv);
+      if (!res?.auth_url) {
+        toast.error(t("OAuth sign-in requires the ArtexV2 backend server to be running."));
+        return;
+      }
+      window.open(res.auth_url, "_blank", "noopener,noreferrer");
+      toast.info(t("Complete sign-in in the browser tab that just opened."));
+      await onReloadOAuth();
+    } catch (e) {
+      toast.error(t("OAuth sign-in failed: {error}", { error: (e as Error).message }));
+    } finally {
+      setOauthBusy(false);
+    }
+  }
+
+  async function submitManualOAuth() {
+    if (!oauthProv || !manualCode.trim() || oauthBusy) return;
+    setOauthBusy(true);
+    try {
+      await api.completeLLMOAuth(oauthProv, manualCode.trim());
+      setManualCode("");
+      setManualOpen(false);
+      await onReloadOAuth();
+      toast.success(t("OAuth account connected"));
+    } catch (e) {
+      toast.error(t("OAuth sign-in failed: {error}", { error: (e as Error).message }));
+    } finally {
+      setOauthBusy(false);
+    }
+  }
+
+  async function disconnectOAuth() {
+    if (!oauthProv || oauthBusy) return;
+    setOauthBusy(true);
+    try {
+      await api.logoutLLMOAuth(oauthProv);
+      await onReloadOAuth();
+      toast.success(t("OAuth account disconnected"));
+    } catch (e) {
+      toast.error(t("Failed to disconnect: {error}", { error: (e as Error).message }));
+    } finally {
+      setOauthBusy(false);
+    }
+  }
+
+  const filteredModels = React.useMemo(() => {
+    const q = modelQuery.trim().toLowerCase();
+    if (!q) return models;
+    return models.filter((m) => m.toLowerCase().includes(q));
+  }, [models, modelQuery]);
+
+  async function loadModels() {
+    if (loadingModels) return;
+    setLoadingModels(true);
+    setModels([]);
+    setModelQuery("");
+    try {
+      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
+      if (r.ok && r.models && r.models.length > 0) {
+        setModels(r.models);
+        setModelsOpen(true);
+        toast.success(t("Loaded {count} models", { count: r.models.length }));
+      } else {
+        toast.error(t("Failed to load models: {error}", { error: r.error ?? t("no models returned") }));
+      }
+    } catch (e) {
+      toast.error(t("Error loading models: {error}", { error: (e as Error).message }));
+    } finally {
+      setLoadingModels(false);
+    }
+  }
+
+  async function testConnection() {
+    if (testing) return;
+    setTesting(true);
+    try {
+      const r = await api.testLLM(
+        format,
+        model,
+        baseUrl,
+        apiKey,
+        proxy,
+        toStore(thinkingType),
+        toStore(effort),
+        profileId,
+        streaming,
+        sessionHeaderKey.trim(),
+        userAgent.trim(),
+      );
+      if (r.ok) {
+        toast.success(t("Connected · {latency}ms · {model}", { latency: r.latency_ms ?? "?", model: r.model ?? model }), {
+          description: r.reply ? t("Reply: {reply}", { reply: r.reply }) : undefined,
+        });
+      } else {
+        toast.error(t("Connection failed: {error}", { error: r.error ?? t("unknown") }));
+      }
+    } catch (e) {
+      toast.error(t("Test error: {error}", { error: (e as Error).message }));
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  async function save() {
+    if (!name.trim() || !model.trim()) {
+      toast.error(t("Please fill in a name and a model"));
+      return;
+    }
+    if (saving) return;
+    setSaving(true);
+    try {
+      const { id } = await api.saveLLMProfile({
+        ...(profile ? { id: Number(profile.id) } : {}),
+        name: name.trim(),
+        format,
+        model: model.trim(),
+        base_url: baseUrl.trim(),
+        proxy: proxy.trim(),
+        api_key: apiKey,
+        rate_per_second: Number(rps) || 0,
+        rate_per_minute: Number(rpm) || 0,
+        context_window_k: Number(cw) || 0,
+        thinking_type: toStore(thinkingType),
+        reasoning_effort: toStore(effort),
+        priority: Number(priority) || 0,
+        pool_exclude: poolExclude,
+        streaming,
+        max_tokens: Math.max(0, Number(maxTokens) || 0),
+        max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
+        session_header_key: sessionHeaderKey.trim(),
+        user_agent: userAgent.trim(),
+        retry,
+      });
+      if (isNew) {
+        toast.success(t('Created: {name} (use "Set as active" on its card to enable it)', { name: name.trim() }));
+      } else {
+        toast.success(
+          profile?.is_default ? t("Saved; the active profile takes effect immediately, no restart needed") : t("Saved"),
+        );
+      }
+      onSaved(String(id));
+      onOpenChange(false);
+    } catch (e) {
+      toast.error(t("Save failed: {error}", { error: (e as Error).message }));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  let keyPlaceholder = "sk-…";
+  if (format === "ollama") {
+    keyPlaceholder = t("optional — a local Ollama server runs keyless");
+  } else if (keyHint) {
+    keyPlaceholder = t("Set ({hint}); leave empty to keep it", { hint: keyHint });
+  }
+
+  const providerIcon = (id: ProfileFormat) => {
+    if (id === "anthropic" || id === "anthropic-oauth") return <SparklesIcon className="size-4" />;
+    if (id === "ollama") return <ServerIcon className="size-4" />;
+    if (id === "opencode-zen" || id === "opencode-go") return <TerminalIcon className="size-4" />;
+    if (id === "openai-responses" || id === "chatgpt") return <BrainIcon className="size-4" />;
+    return <CpuIcon className="size-4" />;
+  };
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent
+        side="right"
+        className="flex flex-col gap-0 p-0 data-[side=right]:min-w-[440px] data-[side=right]:sm:max-w-xl"
+      >
+        <SheetHeader className="border-b px-5 py-4">
+          <SheetTitle className="flex items-center gap-2">
+            {isNew ? t("New model profile") : t("Edit: {name}", { name: profile?.name ?? "" })}
+            {profile?.is_default && (
+              <Badge variant="outline" className="border-amber-400/50 text-amber-500">
+                {t("Active")}
+              </Badge>
+            )}
+          </SheetTitle>
+          <SheetDescription>
+            {isNew
+              ? t("Choose a provider, select a model, and tune its reasoning level.")
+              : t("Click save after editing; saving the active profile takes effect immediately for all agents.")}
+          </SheetDescription>
+        </SheetHeader>
+
+        <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-5 py-5">
+          {/* Step 1: Provider */}
+          <section className="grid gap-3.5">
+            <StepBadge step={1} title={t("Provider")} />
+            <div className="grid grid-cols-2 gap-2">
+              {PROVIDERS.map((p) => {
+                const selected = format === p.id;
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    aria-pressed={selected}
+                    onClick={() => {
+                      if (format !== p.id) {
+                        setFormat(p.id);
+                        setModels([]);
+                        setModelsOpen(false);
+                        setModelQuery("");
+                      }
+                    }}
+                    className={cn(
+                      "group relative flex flex-col gap-1 rounded-xl border p-3 text-left transition-all duration-200",
+                      selected
+                        ? "border-primary bg-primary/5 shadow-xs ring-1 ring-primary/30"
+                        : "border-border bg-card hover:border-foreground/25 hover:bg-muted/40",
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span
+                        className={cn(
+                          "flex items-center gap-1.5 font-medium text-xs sm:text-sm",
+                          selected ? "text-foreground" : "text-foreground/85",
+                        )}
+                      >
+                        <span className={cn("transition-colors", selected ? "text-primary" : "text-muted-foreground")}>
+                          {providerIcon(p.id)}
+                        </span>
+                        <span className="truncate">{p.shortLabel}</span>
+                      </span>
+                      <span className="flex items-center gap-1">
+                        {p.oauthProvider && (
+                          <Badge variant="secondary" className="px-1 py-0 text-[9px] font-medium uppercase">
+                            OAuth
+                          </Badge>
+                        )}
+                        {selected && (
+                          <span className="flex size-4 items-center justify-center rounded-full bg-primary text-primary-foreground animate-in zoom-in-75 duration-150">
+                            <CheckIcon className="size-2.5" />
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                    <p className="line-clamp-2 text-muted-foreground text-xs leading-snug">{p.desc}</p>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className={cn("grid gap-1.5", oauthProv && "sm:col-span-2")}>
+                <Label htmlFor="p-name">{t("Name")}</Label>
+                <Input
+                  id="p-name"
+                  placeholder={oauthProv ? meta.shortLabel : t("e.g. OpenAI production")}
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
+              </div>
+              {!oauthProv && (
+                <div className="grid gap-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <Label htmlFor="p-api-key">
+                      {format === "ollama" ? t("API Key (optional for Ollama)") : "API Key"}
+                    </Label>
+                    {meta.keyPageUrl && (
+                      <a
+                        href={meta.keyPageUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+                      >
+                        {t("Get key")} <ExternalLinkIcon className="size-2.5" />
+                      </a>
+                    )}
+                  </div>
+                  <Input
+                    id="p-api-key"
+                    type="password"
+                    placeholder={keyPlaceholder}
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    autoComplete="new-password"
+                    spellCheck={false}
+                    data-1p-ignore="true"
+                    data-lpignore="true"
+                  />
+                </div>
+              )}
+            </div>
+
+            {oauthProv && (
+              <div className="grid gap-2.5 rounded-xl border bg-muted/25 p-3.5 animate-in fade-in-0 duration-150">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <KeyRoundIcon className="size-4 text-primary" />
+                    <div>
+                      <p className="font-medium text-sm">
+                        {oauthStatus?.connected
+                          ? t("Connected via OAuth")
+                          : oauthStatus?.pending
+                            ? t("Waiting for browser sign-in…")
+                            : t("Subscription sign-in")}
+                      </p>
+                      <p className="text-muted-foreground text-xs">
+                        {oauthStatus?.connected
+                          ? oauthStatus.account_hint || meta.shortLabel
+                          : meta.desc}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    {oauthStatus?.connected ? (
+                      <Button size="sm" variant="outline" disabled={oauthBusy} onClick={() => void disconnectOAuth()}>
+                        <LogOutIcon className="size-3.5" /> {t("Disconnect")}
+                      </Button>
+                    ) : (
+                      <Button size="sm" disabled={oauthBusy} onClick={() => void startOAuth()}>
+                        {oauthBusy || oauthStatus?.pending ? (
+                          <Loader2Icon className="size-3.5 animate-spin" />
+                        ) : (
+                          <LogInIcon className="size-3.5" />
+                        )}
+                        {oauthProv === "chatgpt" ? t("Sign in with ChatGPT") : t("Sign in with Claude")}
+                      </Button>
+                    )}
+                  </div>
+                </div>
+                {oauthStatus?.last_error && (
+                  <p className="font-mono text-destructive text-xs">{oauthStatus.last_error}</p>
+                )}
+                {!oauthStatus?.connected && oauthStatus?.pending && (
+                  <div className="grid gap-1.5 border-t pt-2.5">
+                    <button
+                      type="button"
+                      className="text-left text-muted-foreground text-xs hover:text-foreground"
+                      onClick={() => setManualOpen((v) => !v)}
+                    >
+                      {t("Using a remote browser? Paste redirect URL or code")}
+                    </button>
+                    {manualOpen && (
+                      <div className="flex gap-2">
+                        <Input
+                          className="h-8 font-mono text-xs"
+                          placeholder={t("Paste redirect URL or authorization code…")}
+                          value={manualCode}
+                          onChange={(e) => setManualCode(e.target.value)}
+                        />
+                        <Button size="sm" variant="secondary" disabled={oauthBusy || !manualCode.trim()} onClick={() => void submitManualOAuth()}>
+                          {t("Complete")}
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="grid gap-1.5">
+              <Label htmlFor="p-base-url">{t("Base URL (optional)")}</Label>
+              <Input
+                id="p-base-url"
+                className="font-mono text-xs"
+                placeholder={meta.baseUrlPlaceholder}
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+              />
+            </div>
+          </section>
+
+          {/* Step 2: Model */}
+          <section className="grid gap-3.5 border-t pt-4">
+            <StepBadge step={2} title={t("Model")} />
+            <div className="grid gap-1.5">
+              <Label htmlFor="p-model">{t("Model")}</Label>
+              <div className="flex gap-2">
+                <Input
+                  id="p-model"
+                  className="font-mono"
+                  placeholder={meta.modelPlaceholder}
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                />
+                <Popover
+                  open={modelsOpen}
+                  onOpenChange={(o) => {
+                    setModelsOpen(o);
+                    if (!o) setModelQuery("");
+                  }}
+                  modal
+                >
+                  <PopoverTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="shrink-0 gap-1.5"
+                      disabled={loadingModels}
+                      onClick={loadModels}
+                      title={t("Load available models from the API")}
+                    >
+                      {loadingModels ? <Loader2Icon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
+                      <span className="hidden sm:inline">{t("Fetch")}</span>
+                    </Button>
+                  </PopoverTrigger>
+                  {models.length > 0 && (
+                    <PopoverContent className="w-80 gap-0 p-0" align="end">
+                      <div className="border-b p-1">
+                        <Input
+                          autoFocus
+                          className="h-8 border-0 shadow-none focus-visible:ring-0 dark:bg-transparent"
+                          placeholder={t("Search {count} models…", { count: models.length })}
+                          value={modelQuery}
+                          onChange={(e) => setModelQuery(e.target.value)}
+                          spellCheck={false}
+                          aria-label={t("Search models")}
+                        />
+                      </div>
+                      <div className="max-h-64 overflow-y-auto overscroll-contain p-1">
+                        {filteredModels.length === 0 ? (
+                          <p className="px-2 py-6 text-center text-muted-foreground text-xs">
+                            {t("No model matches “{query}”", { query: modelQuery.trim() })}
+                          </p>
+                        ) : (
+                          filteredModels.map((m) => (
+                            <button
+                              key={m}
+                              type="button"
+                              className="w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs transition-colors hover:bg-accent hover:text-accent-foreground"
+                              onClick={() => {
+                                setModel(m);
+                                setModelsOpen(false);
+                              }}
+                            >
+                              {m}
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </PopoverContent>
+                  )}
+                </Popover>
+              </div>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <Label htmlFor="p-cw">{t("Context window (K)")}</Label>
+                  <div className="flex gap-1">
+                    {CONTEXT_PRESETS.map((k) => (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => setCw(String(k))}
+                        className={cn(
+                          "rounded px-1.5 py-0.5 font-mono text-[10px] transition-colors",
+                          Number(cw) === k
+                            ? "bg-primary text-primary-foreground"
+                            : "bg-muted text-muted-foreground hover:bg-accent hover:text-foreground",
+                        )}
+                      >
+                        {k === 1000 ? "1M" : `${k}K`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <Input
+                  id="p-cw"
+                  type="number"
+                  min={0}
+                  max={1000}
+                  value={cw}
+                  onChange={(e) => setCw(e.target.value)}
+                  placeholder="200"
+                />
+              </div>
+
+              <div className="grid gap-1.5">
+                <Label htmlFor="p-max-tokens">{t("Output cap · max tokens")}</Label>
+                <Input
+                  id="p-max-tokens"
+                  type="number"
+                  min={0}
+                  value={maxTokens}
+                  onChange={(e) => setMaxTokens(e.target.value)}
+                  placeholder="0"
+                />
+              </div>
+            </div>
+
+            {format === "openai" && (
+              <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/25 p-3 animate-in fade-in-0 duration-150">
+                <div className="grid gap-0.5">
+                  <Label className="text-xs font-medium">{t("Cap field name")}</Label>
+                  <p className="text-muted-foreground text-xs">{MAX_TOKENS_FIELD_HINTS.openai}</p>
+                </div>
+                <Select value={maxTokensField} onValueChange={setMaxTokensField}>
+                  <SelectTrigger className="w-52 shrink-0">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {MAX_TOKENS_FIELDS.map((o) => (
+                      <SelectItem key={o.value} value={o.value}>
+                        {o.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+          </section>
+
+          {/* Step 3: Reasoning level */}
+          <section className="grid gap-3.5 border-t pt-4">
+            <StepBadge step={3} title={t("Reasoning level")} />
+
+            <div className="grid gap-2">
+              <Label className="text-xs font-medium text-muted-foreground">{t("Thinking switch · thinking.type")}</Label>
+              <div className="grid grid-cols-3 gap-1.5 rounded-lg bg-muted/60 p-1">
+                {THINKING_TYPES.map((o) => {
+                  const active = thinkingType === o.value;
+                  return (
+                    <button
+                      key={o.value}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() => setThinkingType(o.value)}
+                      className={cn(
+                        "rounded-md px-2.5 py-1.5 text-xs font-medium transition-all duration-150",
+                        active
+                          ? "bg-background text-foreground shadow-xs"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {o.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-muted-foreground text-xs">
+                {t(
+                  "Controls whether the thinking field is sent. Not sent = the field is omitted (compatible with models like MiniMax that lack support); Disabled = send disabled; Enabled = send enabled. Independent of the effort below.",
+                )}
+              </p>
+            </div>
+
+            <div className="grid gap-2">
+              <Label className="text-xs font-medium text-muted-foreground">{t("Thinking effort · reasoning_effort")}</Label>
+              <div className="grid grid-cols-3 gap-1.5 rounded-lg bg-muted/60 p-1 sm:grid-cols-6">
+                {EFFORT_LEVELS.map((o) => {
+                  const active = effort === o.value;
+                  return (
+                    <button
+                      key={o.value}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() => setEffort(o.value)}
+                      className={cn(
+                        "rounded-md px-2 py-1.5 text-xs font-medium transition-all duration-150",
+                        active
+                          ? "bg-background text-foreground shadow-xs ring-1 ring-primary/20"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {o.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-muted-foreground text-xs">
+                {t(
+                  "A separate effort knob (OpenAI reasoning_effort / Anthropic output_config.effort). Some APIs have no thinking field and activate thinking via effort alone, so it can be set on its own without sending the thinking switch.",
+                )}
+              </p>
+            </div>
+          </section>
+
+          {/* Collapsible Advanced Section */}
+          <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen} className="border-t pt-4">
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                className="flex w-full items-center justify-between rounded-lg border bg-muted/25 px-3.5 py-2.5 text-left transition-colors hover:bg-muted/50"
+              >
+                <span className="flex items-center gap-2 font-medium text-sm">
+                  <SlidersHorizontalIcon className="size-4 text-muted-foreground" />
+                  {t("Pool, network & retry overrides")}
+                </span>
+                <ChevronDownIcon
+                  className={cn("size-4 text-muted-foreground transition-transform duration-200", advancedOpen && "rotate-180")}
+                />
+              </button>
+            </CollapsibleTrigger>
+            <CollapsibleContent className="pt-3">
+              <div className="grid gap-4">
+                <div className="grid gap-3 rounded-lg border p-3">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="grid gap-0.5">
+                      <Label htmlFor="p-priority" className="text-sm">
+                        {t("Pool priority")}
+                      </Label>
+                      <p className="text-muted-foreground text-xs">
+                        {t(
+                          "Higher numbers are picked first; the active profile is always first regardless of this value. Profiles with equal priority take turns leading, spreading quota naturally.",
+                        )}
+                      </p>
+                    </div>
+                    <Input
+                      id="p-priority"
+                      type="number"
+                      className="w-24 shrink-0"
+                      value={priority}
+                      onChange={(e) => setPriority(e.target.value)}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-4 border-t pt-3">
+                    <div className="grid gap-0.5">
+                      <Label className="text-sm">{t("Excluded from pool")}</Label>
+                      <p className="text-muted-foreground text-xs">
+                        {t(
+                          "When enabled, this profile is never used as a failover target (Agents / tasks can still pin it explicitly). Suited to expensive profiles reserved for one specific Agent that should not be burned through by other agents' failures.",
+                        )}
+                      </p>
+                    </div>
+                    <Switch checked={poolExclude} onCheckedChange={setPoolExclude} aria-label={t("Excluded from pool")} />
+                  </div>
+                  <div className="flex items-center justify-between gap-4 border-t pt-3">
+                    <div className="grid gap-0.5">
+                      <Label className="text-sm">{t("Streaming output")}</Label>
+                      <p className="text-muted-foreground text-xs">
+                        {t(
+                          "On (default) streams over SSE, with live in-flight progress and real-time token counting. Off uses true non-streaming (stream:false, returning the full response in one shot) — a way around gateways with broken SSE implementations (empty frames / dropped thinking-field frames), at the cost of losing live in-flight progress.",
+                        )}
+                      </p>
+                    </div>
+                    <Switch checked={streaming} onCheckedChange={setStreaming} aria-label={t("Streaming output")} />
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="p-rps">{t("Rate limit per second")}</Label>
+                    <Input id="p-rps" type="number" min={0} value={rps} onChange={(e) => setRps(e.target.value)} />
+                  </div>
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="p-rpm">{t("Rate limit per minute")}</Label>
+                    <Input id="p-rpm" type="number" min={0} value={rpm} onChange={(e) => setRpm(e.target.value)} />
+                  </div>
+                </div>
+
+                <div className="grid gap-1.5">
+                  <Label htmlFor="p-proxy">{t("Proxy (optional)")}</Label>
+                  <Input
+                    id="p-proxy"
+                    className="font-mono text-xs"
+                    placeholder="socks5://user:pass@127.0.0.1:1080 · http://127.0.0.1:8080"
+                    value={proxy}
+                    onChange={(e) => setProxy(e.target.value)}
+                  />
+                  <p className="text-muted-foreground text-xs">
+                    {t(
+                      "Only outbound LLM requests go through this proxy; http/https/socks5 are supported, optionally with credentials (e.g. socks5://user:pass@host:port — URL-encode the password if it contains special characters). Leave empty for no proxy (direct connection).",
+                    )}
+                  </p>
+                </div>
+
+                <div className="grid gap-1.5">
+                  <Label htmlFor="p-session-header">{t("Custom session header (optional)")}</Label>
+                  <Input
+                    id="p-session-header"
+                    className="font-mono text-xs"
+                    placeholder={t("e.g. x-session-id (empty = not sent)")}
+                    value={sessionHeaderKey}
+                    onChange={(e) => setSessionHeaderKey(e.target.value)}
+                  />
+                  <p className="text-muted-foreground text-xs">
+                    {rich(
+                      t(
+                        "Once a header name is set, every request carries this HTTP header, with the value filled in automatically as the <b>current session's session id</b> (chat sessions like conv-12, workers like exp3-worker-i87). Meant for gateways that do prompt caching / sticky routing on a session-id header; stable across turns of one session, distinct across sessions. Leave empty to not send it.",
+                      ),
+                    )}
+                  </p>
+                </div>
+
+                <div className="grid gap-1.5">
+                  <Label htmlFor="p-user-agent">{t("Custom User-Agent (optional)")}</Label>
+                  <Input
+                    id="p-user-agent"
+                    className="font-mono text-xs"
+                    placeholder={t("e.g. my-app/1.0 (empty = default UA)")}
+                    value={userAgent}
+                    onChange={(e) => setUserAgent(e.target.value)}
+                  />
+                  <p className="text-muted-foreground text-xs">
+                    {rich(
+                      t(
+                        "Overrides the <b>User-Agent</b> header on every outbound LLM request. Useful for gateways that route or allow-list by User-Agent. Leave empty to keep the default User-Agent unchanged.",
+                      ),
+                    )}
+                  </p>
+                </div>
+
+                <ProfileRetryFields value={retry} onChange={setRetry} />
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        </div>
+
+        <div className="flex gap-2 border-t bg-background/95 px-5 py-3">
+          <Button variant="outline" onClick={testConnection} disabled={testing}>
+            {testing ? <Loader2Icon className="animate-spin" /> : <PlugZapIcon />}
+            {testing ? t("Testing…") : t("Test connection")}
+          </Button>
+          <Button onClick={save} disabled={saving} className="flex-1">
+            {saving && <Loader2Icon className="animate-spin" />}
+            {!saving && (isNew ? <PlusIcon /> : <SaveIcon />)}
+            {isNew ? t("Create") : t("Save")}
+          </Button>
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}

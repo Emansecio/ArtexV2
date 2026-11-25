@@ -23,7 +23,13 @@ type Scheduler struct {
 	s    *Server
 	pg   *db.DB
 	tick time.Duration
+	wake chan struct{} // buffered(1): event producers nudge an immediate step
 }
+
+// schedMinEventInterval is the coalescing floor for event-driven wakes: a burst
+// of pushes (e.g. a finding flood) merges into one step at this spacing instead
+// of one step per event.
+const schedMinEventInterval = 250 * time.Millisecond
 
 const (
 	schedKeyLastFinding    = "last_finding_id"    // watermark: max finding node id fired for
@@ -34,10 +40,25 @@ const (
 )
 
 func newScheduler(s *Server) *Scheduler {
-	return &Scheduler{s: s, pg: s.m.pg, tick: 30 * time.Second}
+	return &Scheduler{s: s, pg: s.m.pg, tick: 30 * time.Second, wake: make(chan struct{}, 1)}
+}
+
+// Wake nudges the scheduler into an immediate reconcile+step — called on the
+// events its watermarks track (task terminal transitions, findings, met goals,
+// tool calls, task creates). Non-blocking: a pending wake is coalesced.
+func (sc *Scheduler) Wake() {
+	if sc == nil {
+		return
+	}
+	select {
+	case sc.wake <- struct{}{}:
+	default:
+	}
 }
 
 // Run loops until ctx is done, ticking the scheduler. Started once from server New.
+// Event pushes run a step right away (subject to the coalescing floor); the
+// 30s ticker stays as the interval-trigger + fallback path.
 func (sc *Scheduler) Run(ctx context.Context) {
 	if sc.pg == nil {
 		return
@@ -45,13 +66,39 @@ func (sc *Scheduler) Run(ctx context.Context) {
 	sc.init()
 	t := time.NewTicker(sc.tick)
 	defer t.Stop()
+	var lastRun time.Time
+	var trailing *time.Timer
+	var trailingC <-chan time.Time
+	defer func() {
+		if trailing != nil {
+			trailing.Stop()
+		}
+	}()
+	run := func() {
+		lastRun = time.Now()
+		sc.s.reconcileConcurrency() // concurrency cap: start queued tasks as free slots appear
+		sc.step()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			sc.s.reconcileConcurrency() // concurrency cap: start queued tasks as free slots appear
-			sc.step()
+			run()
+		case <-sc.wake:
+			// Run now unless a burst is already coalescing — then a trailing
+			// timer guarantees one more pass at the min interval.
+			if d := time.Since(lastRun); d >= schedMinEventInterval {
+				run()
+			} else if trailing == nil {
+				trailing = time.NewTimer(schedMinEventInterval - d)
+				trailingC = trailing.C
+			}
+		case <-trailingC:
+			trailingC = nil
+			trailing.Stop()
+			trailing = nil
+			run()
 		}
 	}
 }

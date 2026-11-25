@@ -1,7 +1,6 @@
 package intercept
 
 import (
-	"encoding/json"
 	"path"
 	"strings"
 
@@ -36,19 +35,9 @@ type callWord struct {
 //
 // Parse errors never panic and always return false (no match).
 func argvCompoundMatches(tokens []string, toolName string, input []byte) bool {
-	if toolName != "Bash" || len(tokens) == 0 {
-		return false
-	}
-	var in struct {
-		Command string `json:"command"`
-	}
-	if json.Unmarshal(input, &in) != nil {
-		return false
-	}
-	if strings.TrimSpace(in.Command) == "" {
-		return false
-	}
-	return bashCommandMatchesArgv(tokens, in.Command, 0)
+	var st matchState
+	st.load(toolName, input)
+	return st.cmd != "" && st.compoundMatches(tokens)
 }
 
 func bashCommandMatchesArgv(rule []string, command string, depth int) bool {
@@ -56,6 +45,10 @@ func bashCommandMatchesArgv(rule []string, command string, depth int) bool {
 	if err != nil {
 		return false
 	}
+	return bashFileMatchesArgv(rule, f, depth)
+}
+
+func bashFileMatchesArgv(rule []string, f *syntax.File, depth int) bool {
 	matched := false
 	syntax.Walk(f, func(n syntax.Node) bool {
 		if matched {

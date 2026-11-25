@@ -139,9 +139,9 @@ func assertEmbeddedApplied(t *testing.T, d *DB) []appliedMigration {
 	}{{1, llmRecordsMigration}, {2, llmUsageMigration}, {3, "0003_task_scope_icp_index.sql"}, {4, "0004_llm_usage_ts_index.sql"},
 		{5, "0005_traffic_rewrite_rules.sql"}, {6, "0006_activity_outbox.sql"}, {7, "0007_finding_report_state.sql"},
 		{8, "0008_traffic_evidence_rewrite_flag.sql"}, {9, "0009_llm_context.sql"}, {10, "0010_dashboard_usage_indexes.sql"},
-		{11, "0011_traffic_tamper_hooks.sql"}, {12, "0012_perf_indexes.sql"}}
+		{11, "0011_traffic_tamper_hooks.sql"}, {12, "0012_perf_indexes.sql"}, {13, "0013_expnodes_updated_at_trigger.sql"}}
 	if len(applied) != len(want) {
-		t.Fatalf("schema_migrations = %+v, want versions 1 to 12", applied)
+		t.Fatalf("schema_migrations = %+v, want versions 1 to 13", applied)
 	}
 	for i, w := range want {
 		content, err := fs.ReadFile(migrationsFS(), w.name)
@@ -399,7 +399,7 @@ func TestMigrationsRefuseOutOfOrderVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	after := readApplied(t, &DB{raw})
+	after := readApplied(t, &DB{DB: raw})
 	if len(after) != len(before) {
 		t.Fatalf("schema_migrations changed: before %+v, after %+v", before, after)
 	}

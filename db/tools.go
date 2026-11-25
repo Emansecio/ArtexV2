@@ -1,7 +1,6 @@
 package db
 
 import (
-	"database/sql"
 	"encoding/json"
 )
 
@@ -24,6 +23,12 @@ type Tool struct {
 
 const toolCols = `key, system, description, schema, agents, enabled, kind, exec, deferred`
 
+// dropToolCache invalidates the cached ListTools/ListCustomTools results after
+// a successful write to the tools table.
+func (d *DB) dropToolCache() {
+	d.cfgRef().drop("tools:list", "tools:custom")
+}
+
 // SeedTool inserts a built-in tool's code-defined defaults ONCE. ON CONFLICT DO
 // NOTHING: an existing row (possibly edited in the UI) is never overwritten on
 // startup — that's what keeps page edits from being wiped every restart. Use
@@ -35,11 +40,17 @@ func (d *DB) SeedTool(key, desc string, schema, agents json.RawMessage) error {
 	if len(agents) == 0 {
 		agents = json.RawMessage("[]")
 	}
-	_, err := d.Exec(`
+	res, err := d.Exec(`
 INSERT INTO tools(key, system, description, schema, agents, enabled)
 VALUES ($1, true, $2, $3, $4, true)
 ON CONFLICT (key) DO NOTHING`, key, desc, schema, agents)
-	return err
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		d.dropToolCache()
+	}
+	return nil
 }
 
 // AddAgentToToolBinding adds an agent key to the given tools' `agents` arrays if
@@ -51,6 +62,7 @@ func (d *DB) AddAgentToToolBinding(agentKey string, keys []string) error {
 			return err
 		}
 	}
+	d.dropToolCache()
 	return nil
 }
 
@@ -59,6 +71,9 @@ func (d *DB) AddAgentToToolBinding(agentKey string, keys []string) error {
 // binding. Uses jsonb `-` (remove array element) guarded by `?` (membership).
 func (d *DB) RemoveAgentFromToolBindings(agentKey string) error {
 	_, err := d.Exec(`UPDATE tools SET agents = agents - $1 WHERE agents ? $1`, agentKey)
+	if err == nil {
+		d.dropToolCache()
+	}
 	return err
 }
 
@@ -67,6 +82,9 @@ func (d *DB) RemoveAgentFromToolBindings(agentKey string) error {
 // (SeedTool is first-insert-only, so a changed default never reaches a seeded row).
 func (d *DB) RemoveAgentFromTool(agentKey, toolKey string) error {
 	_, err := d.Exec(`UPDATE tools SET agents = agents - $1 WHERE key=$2 AND agents ? $1`, agentKey, toolKey)
+	if err == nil {
+		d.dropToolCache()
+	}
 	return err
 }
 
@@ -88,6 +106,9 @@ ON CONFLICT (key) DO UPDATE
       schema      = EXCLUDED.schema,
       agents      = EXCLUDED.agents,
       enabled     = true`, key, desc, schema, agents)
+	if err == nil {
+		d.dropToolCache()
+	}
 	return err
 }
 
@@ -101,6 +122,9 @@ func (d *DB) RefreshToolDefaults(key, desc string, schema json.RawMessage) error
 		schema = json.RawMessage("{}")
 	}
 	_, err := d.Exec(`UPDATE tools SET description=$2, schema=$3, updated_at=now() WHERE key=$1 AND system`, key, desc, schema)
+	if err == nil {
+		d.dropToolCache()
+	}
 	return err
 }
 
@@ -126,8 +150,25 @@ func scanTool(rows interface{ Scan(...any) error }) (*Tool, error) {
 	return &t, nil
 }
 
-// ListTools returns the whole tool catalog, ordered by key.
+// cloneTools deep-copies cached tool rows: callers must never mutate the
+// shared cache entries (e.g. schema masking writes back over m.Env).
+func cloneTools(in []*Tool) []*Tool {
+	out := make([]*Tool, len(in))
+	for i, t := range in {
+		cp := *t
+		out[i] = &cp
+	}
+	return out
+}
+
+// ListTools returns the whole tool catalog, ordered by key. The catalog is
+// cached briefly (configCacheTTL) — it is re-read for every agent run while
+// writes are rare. All db-level tools writes invalidate; raw-SQL repairs rely
+// on the TTL.
 func (d *DB) ListTools() ([]*Tool, error) {
+	if v, hit := d.cfgRef().get("tools:list"); hit {
+		return cloneTools(v.([]*Tool)), nil
+	}
 	rows, err := d.Query(`SELECT ` + toolCols + ` FROM tools ORDER BY key`)
 	if err != nil {
 		return nil, err
@@ -141,17 +182,27 @@ func (d *DB) ListTools() ([]*Tool, error) {
 		}
 		out = append(out, t)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	d.cfgRef().put("tools:list", out)
+	return cloneTools(out), nil
 }
 
-// GetTool fetches one tool row (nil if absent).
+// GetTool fetches one tool row (nil if absent). It resolves through the cached
+// catalog so per-call lookups (e.g. the target-gate proxy check) don't each hit
+// Postgres; writes invalidate via the "tools:" prefix like ListTools.
 func (d *DB) GetTool(key string) (*Tool, error) {
-	row := d.QueryRow(`SELECT `+toolCols+` FROM tools WHERE key=$1`, key)
-	t, err := scanTool(row)
-	if err == sql.ErrNoRows {
-		return nil, nil
+	tools, err := d.ListTools()
+	if err != nil {
+		return nil, err
 	}
-	return t, err
+	for _, t := range tools {
+		if t.Key == key {
+			return t, nil
+		}
+	}
+	return nil, nil
 }
 
 // CreateCustomTool inserts a user-defined tool (system=false) with an execution
@@ -173,6 +224,9 @@ func (d *DB) CreateCustomTool(t *Tool) error {
 INSERT INTO tools(key, system, description, schema, agents, enabled, kind, exec, deferred)
 VALUES ($1, false, $2, $3, $4, $5, $6, $7, $8)`,
 		t.Key, t.Description, schema, agents, t.Enabled, t.Kind, exec, t.Deferred)
+	if err == nil {
+		d.dropToolCache()
+	}
 	return err
 }
 
@@ -195,6 +249,9 @@ func (d *DB) UpdateCustomTool(t *Tool) error {
 UPDATE tools SET description=$2, schema=$3, agents=$4, enabled=$5, kind=$6, exec=$7, deferred=$8
 WHERE key=$1 AND system=false`,
 		t.Key, t.Description, schema, agents, t.Enabled, t.Kind, exec, t.Deferred)
+	if err == nil {
+		d.dropToolCache()
+	}
 	return err
 }
 
@@ -209,11 +266,18 @@ func sealToolExec(exec json.RawMessage) (string, error) {
 // DeleteCustomTool removes a custom tool (system=false only; built-ins protected).
 func (d *DB) DeleteCustomTool(key string) error {
 	_, err := d.Exec(`DELETE FROM tools WHERE key=$1 AND system=false`, key)
+	if err == nil {
+		d.dropToolCache()
+	}
 	return err
 }
 
-// ListCustomTools returns only the user-defined (system=false) tools.
+// ListCustomTools returns only the user-defined (system=false) tools. Cached
+// like ListTools.
 func (d *DB) ListCustomTools() ([]*Tool, error) {
+	if v, hit := d.cfgRef().get("tools:custom"); hit {
+		return cloneTools(v.([]*Tool)), nil
+	}
 	rows, err := d.Query(`SELECT ` + toolCols + ` FROM tools WHERE system=false ORDER BY key`)
 	if err != nil {
 		return nil, err
@@ -227,7 +291,11 @@ func (d *DB) ListCustomTools() ([]*Tool, error) {
 		}
 		out = append(out, t)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	d.cfgRef().put("tools:custom", out)
+	return cloneTools(out), nil
 }
 
 // UpdateTool saves the page-editable fields. key is never changed (it is welded to
@@ -243,5 +311,8 @@ func (d *DB) UpdateTool(key, desc string, schema, agents json.RawMessage, enable
 	_, err := d.Exec(`
 UPDATE tools SET description=$2, schema=$3, agents=$4, enabled=$5 WHERE key=$1`,
 		key, desc, schema, agents, enabled)
+	if err == nil {
+		d.dropToolCache()
+	}
 	return err
 }

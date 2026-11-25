@@ -165,7 +165,7 @@ func DecorateTool(t actool.CoreTool, desc string, schema map[string]any) actool.
 	if t.Name() == "record_fact" {
 		schema = RepairRecordFactSchema(schema)
 	}
-	return &overriddenTool{CoreTool: t, desc: desc, schema: schema}
+	return &overriddenTool{CoreTool: t, desc: desc, schema: schema, defs: scalarDefaults(schema)}
 }
 
 // overriddenTool is a CoreTool decorator: it embeds the original (so all behavioral
@@ -175,6 +175,7 @@ type overriddenTool struct {
 	actool.CoreTool
 	desc   string
 	schema map[string]any
+	defs   map[string]json.RawMessage // scalar defaults, precomputed at Decorate
 }
 
 func (o *overriddenTool) Description() string         { return o.desc }
@@ -189,15 +190,14 @@ func (o *overriddenTool) AcceptsRawInput() bool {
 }
 
 func (o *overriddenTool) Call(ctx context.Context, in json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
-	return o.CoreTool.Call(ctx, injectDefaults(in, o.schema), tc)
+	return o.CoreTool.Call(ctx, injectDefaults(in, o.defs), tc)
 }
 
 // injectDefaults fills scalar parameter defaults declared in the (possibly edited)
 // schema into the input JSON whenever the model omitted the field or left it empty/
 // null. Structure (names/types/required) is untouched — only default values are
 // merged in.
-func injectDefaults(in json.RawMessage, schema map[string]any) json.RawMessage {
-	defs := scalarDefaults(schema)
+func injectDefaults(in json.RawMessage, defs map[string]json.RawMessage) json.RawMessage {
 	if len(defs) == 0 {
 		return in
 	}

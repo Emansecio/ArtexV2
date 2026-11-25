@@ -2,7 +2,17 @@
 
 import * as React from "react";
 
-import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
+import {
+  CpuIcon,
+  FlaskConicalIcon,
+  GlobeIcon,
+  KeyboardIcon,
+  Link2Icon,
+  RadioTowerIcon,
+  SearchIcon,
+  ShieldAlertIcon,
+  TerminalIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -296,13 +306,28 @@ export default function SystemSettingsPage() {
         <p className="text-muted-foreground text-sm">{t("Global runtime switches")}</p>
       </div>
 
-      {/* Multi-column instead of grid: the web search card is several times taller than the others and
-          its height varies with the selected backend (brave/tavily key inputs are conditional). A grid
-          would stretch the row to the tallest card and leave blank space beside the others, while columns
-          balance-fill by content height. Card spacing uses mb rather than gap — in a multi-column layout
-          column-gap only covers the gaps between columns; row spacing must come from the children. */}
-      <div className="columns-1 gap-4 md:gap-6 lg:columns-2">
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[12.5rem_minmax(0,1fr)]">
+        <nav className="hidden lg:sticky lg:top-16 lg:flex lg:flex-col lg:gap-1 lg:self-start" aria-label={t("System settings")}>
+          {[
+            { id: "network", label: t("Network & traffic") },
+            { id: "execution", label: t("Execution") },
+            { id: "web-search", label: t("Web search") },
+            { id: "preferences", label: t("Preferences") },
+          ].map((sec) => (
+            <a
+              key={sec.id}
+              href={`#${sec.id}`}
+              className="rounded-md px-2.5 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              {sec.label}
+            </a>
+          ))}
+        </nav>
+
+        <div className="flex max-w-3xl flex-col gap-8">
+          <section id="network" className="scroll-mt-16 flex flex-col gap-4">
+            <h2 className="text-sm font-semibold text-muted-foreground">{t("Network & traffic")}</h2>
+        <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <RadioTowerIcon className="size-4" />
@@ -312,12 +337,18 @@ export default function SystemSettingsPage() {
               {t(
                 "When enabled, every agent's HTTP traffic is stored in full through the recording proxy, and agents are injected with the traffic_search / traffic_get tools and proxy configuration (the prompt includes proxy notes).",
               )}
-              <br />
-              {rich(
-                t(
-                  "When off (default) no traffic is recorded: the agent does <b>not</b> receive proxy configuration or traffic tools, and the prompt contains <b>no</b> proxy-related content. Agents are rebuilt immediately after switching.",
-                ),
-              )}
+              <details className="mt-2 text-xs">
+                <summary className="cursor-pointer select-none font-medium text-foreground/80 hover:text-foreground">
+                  {t("Details")}
+                </summary>
+                <p className="mt-1">
+                  {rich(
+                    t(
+                      "When off (default) no traffic is recorded: the agent does <b>not</b> receive proxy configuration or traffic tools, and the prompt contains <b>no</b> proxy-related content. Agents are rebuilt immediately after switching.",
+                    ),
+                  )}
+                </p>
+              </details>
             </CardDescription>
           </CardHeader>
           <CardContent className="flex items-center justify-between gap-4">
@@ -335,10 +366,10 @@ export default function SystemSettingsPage() {
 
         <NoiseProfileCard />
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
-              <RadioTowerIcon className="size-4" />
+              <Link2Icon className="size-4" />
               {t("Automatic agent traffic binding")}
             </CardTitle>
             <CardDescription id="agent-traffic-binding-description">
@@ -347,10 +378,16 @@ export default function SystemSettingsPage() {
                   "Off by default. When enabled, the report agent triggered on vulnerability creation reviews existing HTTP requests/responses and links the matching traffic before writing the report. <b>Reading packets and the extra tool calls increase token consumption.</b>",
                 ),
               )}
-              <br />
-              {t(
-                "Reporting still works for TCP, uncaptured traffic, or when no traffic matches. This switch does not affect traffic capture, manual binding, or viewing saved evidence. It takes effect for the next round of agents; once disabled, new automatic bindings are rejected immediately.",
-              )}
+              <details className="mt-2 text-xs">
+                <summary className="cursor-pointer select-none font-medium text-foreground/80 hover:text-foreground">
+                  {t("Details")}
+                </summary>
+                <p className="mt-1">
+                  {t(
+                    "Reporting still works for TCP, uncaptured traffic, or when no traffic matches. This switch does not affect traffic capture, manual binding, or viewing saved evidence. It takes effect for the next round of agents; once disabled, new automatic bindings are rejected immediately.",
+                  )}
+                </p>
+              </details>
             </CardDescription>
           </CardHeader>
           <CardContent className="flex items-center justify-between gap-4">
@@ -367,10 +404,10 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
-              <RadioTowerIcon className="size-4" />
+              <GlobeIcon className="size-4" />
               {t("Global proxy")}
             </CardTitle>
             <CardDescription>
@@ -379,18 +416,25 @@ export default function SystemSettingsPage() {
                   "All agents' <b>target traffic</b> egresses through this proxy (hide the source IP / use a jump host). Supports <b>http / https / socks5</b>, optionally with <code>user:pass</code> authentication. Empty = direct connection.",
                 ),
               )}
-              <br />
-              {rich(
-                t(
-                  "With <b>traffic capture</b> on, it acts as the recording proxy's <b>upstream</b> (traffic is still stored in full, then egresses through this proxy); with capture off, it is injected directly into the agent's bash / WebFetch egress. Independent of the web search proxy and the LLM proxy.",
-                ),
-              )}
-              <br />
-              {rich(
-                t(
-                  "<b>Note</b>: with <b>capture off</b>, socks5 relies on each CLI tool honoring <code>ALL_PROXY</code> (curl works; some tools may ignore it). If you mainly use socks5, enable traffic capture — on that path the MITM does the dialing itself, invisible to tools and reliably effective.",
-                ),
-              )}
+              <details className="mt-2 text-xs">
+                <summary className="cursor-pointer select-none font-medium text-foreground/80 hover:text-foreground">
+                  {t("Details")}
+                </summary>
+                <p className="mt-1">
+                  {rich(
+                    t(
+                      "With <b>traffic capture</b> on, it acts as the recording proxy's <b>upstream</b> (traffic is still stored in full, then egresses through this proxy); with capture off, it is injected directly into the agent's bash / WebFetch egress. Independent of the web search proxy and the LLM proxy.",
+                    ),
+                  )}
+                </p>
+                <p className="mt-1">
+                  {rich(
+                    t(
+                      "<b>Note</b>: with <b>capture off</b>, socks5 relies on each CLI tool honoring <code>ALL_PROXY</code> (curl works; some tools may ignore it). If you mainly use socks5, enable traffic capture — on that path the MITM does the dialing itself, invisible to tools and reliably effective.",
+                    ),
+                  )}
+                </p>
+              </details>
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-2">
@@ -417,8 +461,11 @@ export default function SystemSettingsPage() {
             </p>
           </CardContent>
         </Card>
+          </section>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <section id="execution" className="scroll-mt-16 flex flex-col gap-4">
+            <h2 className="text-sm font-semibold text-muted-foreground">{t("Execution")}</h2>
+        <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <ShieldAlertIcon className="size-4" />
@@ -464,7 +511,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <FlaskConicalIcon className="size-4" />
@@ -494,8 +541,11 @@ export default function SystemSettingsPage() {
             />
           </CardContent>
         </Card>
+          </section>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <section id="web-search" className="scroll-mt-16 flex flex-col gap-4">
+            <h2 className="text-sm font-semibold text-muted-foreground">{t("Web search")}</h2>
+        <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <SearchIcon className="size-4" />
@@ -733,11 +783,14 @@ export default function SystemSettingsPage() {
             )}
           </CardContent>
         </Card>
+          </section>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <section id="preferences" className="scroll-mt-16 flex flex-col gap-4">
+            <h2 className="text-sm font-semibold text-muted-foreground">{t("Preferences")}</h2>
+        <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
-              <RadioTowerIcon className="size-4" />
+              <TerminalIcon className="size-4" />
               {t("Custom scripts · Python interpreter")}
             </CardTitle>
             <CardDescription>
@@ -767,7 +820,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <CpuIcon className="size-4" />
@@ -799,7 +852,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <KeyboardIcon className="size-4" />
@@ -835,6 +888,8 @@ export default function SystemSettingsPage() {
             </Select>
           </CardContent>
         </Card>
+          </section>
+        </div>
       </div>
     </div>
   );

@@ -316,15 +316,17 @@ func Open(dir, addr string) (*Traffic, error) {
 	index := filepath.Join(dir, "_index", "index.sqlite")
 	dsn := index
 	if !strings.ContainsRune(index, '?') {
-		dsn = "file:" + index + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-32000)"
+		dsn = "file:" + index + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-8000)&_pragma=mmap_size(67108864)"
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	// Cap SQLite pool size so each connection's 32 MiB page cache stays bounded.
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(4)
+	// Cap SQLite pool size so each connection's 8 MiB page cache stays bounded
+	// while mmap_size shares hot pages via the OS page cache.
+	db.SetMaxOpenConns(3)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxIdleTime(2 * time.Minute)
 	t := &Traffic{
 		dir:    dir,
 		addr:   addr,
@@ -406,7 +408,8 @@ func (t *Traffic) initIndex() error {
 		`PRAGMA journal_mode=WAL`,
 		`PRAGMA synchronous=NORMAL`,
 		`PRAGMA temp_store=MEMORY`,
-		`PRAGMA cache_size=-32000`,
+		`PRAGMA cache_size=-8000`,
+		`PRAGMA mmap_size=67108864`,
 		`PRAGMA busy_timeout=5000`,
 	} {
 		if _, err := conn.ExecContext(ctx, p); err != nil {

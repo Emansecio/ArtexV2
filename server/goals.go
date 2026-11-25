@@ -46,8 +46,34 @@ func (s *Server) startTaskEngine(t *Task) {
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
 		return
 	}
+	// Seeded-intent fast path: when an intent is already claimable the engine
+	// starts NOW — workers begin executing it in parallel with round-0 goal
+	// decomposition instead of idling through the multi-second LLM call. Only
+	// the planner is held, on goalsGate, so it cannot plan against a goal set
+	// that does not exist yet (a premature goalless settle).
+	seeded := false
+	var gate chan struct{}
+	if active, err := t.Store.HasActiveIntent(); err == nil && active {
+		seeded = true
+		gate = make(chan struct{})
+		t.goalsGate = gate
+		s.engine.Run(s.ctx, t)
+	}
+	if gate != nil {
+		defer close(gate)
+	}
 	s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
 		Summary: "round 0 goal decomposition"})
+	// Stream round-0 decomposition tokens live like planner rounds do — the
+	// multi-second LLM call otherwise leaves the UI silent until commit.
+	if s.deltaHub != nil {
+		ctx = agent.WithDeltaSink(ctx, func(ev agent.DeltaEvent) {
+			s.deltaHub.Publish("task:"+t.ID, DeltaMsg{
+				Event: "delta",
+				Data:  DeltaFrame{Worker: "planner", Kind: ev.Kind, Text: ev.Text},
+			})
+		})
+	}
 	goals := s.createGoals(ctx, t, func(r db.Activity) {
 		s.engine.emitActivity(t, r)
 	})
@@ -62,6 +88,13 @@ func (s *Server) startTaskEngine(t *Task) {
 		s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "text", Summary: summary})
 	}
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
+		return
+	}
+	if seeded {
+		// Loops are already up; the gate close releases any held planner round.
+		// A notify covers the case where the seeded intent finished during
+		// decomposition before goals existed to be judged.
+		t.Notify()
 		return
 	}
 	s.engine.Run(s.ctx, t)

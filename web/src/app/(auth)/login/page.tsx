@@ -1,349 +1,461 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import * as React from "react";
 
-import { useRouter } from "next/navigation";
+import {
+  ArrowRight,
+  Brain,
+  Check,
+  Database,
+  LayoutDashboard,
+  Loader2,
+  MessageSquare,
+  RotateCcw,
+  Shield,
+  SlidersHorizontal,
+  Target,
+  X,
+} from "lucide-react";
 
-import { AlertTriangle, ShieldCheck } from "lucide-react";
-
+import { ThemeSwitcher } from "@/app/(main)/_components/sidebar/theme-switcher";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Dialog, DialogClose, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import { auth } from "@/lib/auth";
+import { cn } from "@/lib/utils";
 
-export default function LoginPage() {
-  const router = useRouter();
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [checking, setChecking] = useState(true);
-  const [agreed, setAgreed] = useState(false);
-  const [termsOpen, setTermsOpen] = useState(false);
-  const [readToEnd, setReadToEnd] = useState(false);
-  const termsBodyRef = useRef<HTMLDivElement>(null);
+const WELCOME_STORAGE_KEY = "artex.welcome.v2";
 
-  // Scroll to the bottom of the terms (including when everything fits without scrolling) to unlock "Agree".
-  function handleTermsScroll() {
-    const el = termsBodyRef.current;
-    if (!el) return;
-    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 8) setReadToEnd(true);
+type StartRoute = "/models" | "/function/tasks" | "/dashboard" | "/chat";
+
+interface WelcomePrefs {
+  operatorName: string;
+  headline: string;
+  subtitle: string;
+  defaultRoute: StartRoute;
+  autoEnter: boolean;
+}
+
+const DEFAULT_PREFS: WelcomePrefs = {
+  operatorName: "",
+  headline: "",
+  subtitle: "",
+  defaultRoute: "/models",
+  autoEnter: false,
+};
+
+const DESTINATIONS: {
+  route: StartRoute;
+  label: string;
+  desc: string;
+  icon: React.ComponentType<{ className?: string }>;
+}[] = [
+  {
+    route: "/models",
+    label: t("Models & Fallbacks"),
+    desc: t("Providers, OAuth, reasoning & failover"),
+    icon: Brain,
+  },
+  {
+    route: "/function/tasks",
+    label: t("Tasks"),
+    desc: t("Launch and monitor security runs"),
+    icon: Target,
+  },
+  {
+    route: "/dashboard",
+    label: t("Dashboard"),
+    desc: t("Live overview, findings & usage"),
+    icon: LayoutDashboard,
+  },
+  {
+    route: "/chat",
+    label: t("Chat"),
+    desc: t("Direct interactive agent sessions"),
+    icon: MessageSquare,
+  },
+];
+
+function loadWelcomePrefs(): WelcomePrefs {
+  if (typeof window === "undefined") return DEFAULT_PREFS;
+  try {
+    const raw = window.localStorage.getItem(WELCOME_STORAGE_KEY);
+    if (!raw) return DEFAULT_PREFS;
+    const parsed = JSON.parse(raw) as Partial<WelcomePrefs>;
+    const validRoute = DESTINATIONS.some((d) => d.route === parsed.defaultRoute)
+      ? (parsed.defaultRoute as StartRoute)
+      : DEFAULT_PREFS.defaultRoute;
+    return {
+      operatorName: typeof parsed.operatorName === "string" ? parsed.operatorName : "",
+      headline: typeof parsed.headline === "string" ? parsed.headline : "",
+      subtitle: typeof parsed.subtitle === "string" ? parsed.subtitle : "",
+      defaultRoute: validRoute,
+      autoEnter: Boolean(parsed.autoEnter),
+    };
+  } catch {
+    return DEFAULT_PREFS;
   }
+}
 
-  useEffect(() => {
-    if (!termsOpen) return;
-    // Reset on open, and cover the case where the content is shorter than one screen and never fires a scroll.
-    setReadToEnd(false);
-    const el = termsBodyRef.current;
-    if (el && el.scrollHeight <= el.clientHeight + 8) setReadToEnd(true);
-  }, [termsOpen]);
+function saveWelcomePrefs(prefs: WelcomePrefs) {
+  try {
+    window.localStorage.setItem(WELCOME_STORAGE_KEY, JSON.stringify(prefs));
+  } catch {
+    /* ignore storage quota errors */
+  }
+}
 
-  useEffect(() => {
-    // Already signed in — go straight to the main UI (static export has no middleware to do this redirect).
-    const token = auth.getToken();
-    if (token) {
-      // localStorage may still hold credentials while the cookie is gone. Sync first, then start a fresh request,
-      // so a server-side guard or route cache cannot bounce the redirect back to the login page still in its checking state.
-      auth.setToken(token);
-      window.location.replace("/function/tasks");
-      return;
-    }
-    api
-      .authStatus()
-      .then(({ initialized }) => {
-        if (!initialized) router.replace("/setup");
-      })
-      .catch(() => setError(t("Unable to connect to the backend service")))
-      .finally(() => setChecking(false));
-  }, [router]);
+export default function WelcomePage() {
+  const [prefs, setPrefs] = React.useState<WelcomePrefs>(DEFAULT_PREFS);
+  const [hydrated, setHydrated] = React.useState(false);
+  const [customizing, setCustomizing] = React.useState(false);
+  const [entering, setEntering] = React.useState(false);
+  const [backendOk, setBackendOk] = React.useState<boolean | null>(null);
+  const [version, setVersion] = React.useState("");
+  const [error, setError] = React.useState("");
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!agreed) {
-      setError(t("Please read and agree to the Terms of Use first"));
-      return;
-    }
-    setLoading(true);
+  const enterWorkspace = React.useCallback(async (target: StartRoute) => {
+    setEntering(true);
     setError("");
     try {
-      const { token } = await api.login("ARTEX", password);
+      const { token } = await api.localLogin();
       auth.setToken(token);
-      window.location.replace("/function/tasks");
-    } catch {
-      setError(t("Incorrect username or password"));
-    } finally {
-      setLoading(false);
+      window.location.replace(target);
+    } catch (e) {
+      setError((e as Error).message || t("Unable to connect to the backend service"));
+      setEntering(false);
     }
+  }, []);
+
+  React.useEffect(() => {
+    const loaded = loadWelcomePrefs();
+    setPrefs(loaded);
+    setHydrated(true);
+
+    const existingToken = auth.getToken();
+    if (existingToken) {
+      auth.setToken(existingToken);
+      window.location.replace(loaded.defaultRoute);
+      return;
+    }
+
+    api
+      .health()
+      .then((h) => {
+        setBackendOk(true);
+        setVersion((h.version ?? "").replace(/^v(?=\d)/, ""));
+        if (loaded.autoEnter) {
+          void enterWorkspace(loaded.defaultRoute);
+        }
+      })
+      .catch(() => {
+        setBackendOk(false);
+      });
+  }, [enterWorkspace]);
+
+  function updatePrefs(patch: Partial<WelcomePrefs>) {
+    setPrefs((prev) => {
+      const next = { ...prev, ...patch };
+      saveWelcomePrefs(next);
+      return next;
+    });
   }
 
-  if (checking) {
-    return (
-      // Prerendered in the build-time locale; the reader's locale may differ for this brief state.
-      <div role="status" className="flex min-h-dvh items-center justify-center text-muted-foreground" suppressHydrationWarning>
-        {t("Checking login state…")}
-      </div>
-    );
-  }
+  const displayHeadline =
+    prefs.headline.trim() ||
+    (prefs.operatorName.trim()
+      ? t("Welcome back, {name}", { name: prefs.operatorName.trim() })
+      : t("Welcome to ARTEX"));
 
-  // Keep the agreement sentence whole: the link text is placed through a placeholder so the word order can follow the locale.
-  const [agreeBefore, agreeAfter = ""] = t("I have read and agree to {terms}").split("{terms}");
+  const displaySubtitle =
+    prefs.subtitle.trim() ||
+    t("Local autonomous security testing console. Your models, tasks, and evidence stay on this machine.");
+
+  const selectedDest = DESTINATIONS.find((d) => d.route === prefs.defaultRoute) ?? DESTINATIONS[0];
 
   return (
-    <div className="flex h-dvh">
-      {/* Left panel */}
-      <div className="hidden flex-col items-center justify-center bg-primary p-12 text-center lg:flex lg:w-1/3">
-        <div className="relative flex items-center justify-center">
-          <div className="absolute size-80 rounded-full border border-primary-foreground/10" />
-          <div className="absolute size-60 rounded-full border border-primary-foreground/15" />
-          <div className="absolute size-40 rounded-full border border-primary-foreground/20" />
+    <div className="flex min-h-dvh flex-col bg-background text-foreground">
+      {/* Top bar — equal edges */}
+      <header className="mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-5 sm:px-10">
+        <div className="flex items-center gap-2.5">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/logo.png" alt="ARTEX" width={160} height={160} className="relative brightness-0 invert" />
+          <img src="/logo.png" alt="ARTEX" width={28} height={28} className="size-7 shrink-0" />
+          <span className="font-semibold text-base tracking-tight">ARTEX</span>
+          <span className="rounded-md border bg-muted/60 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+            {version ? `v${version}` : "v2 local"}
+          </span>
         </div>
-      </div>
 
-      {/* Right panel */}
-      <div className="flex w-full items-center justify-center bg-background p-8 lg:w-2/3">
-        <div className="w-full max-w-md space-y-10 py-24 lg:py-32">
-          <div className="space-y-4 text-center">
-            <h2 className="text-2xl font-medium tracking-tight">{t("Sign in")}</h2>
-            <p className="mx-auto max-w-xl text-muted-foreground">
-              {t("Welcome back — enter your password to continue using ARTEX")}
-            </p>
-          </div>
-          <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-            <div className="space-y-1.5">
-              <Label htmlFor="username">{t("Username")}</Label>
-              <Input id="username" value="ARTEX" readOnly className="bg-muted text-muted-foreground" />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="password">{t("Password")}</Label>
-              <Input
-                id="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder={t("Enter your password")}
-                autoFocus
-                autoComplete="current-password"
-              />
-            </div>
-            <div className="flex items-start gap-2">
-              <Checkbox
-                id="agree-terms"
-                checked={agreed}
-                onCheckedChange={(v) => setAgreed(v === true)}
-                className="mt-0.5"
-              />
-              <Label htmlFor="agree-terms" className="text-sm font-normal leading-relaxed text-muted-foreground">
-                {agreeBefore}
-                <button
-                  type="button"
-                  onClick={() => setTermsOpen(true)}
-                  className="mx-0.5 font-medium text-primary underline-offset-4 hover:underline"
-                >
-                  {t("Terms of Use")}
-                </button>
-                {agreeAfter}
-              </Label>
-            </div>
-            {error && <p className="text-sm text-destructive">{error}</p>}
-            <Button type="submit" className="w-full" disabled={loading || !password || !agreed}>
-              {loading ? t("Signing in...") : t("Sign in")}
-            </Button>
-          </form>
-        </div>
-      </div>
-
-      <Dialog open={termsOpen} onOpenChange={setTermsOpen}>
-        <DialogContent className="gap-0 p-0 sm:max-w-2xl">
-          <DialogHeader className="flex-row items-center gap-3 border-b px-6 py-4">
-            <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-              <ShieldCheck className="size-5" />
-            </div>
-            <div className="space-y-0.5">
-              <DialogTitle className="text-base">{t("ARTEX Terms of Use and Disclaimer")}</DialogTitle>
-              <p className="text-xs text-muted-foreground">
-                {t("Version v1.1 · Effective 2026-10-11 · Please read all the following terms in full before signing in")}
-              </p>
-            </div>
-          </DialogHeader>
-
-          <div
-            ref={termsBodyRef}
-            onScroll={handleTermsScroll}
-            className="max-h-[60vh] space-y-5 overflow-y-auto px-6 py-5 text-sm leading-relaxed text-muted-foreground"
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant={customizing ? "secondary" : "ghost"}
+            className="gap-1.5 text-xs"
+            onClick={() => setCustomizing((v) => !v)}
           >
-            <p className="rounded-lg border bg-muted/40 p-3 text-foreground/80">
-              {t(
-                'This Terms of Use and Disclaimer (the "Statement") is the agreement between you and the ARTEX project authors and contributors regarding your use of this software. Please read it carefully and fully understand each provision before use, especially the disclaimer, liability-limitation, and prohibition clauses highlighted in bold or color blocks.',
-              )}
-              <span className="font-medium text-foreground">
-                {" "}
-                {t(
-                  "Once you download, install, access, or use this software in any way, you are deemed to have read, understood, and agreed to be bound by all of this Statement.",
-                )}
-              </span>
-            </p>
+            {customizing ? <X className="size-3.5" /> : <SlidersHorizontal className="size-3.5" />}
+            {customizing ? t("Done") : t("Customize")}
+          </Button>
+          <ThemeSwitcher />
+        </div>
+      </header>
 
-            <section className="space-y-1.5">
-              <h4 className="flex items-center gap-2 font-medium text-foreground">
-                <span className="flex size-5 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground">
-                  1
-                </span>
-                {t("Article 1 · Definitions and Open-Source License")}
-              </h4>
-              <p className="pl-7">
-                {t(
-                  "This software (ARTEX) is an open-source program released under the GNU Affero General Public License v3.0 (AGPL-3.0). You may freely use, copy, modify, and distribute it under that license; however, any derivative work (including online services provided to third parties over a network) must likewise be open-sourced under the AGPL-3.0 license with the complete corresponding source code made public to its users. The full AGPL-3.0 terms are governed by the accompanying LICENSE file.",
+      {/* Main single-screen hero */}
+      <main className="mx-auto flex w-full max-w-6xl flex-1 items-center px-6 py-8 sm:px-10">
+        <div className="grid w-full grid-cols-1 items-center gap-10 lg:grid-cols-12 lg:gap-12">
+          {/* Left column: Hero copy + instant entry + quick destinations */}
+          <section className="flex flex-col gap-7 lg:col-span-7 animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
+            <div className="inline-flex w-fit items-center gap-2 rounded-full border bg-card px-3 py-1 text-xs text-muted-foreground">
+              <span
+                className={cn(
+                  "inline-block size-1.5 rounded-full",
+                  backendOk === true
+                    ? "bg-emerald-500"
+                    : backendOk === false
+                      ? "bg-destructive"
+                      : "bg-muted-foreground/50",
                 )}
+              />
+              {backendOk === false
+                ? t("Backend offline")
+                : t("Local mode · No password required")}
+            </div>
+
+            <div className="space-y-3">
+              <h1 className="font-semibold text-3xl tracking-tight sm:text-4xl lg:text-5xl" suppressHydrationWarning>
+                {hydrated ? displayHeadline : t("Welcome to ARTEX")}
+              </h1>
+              <p className="max-w-xl text-base leading-relaxed text-muted-foreground" suppressHydrationWarning>
+                {hydrated
+                  ? displaySubtitle
+                  : t("Local autonomous security testing console. Your models, tasks, and evidence stay on this machine.")}
               </p>
-            </section>
+            </div>
 
-            <section className="space-y-1.5">
-              <h4 className="flex items-center gap-2 font-medium text-foreground">
-                <span className="flex size-5 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground">
-                  2
-                </span>
-                {t("Article 2 · Permitted Scope of Use")}
-              </h4>
-              <p className="pl-7">
-                {t(
-                  "This software is a security-testing platform. You may use it for: personal study, code research, and technical verification in environments you set up yourself; security testing of systems you own; security testing of third-party systems when you hold the owner's explicit authorization; and testing within the written scope of a bug bounty or vulnerability disclosure program, in compliance with that program's rules of engagement. You are responsible for obtaining and keeping proof of authorization, for staying inside the authorized scope, and for the safety and proportionality of every action the software takes on your behalf.",
-                )}
-              </p>
-            </section>
-
-            <section className="space-y-2">
-              <h4 className="flex items-center gap-2 font-medium text-destructive">
-                <span className="flex size-5 items-center justify-center rounded-md bg-destructive/10 text-xs font-semibold text-destructive">
-                  3
-                </span>
-                <AlertTriangle className="size-4" />
-                {t("Article 3 · Prohibited Conduct")}
-              </h4>
-              <ul className="ml-7 list-decimal space-y-1.5 rounded-lg border border-destructive/20 bg-destructive/5 p-3 pl-8 text-foreground/80 marker:text-destructive/70">
-                <li>
-                  {t(
-                    "Strictly forbidden: scanning, probing, exploiting, or attacking any system whose owner has not explicitly authorized you to test it, or exceeding the authorized scope or a program's rules of engagement once granted;",
-                  )}
-                </li>
-                <li>
-                  {t(
-                    "Strictly forbidden: using this software for illegal intrusion, data theft, extortion, denial of service (DoS/DDoS), or any destructive or criminal activity;",
-                  )}
-                </li>
-                <li>
-                  {t(
-                    "Strictly forbidden: removing, tampering with, or circumventing any copyright, license, or security notice in this software or its output;",
-                  )}
-                </li>
-                <li>
-                  {t(
-                    "Strictly forbidden: engaging in any conduct that violates the laws, regulations, or regulatory rules of your country or region.",
-                  )}
-                </li>
-              </ul>
-            </section>
-
-            <section className="space-y-1.5">
-              <h4 className="flex items-center gap-2 font-medium text-foreground">
-                <span className="flex size-5 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground">
-                  4
-                </span>
-                {t("Article 4 · Intellectual Property")}
-              </h4>
-              <p className="pl-7">
-                {t(
-                  "The copyright and related intellectual property of this software belong to the project authors and contributors, who grant you the corresponding rights within the scope of the AGPL-3.0 license. Beyond the rights expressly granted by that license, this Statement grants you no other rights, expressly or by implication.",
-                )}
-              </p>
-            </section>
-
-            <section className="space-y-1.5">
-              <h4 className="flex items-center gap-2 font-medium text-foreground">
-                <span className="flex size-5 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground">
-                  5
-                </span>
-                {t("Article 5 · Data and Privacy")}
-              </h4>
-              <p className="pl-7">
-                {t(
-                  "This software is a self-deployable open-source program; the authors run no centralized service and neither collect nor upload your usage data. All data you generate, process, or touch while using it stays under your control, and you are responsible for its legality and security; any consequence of improper data handling is yours to bear.",
-                )}
-              </p>
-            </section>
-
-            <section className="space-y-1.5">
-              <h4 className="flex items-center gap-2 font-medium text-foreground">
-                <span className="flex size-5 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground">
-                  6
-                </span>
-                {t("Article 6 · Compliance and Legal Liability")}
-              </h4>
-              <p className="pl-7">
-                {t(
-                  "You must comply on your own with all laws and regulations of your country or region on cybersecurity, data security and personal-information protection, computer crime, and the like (for example, laws on unauthorized access to computer systems, on personal-data protection, and on the responsibilities of security researchers and penetration testers in your jurisdiction).",
-                )}
-                <span className="font-medium text-foreground">
-                  {" "}
-                  {t(
-                    "All legal liability and consequences arising from your violation of the above laws and regulations or of this Statement are borne by you alone and have nothing to do with this software's authors and contributors.",
-                  )}
-                </span>
-              </p>
-            </section>
-
-            <section className="space-y-1.5">
-              <h4 className="flex items-center gap-2 font-medium text-foreground">
-                <span className="flex size-5 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground">
-                  7
-                </span>
-                {t("Article 7 · Disclaimer and Limitation of Liability")}
-              </h4>
-              <p className="pl-7">
-                {t(
-                  'This software is provided on an "AS IS" and "AS AVAILABLE" basis, without any express or implied warranty, including but not limited to warranties of merchantability, fitness for a particular purpose, accuracy, and non-infringement. To the maximum extent permitted by applicable law, this software\'s authors and contributors are not liable for any direct, indirect, incidental, special, or consequential loss arising from using or being unable to use this software (regardless of whether it is used properly), including but not limited to data loss, system damage, business interruption, loss of profit, or legal disputes.',
-                )}
-              </p>
-            </section>
-
-            <section className="space-y-1.5">
-              <h4 className="flex items-center gap-2 font-medium text-foreground">
-                <span className="flex size-5 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground">
-                  8
-                </span>
-                {t("Article 8 · Changes to the Terms and Final Interpretation")}
-              </h4>
-              <p className="pl-7">
-                {t(
-                  "The authors may update this Statement from time to time as laws, regulations, or project development require; the updated version ships with the project and takes effect on its publication date, and your continued use of this software means you accept the revised terms. To the extent permitted by law, the authors hold the final right of interpretation of this Statement. If any provision of this Statement is held invalid, the remaining provisions stay in effect.",
-                )}
-              </p>
-            </section>
-          </div>
-
-          <DialogFooter className="mx-0 mb-0 flex-col items-stretch gap-2 rounded-b-xl px-6 sm:flex-row sm:items-center sm:justify-between">
-            <p className="text-xs text-muted-foreground">
-              {readToEnd ? t("You have read all the terms") : t("Scroll the terms to the bottom to confirm")}
-            </p>
-            <DialogClose asChild>
+            {/* Primary action */}
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                size="lg"
+                disabled={entering || backendOk === false}
+                onClick={() => void enterWorkspace(prefs.defaultRoute)}
+                className="h-11 gap-2 px-6 transition-transform duration-150 hover:-translate-y-0.5 active:translate-y-0"
+              >
+                {entering ? <Loader2 className="size-4 animate-spin" /> : null}
+                {entering ? t("Opening workspace…") : t("Open workspace")}
+                {!entering && <ArrowRight className="size-4" />}
+              </Button>
               <Button
                 type="button"
-                disabled={!readToEnd}
-                onClick={() => {
-                  setAgreed(true);
-                  setError("");
+                size="lg"
+                variant="outline"
+                className="h-11 gap-2 px-5 transition-transform duration-150 hover:-translate-y-0.5 active:translate-y-0"
+                onClick={() => setCustomizing((v) => !v)}
+              >
+                <SlidersHorizontal className="size-4" />
+                {t("Customize welcome")}
+              </Button>
+            </div>
+
+            {error && (
+              <p role="alert" className="text-sm text-destructive">
+                {error}
+              </p>
+            )}
+
+            {/* Quick-start destination picker */}
+            <div className="space-y-2.5 pt-2">
+              <p className="font-medium text-xs uppercase tracking-wider text-muted-foreground">
+                {t("Start directly in")}
+              </p>
+              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                {DESTINATIONS.map((dest) => {
+                  const Icon = dest.icon;
+                  const active = prefs.defaultRoute === dest.route;
+                  return (
+                    <button
+                      key={dest.route}
+                      type="button"
+                      disabled={entering}
+                      onClick={() => {
+                        updatePrefs({ defaultRoute: dest.route });
+                        if (!customizing) void enterWorkspace(dest.route);
+                      }}
+                      className={cn(
+                        "group flex items-start gap-3 rounded-xl border bg-card p-3.5 text-left transition-all duration-200 hover:-translate-y-0.5 hover:border-foreground/30 hover:shadow-xs active:translate-y-0",
+                        active && "border-foreground/40 ring-1 ring-foreground/15",
+                      )}
+                    >
+                      <div
+                        className={cn(
+                          "mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg border transition-colors",
+                          active
+                            ? "border-foreground/20 bg-foreground text-background"
+                            : "bg-muted/60 text-muted-foreground group-hover:text-foreground",
+                        )}
+                      >
+                        <Icon className="size-4" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="truncate font-medium text-sm">{dest.label}</span>
+                          {active && <Check className="size-3.5 shrink-0 text-foreground" />}
+                        </div>
+                        <p className="mt-0.5 line-clamp-1 text-muted-foreground text-xs">{dest.desc}</p>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </section>
+
+          {/* Right column: Live environment card OR Inline Welcome Configurator */}
+          <section className="lg:col-span-5">
+            {customizing ? (
+              <div className="grid gap-4 rounded-2xl border bg-card p-6 shadow-xs animate-in fade-in-0 slide-in-from-bottom-1 duration-200">
+                <div className="flex items-center justify-between gap-2 border-b pb-3">
+                  <div>
+                    <h2 className="font-semibold text-base tracking-tight">{t("Customize welcome")}</h2>
+                    <p className="text-muted-foreground text-xs">{t("Changes are saved locally in this browser.")}</p>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="gap-1.5 text-xs text-muted-foreground"
+                    onClick={() => {
+                      setPrefs(DEFAULT_PREFS);
+                      saveWelcomePrefs(DEFAULT_PREFS);
+                    }}
+                  >
+                    <RotateCcw className="size-3.5" /> {t("Reset")}
+                  </Button>
+                </div>
+
+                <div className="grid gap-1.5">
+                  <Label htmlFor="w-operator">{t("Operator name")}</Label>
+                  <Input
+                    id="w-operator"
+                    placeholder={t("e.g. Thiago")}
+                    value={prefs.operatorName}
+                    onChange={(e) => updatePrefs({ operatorName: e.target.value })}
+                  />
+                </div>
+
+                <div className="grid gap-1.5">
+                  <Label htmlFor="w-headline">{t("Custom headline (optional)")}</Label>
+                  <Input
+                    id="w-headline"
+                    placeholder={t("Welcome to ARTEX")}
+                    value={prefs.headline}
+                    onChange={(e) => updatePrefs({ headline: e.target.value })}
+                  />
+                </div>
+
+                <div className="grid gap-1.5">
+                  <Label htmlFor="w-subtitle">{t("Subtitle (optional)")}</Label>
+                  <Textarea
+                    id="w-subtitle"
+                    rows={2}
+                    placeholder={t(
+                      "Local autonomous security testing console. Your models, tasks, and evidence stay on this machine.",
+                    )}
+                    value={prefs.subtitle}
+                    onChange={(e) => updatePrefs({ subtitle: e.target.value })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-4 rounded-xl border bg-muted/30 p-3.5">
+                  <div className="grid gap-0.5">
+                    <Label htmlFor="w-auto" className="text-sm font-medium">
+                      {t("Skip welcome on next visit")}
+                    </Label>
+                    <p className="text-muted-foreground text-xs">
+                      {t("Open {page} automatically when starting ARTEX.", { page: selectedDest.label })}
+                    </p>
+                  </div>
+                  <Switch
+                    id="w-auto"
+                    checked={prefs.autoEnter}
+                    onCheckedChange={(v) => updatePrefs({ autoEnter: v })}
+                  />
+                </div>
+
+                <Button type="button" onClick={() => setCustomizing(false)} className="w-full">
+                  {t("Save preferences")}
+                </Button>
+              </div>
+            ) : (
+              <div
+                className="relative overflow-hidden rounded-2xl border bg-card p-6 shadow-xs"
+                style={{
+                  backgroundImage:
+                    "radial-gradient(color-mix(in oklab, var(--foreground) 10%, transparent) 1px, transparent 1px)",
+                  backgroundSize: "18px 18px",
                 }}
               >
-                {t("I have read and agree to all the terms")}
-              </Button>
-            </DialogClose>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+                <div className="relative grid gap-5 rounded-xl border bg-background/95 p-5 backdrop-blur-xs">
+                  <div className="flex items-center justify-between gap-2 border-b pb-3.5">
+                    <div className="flex items-center gap-2">
+                      <span className="flex size-7 items-center justify-center rounded-md bg-foreground text-background">
+                        <Shield className="size-3.5" />
+                      </span>
+                      <div>
+                        <p className="font-medium text-sm leading-none">
+                          {prefs.operatorName.trim() ? `${prefs.operatorName.trim()} · Local` : "ARTEX Local"}
+                        </p>
+                        <p className="mt-1 font-mono text-[11px] text-muted-foreground">127.0.0.1 · zero-docker</p>
+                      </div>
+                    </div>
+                    <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-0.5 font-medium text-[11px] text-emerald-600 dark:text-emerald-400">
+                      <span className="size-1.5 rounded-full bg-emerald-500" />
+                      {t("Ready")}
+                    </span>
+                  </div>
+
+                  <div className="grid gap-3">
+                    <div className="flex items-center gap-3 rounded-lg border bg-card px-3.5 py-2.5">
+                      <Brain className="size-4 shrink-0 text-muted-foreground" />
+                      <div className="min-w-0 flex-1">
+                        <p className="font-medium text-xs">{t("Models & Fallbacks")}</p>
+                        <p className="truncate text-muted-foreground text-[11px]">
+                          {t("Codex OAuth · Claude Code · OpenCode · Ollama")}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 rounded-lg border bg-card px-3.5 py-2.5">
+                      <Database className="size-4 shrink-0 text-muted-foreground" />
+                      <div className="min-w-0 flex-1">
+                        <p className="font-medium text-xs">{t("Local PostgreSQL store")}</p>
+                        <p className="truncate text-muted-foreground text-[11px]">
+                          {t("Encrypted keys & OAuth refresh tokens on disk")}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 rounded-lg border bg-card px-3.5 py-2.5">
+                      <Target className="size-4 shrink-0 text-muted-foreground" />
+                      <div className="min-w-0 flex-1">
+                        <p className="font-medium text-xs">{t("Default launch page")}</p>
+                        <p className="truncate font-mono text-muted-foreground text-[11px]">{selectedDest.route}</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      </main>
+
+      <footer className="mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-4 text-muted-foreground text-xs sm:px-10">
+        <span>{t("ARTEX · Local autonomous security workspace")}</span>
+        <span className="font-mono">localhost</span>
+      </footer>
     </div>
   );
 }

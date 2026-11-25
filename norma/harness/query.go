@@ -212,7 +212,7 @@ func (d *QueryDeps) withDefaults(in QueryInput) {
 func Query(ctx context.Context, in QueryInput, deps QueryDeps) iter.Seq2[Event, error] {
 	deps.withDefaults(in)
 	if in.UntrustedOutputBoundary {
-		in.System = withUntrustedNote(in.System)
+		in.System, in.DynamicBoundary = WithUntrustedNote(in.System, in.DynamicBoundary)
 	}
 	conc := in.MaxConcurrency
 	if conc <= 0 {
@@ -388,7 +388,7 @@ func (l *loop) run() {
 		// Deferred tools stay in the registry (callable via ExecuteExtraTool) but
 		// their schemas are withheld from the model to save context tokens.
 		if len(l.in.DeferredTools) > 0 {
-			schemas = filterToolSchemas(schemas, l.in.DeferredTools)
+			schemas = FilterToolSchemas(schemas, l.in.DeferredTools)
 		}
 	}
 	l.turnCount = 1 // the first model call is turn 1
@@ -643,8 +643,10 @@ func (l *loop) isDisabledDuringSettlement(settling bool, name string) bool {
 	return settling && l.in.Settlement != nil && slices.Contains(l.in.Settlement.DisabledTools, name)
 }
 
-// filterToolSchemas returns schemas with the named tools removed.
-func filterToolSchemas(schemas []llm.ToolSchema, disabled []string) []llm.ToolSchema {
+// FilterToolSchemas returns schemas with the named tools removed — also used
+// by agentcore's compaction cache-fork, which must replay the session's exact
+// wire tool list to hit the prompt cache.
+func FilterToolSchemas(schemas []llm.ToolSchema, disabled []string) []llm.ToolSchema {
 	block := make(map[string]bool, len(disabled))
 	for _, d := range disabled {
 		block[d] = true
@@ -850,10 +852,12 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 			raw = "{}"
 		}
 		block := llm.ContentBlock{Type: llm.BlockToolUse, ID: curID, Name: curName, Input: []byte(raw)}
+		// Start the tool before emitting tool_use: the emit path persists an
+		// activity row synchronously, which would otherwise delay dispatch.
+		exec.add(block)
 		if !l.emit(Event{Kind: KindToolUse, ToolUse: &block}) {
 			return false
 		}
-		exec.add(block)
 		return exec.drain()
 	}
 
@@ -939,10 +943,12 @@ func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, 
 			}
 		case llm.BlockToolUse:
 			block := b
+			// Dispatch first: emitting tool_use persists synchronously and must
+			// not sit on the critical path of tool startup.
+			exec.add(block)
 			if !l.emit(Event{Kind: KindToolUse, ToolUse: &block}) {
 				return asst, exec, stopReason, nil, true, false
 			}
-			exec.add(block)
 			if !exec.drain() { // surface any results ready so far (FIFO)
 				return asst, exec, stopReason, nil, true, false
 			}

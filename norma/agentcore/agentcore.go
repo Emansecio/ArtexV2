@@ -305,6 +305,7 @@ func NewSession(opts Options) *Session {
 		s.compactor = opts.Compactor
 	} else if opts.Compaction != nil {
 		sumProv := opts.SummaryProvider
+		sameProvider := sumProv == nil
 		if sumProv == nil {
 			sumProv = opts.Provider
 		}
@@ -312,11 +313,48 @@ func NewSession(opts Options) *Session {
 		if opts.Compaction.SummaryMaxTokens > 0 {
 			sumMax = opts.Compaction.SummaryMaxTokens
 		}
-		s.compactor = compaction.New(*opts.Compaction, compaction.ProviderSummarizerWithOptions(sumProv, compaction.SummaryOptions{
+		ccfg := *opts.Compaction
+		sumOpts := compaction.SummaryOptions{
 			MaxOutputTokens: sumMax,
 			NonStreaming:    opts.NonStreaming,
-			Prompt:          opts.Compaction.CustomSummaryPrompt,
-		}))
+			Prompt:          ccfg.CustomSummaryPrompt,
+		}
+		if sameProvider {
+			// On the session's own provider a speculative run burns a
+			// full-context call that bounded workers usually never reach;
+			// leave it for dedicated (cheap) summary providers.
+			ccfg.SpeculativePreCompact = false
+			// Fork the warm prompt cache instead of paying 100% uncached on
+			// the whole history — resolved lazily so the session registry and
+			// reminder are built by the first compaction call.
+			sumOpts.SessionPrefixFn = func() *compaction.SessionPrefix {
+				if s.registry == nil {
+					return nil
+				}
+				schemas := s.registry.Schemas()
+				if len(opts.DeferredTools) > 0 {
+					schemas = harness.FilterToolSchemas(schemas, opts.DeferredTools)
+				}
+				system, boundary := s.system(), s.opts.DynamicBoundary
+				if s.opts.UntrustedOutputBoundary {
+					// The wire system carries the note inside the static
+					// region — replay it the same way or the hash diverges.
+					system, boundary = harness.WithUntrustedNote(system, boundary)
+				}
+				var extra string
+				if s.opts.SystemReminderFunc != nil {
+					extra = s.opts.SystemReminderFunc()
+				}
+				return &compaction.SessionPrefix{
+					Tools:           schemas,
+					System:          system,
+					DynamicBoundary: boundary,
+					PromptCacheKey:  s.opts.PromptCacheKey,
+					SystemReminder:  buildSystemReminder(extra),
+				}
+			}
+		}
+		s.compactor = compaction.New(ccfg, compaction.ProviderSummarizerWithOptions(sumProv, sumOpts))
 	}
 	if opts.Plan != nil {
 		start := opts.PermissionMode

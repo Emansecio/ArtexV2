@@ -56,6 +56,8 @@
 /* Default theme styles (used when no data-theme-preset is set or when 'default' is selected).
 These serve as the fallback; there is no separate default.css file. */
 :root {
+  color-scheme: light;
+  interpolate-size: allow-keywords;
   --radius: 0.625rem;
   --card: oklch(1 0 0);
   --card-foreground: oklch(0.145 0 0);
@@ -95,6 +97,7 @@ These serve as the fallback; there is no separate default.css file. */
 }
 
 .dark {
+  color-scheme: dark;
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
@@ -175,59 +178,14 @@ These serve as the fallback; there is no separate default.css file. */
     box-shadow: var(--shadow-2xl);
   }
 
-  html[data-font="inter"] body {
-    --font-sans: var(--font-inter);
-  }
-  html[data-font="notoSans"] body {
-    --font-sans: var(--font-noto-sans);
-  }
-  html[data-font="nunitoSans"] body {
-    --font-sans: var(--font-nunito-sans);
-  }
-  html[data-font="figtree"] body {
-    --font-sans: var(--font-figtree);
-  }
-  html[data-font="roboto"] body {
-    --font-sans: var(--font-roboto);
-  }
   html[data-font="geist"] body {
     --font-sans: var(--font-geist);
-  }
-  html[data-font="raleway"] body {
-    --font-sans: var(--font-raleway);
-  }
-  html[data-font="dmSans"] body {
-    --font-sans: var(--font-dm-sans);
-  }
-  html[data-font="publicSans"] body {
-    --font-sans: var(--font-public-sans);
-  }
-  html[data-font="outfit"] body {
-    --font-sans: var(--font-outfit);
   }
   html[data-font="geistMono"] body {
     --font-sans: var(--font-geist-mono);
   }
   html[data-font="geistPixelSquare"] body {
     --font-sans: var(--font-geist-pixel-square);
-  }
-  html[data-font="jetBrainsMono"] body {
-    --font-sans: var(--font-jetbrains-mono);
-  }
-  html[data-font="notoSerif"] body {
-    --font-sans: var(--font-noto-serif);
-  }
-  html[data-font="robotoSlab"] body {
-    --font-sans: var(--font-roboto-slab);
-  }
-  html[data-font="merriweather"] body {
-    --font-sans: var(--font-merriweather);
-  }
-  html[data-font="lora"] body {
-    --font-sans: var(--font-lora);
-  }
-  html[data-font="playfairDisplay"] body {
-    --font-sans: var(--font-playfair-display);
   }
 }
 
@@ -237,6 +195,115 @@ html {
 
 .disable-transitions * {
   transition: none !important;
+}
+
+/* Native Collapsible open/close animation (degrades cleanly when unsupported) */
+[data-slot="collapsible-content"] {
+  overflow: hidden;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  [data-slot="collapsible-content"] {
+    transition: height 200ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out;
+  }
+
+  [data-slot="collapsible-content"][data-state="closed"] {
+    height: 0;
+    opacity: 0;
+  }
+
+  [data-slot="collapsible-content"][data-state="open"] {
+    height: var(--radix-collapsible-content-height, auto);
+    opacity: 1;
+  }
+}
+
+/* Horizontal scrollability fade hints driven by scroll position (zero JS) */
+@property --fade-start {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@property --fade-end {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+.scroll-fade-x {
+  overflow-x: auto;
+  scroll-padding-inline: 2.5rem;
+}
+
+@supports (animation-timeline: scroll()) {
+  .scroll-fade-x {
+    scrollbar-width: none;
+    --fade-size: 2.5rem;
+    mask:
+      linear-gradient(black, black) no-clip subtract,
+      linear-gradient(to right, black, transparent) 0 0 / var(--fade-start) 100% no-repeat no-clip,
+      linear-gradient(to right, transparent, black) 100% 0 / var(--fade-end) 100% no-repeat no-clip;
+    animation: scroll-fade-start linear both, scroll-fade-end linear both;
+    animation-timeline: scroll(self inline);
+    animation-range: 0 var(--fade-size), calc(100% - var(--fade-size)) 100%;
+  }
+}
+
+@keyframes scroll-fade-start {
+  to {
+    --fade-start: var(--fade-size);
+  }
+}
+
+@keyframes scroll-fade-end {
+  from {
+    --fade-end: var(--fade-size);
+  }
+}
+
+/* Sliding active underline for line TabsList via CSS Anchor Positioning */
+@supports (position-anchor: --active-tab) {
+  [data-slot="tabs-list"][data-variant="line"] {
+    position: relative;
+    anchor-scope: --active-tab;
+  }
+
+  [data-slot="tabs-list"][data-variant="line"]::before {
+    content: "";
+    position: absolute;
+    position-anchor: --active-tab;
+    inset-inline-start: anchor(self-start);
+    inset-inline-end: anchor(self-end);
+    inset-block-end: -2px;
+    border-block-end: 2px solid var(--foreground);
+    pointer-events: none;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    [data-slot="tabs-list"][data-variant="line"]::before {
+      transition: inset 200ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+  }
+
+  [data-slot="tabs-list"][data-variant="line"] [data-slot="tabs-trigger"][data-state="active"] {
+    anchor-name: --active-tab;
+  }
+
+  [data-slot="tabs-list"][data-variant="line"] [data-slot="tabs-trigger"]::after {
+    content: none;
+  }
+}
+
+/* Off-screen rendering deferral for long lists (only apply below the fold) */
+.defer-render {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 28px;
+}
+
+.cv-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 44px;
 }
 
 [data-print-root] {

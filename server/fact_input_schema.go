@@ -91,6 +91,7 @@ WHERE key='record_fact' AND system AND kind='builtin'
 	}
 	done()
 	log.Printf("[facts] record_fact now publishes the facts-only contract (one-time)")
+	s.m.pg.InvalidateToolCache()
 }
 
 func sliceHas(list []string, s string) bool {
@@ -127,5 +128,7 @@ func (s *Server) seedFactInputSchema() {
 WHERE key='record_fact' AND system AND kind='builtin'
   AND schema=$1::jsonb AND schema IS DISTINCT FROM $2::jsonb`, string(row.Schema), string(raw)); err != nil {
 		log.Printf("[facts] repair record_fact schema: %v", err)
+		return
 	}
+	s.m.pg.InvalidateToolCache()
 }

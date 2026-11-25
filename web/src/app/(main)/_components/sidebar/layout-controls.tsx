@@ -100,7 +100,7 @@ export function LayoutControls() {
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <Button size="icon">
+        <Button variant="ghost" size="icon-sm" aria-label={t("Preferences")} title={t("Preferences")}>
           <Settings />
         </Button>
       </PopoverTrigger>

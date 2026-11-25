@@ -614,3 +614,23 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request, getSetting func(s
 	}
 	writeJSON(w, 200, map[string]any{"token": tok})
 }
+
+// POST /api/auth/local — passwordless session issuance for local loopback use.
+// Restricted to 127.0.0.1 / ::1 so remote callers cannot bypass authentication.
+func (s *Server) authLocal(w http.ResponseWriter, r *http.Request) {
+	ip := strings.TrimSpace(clientIP(r, nil))
+	if ip != "127.0.0.1" && ip != "::1" && ip != "localhost" {
+		writeErr(w, 403, "Local passwordless sign-in is only allowed from localhost")
+		return
+	}
+	if s.pwdState.Load() == pwdUnreadable {
+		s.loadPasswordVersion()
+	}
+	ver := s.pwdVersion.Load()
+	tok, err := signJWTVersion(s.jwtKey, ver)
+	if err != nil {
+		writeErr(w, 500, "token generation failed")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"token": tok})
+}

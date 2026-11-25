@@ -696,11 +696,11 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	maxTurns := s.agentMaxTurns(c.AgentKey)
 	maxDuration := time.Duration(s.agentRunSeconds(c.AgentKey)) * time.Second
 	webSearch := false
-	if a, err := pg.GetAgentByKey(c.AgentKey); err == nil && a != nil {
+	if a, err := s.cachedAgentByKey(c.AgentKey); err == nil && a != nil {
 		webSearch = a.WebSearch
 	}
 	sessionID := s.convBusyKey(c.ID) // "conv-<id>" transcript session
-	emit := func(rec db.Activity) {
+	em := newActEmitter(func(rec db.Activity) {
 		seq, err := pg.AppendConvActivity(c.ID, rec)
 		if err != nil {
 			log.Printf("[conv %d] append activity failed: %v", c.ID, err)
@@ -713,7 +713,9 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 		if s.deltaHub != nil {
 			s.deltaHub.Publish(convChan, DeltaMsg{Event: "activity", Data: activityDTO(rec)})
 		}
-	}
+	})
+	defer em.flush()
+	emit := em.emit
 	// Approval scope of this turn's tool calls for the target gate (chat and retester).
 	// The conversation's opt-in flag is the one read when the turn started: a
 	// switch through the API applies from the next turn.
@@ -731,6 +733,7 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	// On a manual stop ctx is cancelled; Chat already emits a clean "stopped by the user"
 	// step, so skip the raw-error entry — only surface genuine failures.
 	if _, err := ca.Chat(gctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
+		em.flush() // commit queued rows before the direct error write below
 		finishReason = err.Error()
 		if ctx.Err() == nil {
 			errRec := db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
@@ -763,7 +766,7 @@ func (s *Server) readTriggerBehavior(agentKey string) triggerBehavior {
 	if s.m.pg == nil {
 		return b
 	}
-	a, err := s.m.pg.GetAgentByKey(agentKey)
+	a, err := s.cachedAgentByKey(agentKey)
 	if err != nil || a == nil {
 		return b
 	}

@@ -84,7 +84,6 @@ type Client struct {
 	streamBody   io.ReadCloser
 	streamCancel context.CancelFunc
 	streamDone   chan struct{}
-	legacyMu     sync.Mutex
 	pendingMu    sync.Mutex
 	pending      map[int]chan *rpcResponse
 	streamErr    chan error
@@ -602,6 +601,8 @@ func (c *Client) roundTrip(ctx context.Context, body rpcRequest, expectResp bool
 		return nil, fmt.Errorf("mcp http %d: %s", resp.StatusCode, readSnippet(resp.Body))
 	}
 	if !expectResp {
+		// Drain the 202 ack so the connection keeps keep-alive reuse.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return nil, nil // notification — no JSON-RPC body to parse
 	}
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
@@ -629,12 +630,9 @@ func decodeRPC(r io.Reader) (*rpcResponse, error) {
 
 // legacyRoundTrip posts to the endpoint announced by GET /sse. The HTTP POST
 // only acknowledges receipt; the JSON-RPC response arrives on the SSE stream.
+// Calls run concurrently: the shared reader demultiplexes responses to callers
+// by JSON-RPC ID through c.pending, so serializing the POSTs is unnecessary.
 func (c *Client) legacyRoundTrip(ctx context.Context, body rpcRequest, expectResp bool) (*rpcResponse, error) {
-	// Serializing calls keeps the first implementation deterministic while the
-	// shared SSE reader still handles asynchronous delivery.
-	c.legacyMu.Lock()
-	defer c.legacyMu.Unlock()
-
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -664,7 +662,11 @@ func (c *Client) legacyRoundTrip(ctx context.Context, body rpcRequest, expectRes
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Drain so the connection stays eligible for HTTP/1.1 keep-alive reuse.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("mcp sse http %d: %s", resp.StatusCode, readSnippet(resp.Body))
 	}

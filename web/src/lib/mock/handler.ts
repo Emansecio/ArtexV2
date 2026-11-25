@@ -2290,6 +2290,20 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/llm/profiles" && m === "POST") return { id: Number(b.id) || 3 };
   if (path === "/llm/profiles/active") return { ok: true };
   if (path === "/llm/pool" && m === "GET") return D.llmPool;
+  if (path === "/llm/oauth/status" && m === "GET") {
+    return {
+      providers: [
+        { provider: "chatgpt", connected: false, pending: false },
+        { provider: "anthropic", connected: false, pending: false },
+      ],
+    };
+  }
+  if (path === "/auth/local" && m === "POST") {
+    return { token: "mock-demo" };
+  }
+  if (path.startsWith("/llm/oauth/") && m === "POST") {
+    return { error: "OAuth sign-in requires the ArtexV2 backend server (unavailable in mock preview mode)" };
+  }
   if (path === "/llm/pool/reset")
     return { ...D.llmPool, chain: D.llmPool.chain.map((c) => ({ ...c, state: "ok", fails: 0, cooldown_secs: 0 })) };
   if (seg[0] === "llm" && seg[1] === "profiles" && seg.length === 3 && m === "DELETE")

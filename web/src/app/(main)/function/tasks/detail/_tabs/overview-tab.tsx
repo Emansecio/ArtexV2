@@ -83,65 +83,12 @@ const SCOPE_SOURCE_LABELS: Record<TaskScopeRow["source"], string> = {
   manual: t("Manual"),
 };
 
-function StatCard({
-  label,
-  value,
-  sub,
-  icon: Icon,
-}: {
-  label: string;
-  value: React.ReactNode;
-  sub?: string;
-  icon: React.ElementType;
-}) {
-  return (
-    <Card className="gap-1.5">
-      <CardHeader className="pb-0">
-        <CardDescription className="flex items-center gap-1.5">
-          <Icon className="size-3.5" /> {label}
-        </CardDescription>
-        <CardTitle className="text-2xl tabular-nums">{value}</CardTitle>
-      </CardHeader>
-      {sub && <CardContent className="text-xs text-muted-foreground">{sub}</CardContent>}
-    </Card>
-  );
-}
-
-export function OverviewTab({ taskId }: { taskId: string }) {
-  const [task, setTask] = React.useState<Task | null>(null);
-  const [stats, setStats] = React.useState<Stats | null>(null);
-  const [intents, setIntents] = React.useState<TaskNode[]>([]);
-  const [findings, setFindings] = React.useState<Finding[]>([]);
-  const [coverage, setCoverage] = React.useState<{
-    enabled: boolean;
-    scope_rows: number;
-    denominator: number;
-    tested: number;
-    pct: number | null;
-    by_type: { type: string; total: number; tested: number }[];
-    gaps?: { kind: string; surface?: string; risk_area: string }[];
-    completeness?: { complete: boolean; state: string; caveat: string };
-  } | null>(null);
-  // Intent ids currently re-running ("__all__" means the batch); used to disable buttons + spinners.
-  const [rerunning, setRerunning] = React.useState<Set<string>>(new Set());
-  // Test scope list + add-form state.
+export function TaskScopeRulesSection({ taskId }: { taskId: string }) {
   const [scope, setScope] = React.useState<TaskScopeRow[]>([]);
   const [scopeKind, setScopeKind] = React.useState<TaskScopeRow["kind"]>("root_domain");
   const [scopeValueInput, setScopeValueInput] = React.useState("");
   const [scopeBusy, setScopeBusy] = React.useState(false);
   const [scopeErr, setScopeErr] = React.useState("");
-  // Token usage per model (from the always-on llm_usage metering ledger, exact per call).
-  const [modelTokens, setModelTokens] = React.useState<ModelTokenStat[]>([]);
-  // Goal management: goal list + add form + inline edit state.
-  const [goals, setGoals] = React.useState<TaskGoal[]>([]);
-  const [goalText, setGoalText] = React.useState("");
-  const [goalVuln, setGoalVuln] = React.useState("");
-  const [goalBusy, setGoalBusy] = React.useState(false);
-  const [goalErr, setGoalErr] = React.useState("");
-  const [editingGoalId, setEditingGoalId] = React.useState<string | null>(null);
-  const [editText, setEditText] = React.useState("");
-  const [editVuln, setEditVuln] = React.useState("");
-  // Constraint management: constraint list + add form + inline edit state.
   const [constraints, setConstraints] = React.useState<TaskConstraint[]>([]);
   const [conText, setConText] = React.useState("");
   const [conKind, setConKind] = React.useState<TaskConstraint["kind"]>("deny");
@@ -150,15 +97,6 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const [editingConId, setEditingConId] = React.useState<string | null>(null);
   const [editConText, setEditConText] = React.useState("");
   const [editConKind, setEditConKind] = React.useState<TaskConstraint["kind"]>("deny");
-
-  const loadTokens = React.useCallback(async () => {
-    try {
-      const resp = await api.tokensByModel(taskId);
-      setModelTokens(resp.models);
-    } catch {
-      // Ignore: without PG the endpoint errors and the card stays empty
-    }
-  }, [taskId]);
 
   const loadScope = React.useCallback(async () => {
     try {
@@ -169,69 +107,6 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     }
   }, [taskId]);
 
-  const loadGoals = React.useCallback(async () => {
-    try {
-      const resp = await api.taskGoals(taskId);
-      setGoals(resp.goals);
-    } catch {
-      // Ignore: transient error, the next poll retries
-    }
-  }, [taskId]);
-
-  const addGoal = async () => {
-    const text = goalText.trim();
-    if (!text) return;
-    setGoalBusy(true);
-    setGoalErr("");
-    try {
-      await api.addGoal(taskId, text, goalVuln.trim() || undefined);
-      setGoalText("");
-      setGoalVuln("");
-      await loadGoals();
-    } catch (e) {
-      setGoalErr(e instanceof Error ? e.message : t("Failed to add"));
-    } finally {
-      setGoalBusy(false);
-    }
-  };
-
-  const startEditGoal = (g: TaskGoal) => {
-    setEditingGoalId(g.id);
-    setEditText(g.text);
-    setEditVuln(g.vulnclass ?? "");
-  };
-
-  const cancelEditGoal = () => {
-    setEditingGoalId(null);
-    setEditText("");
-    setEditVuln("");
-  };
-
-  const saveEditGoal = async (g: TaskGoal) => {
-    const text = editText.trim();
-    if (!text) return;
-    setGoalBusy(true);
-    setGoalErr("");
-    try {
-      await api.updateGoal(taskId, g.id, text, editVuln.trim() || undefined);
-      cancelEditGoal();
-      await loadGoals();
-    } catch (e) {
-      setGoalErr(e instanceof Error ? e.message : t("Failed to save"));
-    } finally {
-      setGoalBusy(false);
-    }
-  };
-
-  const removeGoal = async (g: TaskGoal) => {
-    setGoals((prev) => prev.filter((x) => x.id !== g.id));
-    try {
-      await api.deleteGoal(taskId, g.id);
-    } catch {
-      await loadGoals(); // delete failed: re-fetch to restore
-    }
-  };
-
   const loadConstraints = React.useCallback(async () => {
     try {
       const resp = await api.taskConstraints(taskId);
@@ -240,6 +115,15 @@ export function OverviewTab({ taskId }: { taskId: string }) {
       // Ignore: transient error, the next poll retries
     }
   }, [taskId]);
+
+  React.useEffect(() => {
+    void loadScope();
+    void loadConstraints();
+    const stopPolling = setVisibleInterval(() => {
+      void loadConstraints();
+    }, 5000);
+    return stopPolling;
+  }, [loadScope, loadConstraints]);
 
   const addConstraint = async () => {
     const text = conText.trim();
@@ -290,7 +174,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     try {
       await api.deleteConstraint(taskId, c.id);
     } catch {
-      await loadConstraints(); // delete failed: re-fetch to restore
+      await loadConstraints();
     }
   };
 
@@ -315,276 +199,12 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     try {
       await api.deleteTaskScope(taskId, row.id);
     } catch {
-      await loadScope(); // delete failed: re-fetch to restore
+      await loadScope();
     }
   };
-
-  const markRerun = (key: string, on: boolean) =>
-    setRerunning((prev) => {
-      const next = new Set(prev);
-      if (on) next.add(key);
-      else next.delete(key);
-      return next;
-    });
-
-  // Re-run one: set back to open (optimistic local state update, 3s poll as backstop); a worker re-claims it and runs from scratch.
-  const rerunOne = async (id: string) => {
-    markRerun(id, true);
-    try {
-      await api.rerunIntent(taskId, id);
-      setIntents((prev) => prev.map((i) => (i.id === id ? { ...i, state: "open" } : i)));
-    } catch {
-      // Ignore failures: the next poll still shows blocked and the user can click again
-    } finally {
-      markRerun(id, false);
-    }
-  };
-
-  // Re-run all of this task's blocked intents in bulk.
-  const rerunAll = async () => {
-    markRerun("__all__", true);
-    try {
-      await api.rerunBlocked(taskId);
-      setIntents((prev) => prev.map((i) => (i.state === "blocked" ? { ...i, state: "open" } : i)));
-    } catch {
-      // ignore
-    } finally {
-      markRerun("__all__", false);
-    }
-  };
-
-  React.useEffect(() => {
-    let cancelled = false;
-    let loading = false;
-
-    const load = async () => {
-      if (loading) return;
-      loading = true;
-      try {
-        const [taskResp, statsResp, intentsResp, findingsResp] = await Promise.all([
-          api.task(taskId),
-          api.stats(taskId),
-          api.intents(taskId),
-          api.findings(taskId),
-        ]);
-        if (cancelled) return;
-        const activeTask = statsResp.active_task;
-        setTask(
-          activeTask
-            ? {
-                ...taskResp,
-                in_flight: activeTask.in_flight,
-                goals_total: activeTask.goals_total,
-                goals_met: activeTask.goals_met,
-                engine_mode: statsResp.engine_mode ?? activeTask.engine_mode,
-                paused: activeTask.paused,
-              }
-            : taskResp,
-        );
-        setStats(statsResp);
-        setIntents(intentsResp);
-        setFindings(findingsResp);
-        // coverage is independent + may 503 when no asset store — fetch separately so
-        // its failure never blocks the others.
-        api
-          .taskCoverage(taskId)
-          .then((c) => {
-            if (!cancelled) setCoverage(c);
-          })
-          .catch(() => {
-            // A transient coverage failure is retried by the next poll.
-          });
-      } catch {
-        // transient errors are ignored; the next poll will retry
-      } finally {
-        loading = false;
-      }
-    };
-
-    void load();
-    void loadScope();
-    void loadTokens();
-    void loadGoals();
-    void loadConstraints();
-    const stopPolling = setVisibleInterval(() => {
-      void load();
-      void loadTokens();
-      void loadGoals();
-      void loadConstraints();
-    }, 3000);
-    return () => {
-      cancelled = true;
-      stopPolling();
-    };
-  }, [taskId, loadScope, loadTokens, loadGoals, loadConstraints]);
-
-  const running = intents.filter((i) => i.state === "running");
-  const open = intents.filter((i) => i.state === "open");
-  const blocked = intents.filter((i) => i.state === "blocked");
-  const taskFindings = findings.filter((f) => f.task_id === taskId);
-  const goalsPct = task?.goals_total ? Math.round(((task.goals_met ?? 0) / task.goals_total) * 100) : 0;
-  // Token totals (across all models) for the card header overview.
-  const tokenTotals = modelTokens.reduce(
-    (acc, m) => {
-      acc.input += m.input_tokens;
-      acc.output += m.output_tokens;
-      acc.cacheRead += m.cache_read_tokens;
-      acc.cacheWrite += m.cache_write_tokens;
-      acc.calls += m.calls;
-      return acc;
-    },
-    { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 },
-  );
 
   return (
     <div className="flex flex-col gap-4">
-      {/* Original task description and goal (as filled in at creation), pinned at the top for reference. */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <TargetIcon className="size-4 text-primary" /> {t("Task description & goal")}
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <div className="flex flex-col gap-1.5">
-            <div className="text-xs font-medium text-muted-foreground">{t("Description")}</div>
-            <p className="text-sm whitespace-pre-wrap break-words">{task?.description?.trim() || "—"}</p>
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <div className="text-xs font-medium text-muted-foreground">{t("Goal")}</div>
-            <p className="text-sm whitespace-pre-wrap break-words">{task?.goal?.trim() || "—"}</p>
-          </div>
-        </CardContent>
-      </Card>
-      {/* Goal management: view/add/edit/delete this task's exploration goals. Adds and edits notify the planner and revive the task;
-          deletes only notify the planner (no revival). A goal = a final deliverable/verifiable outcome, not an attack step or recon action. */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <ListChecksIcon className="size-4 text-primary" /> {t("Goal management")}
-            <span className="text-muted-foreground text-xs font-normal">
-              {t("(final verifiable goals, {count} in total; adds/edits notify the planner and revive the task)", {
-                count: goals.length,
-              })}
-            </span>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          {/* Add form */}
-          <div className="flex flex-wrap items-center gap-2">
-            <Input
-              className="h-7 min-w-56 flex-1 text-sm"
-              placeholder={t("Add a goal, e.g. 'gain unauthorized access with an admin account'")}
-              value={goalText}
-              onChange={(e) => setGoalText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void addGoal();
-              }}
-              disabled={goalBusy}
-            />
-            <Input
-              className="h-7 w-32 text-sm"
-              placeholder={t("Vulnerability class (optional)")}
-              value={goalVuln}
-              onChange={(e) => setGoalVuln(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void addGoal();
-              }}
-              disabled={goalBusy}
-            />
-            <Button size="sm" variant="outline" disabled={goalBusy || !goalText.trim()} onClick={() => void addGoal()}>
-              <PlusIcon className="size-3.5" /> {t("Add")}
-            </Button>
-            {goalErr && <span className="text-xs text-red-500">{goalErr}</span>}
-          </div>
-          {/* Goal list */}
-          {goals.length > 0 ? (
-            <div className="flex flex-col gap-1.5">
-              {goals.map((g) =>
-                editingGoalId === g.id ? (
-                  <div key={g.id} className="flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-1.5">
-                    <Input
-                      className="h-7 min-w-56 flex-1 text-sm"
-                      value={editText}
-                      onChange={(e) => setEditText(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") void saveEditGoal(g);
-                        if (e.key === "Escape") cancelEditGoal();
-                      }}
-                      disabled={goalBusy}
-                      autoFocus
-                    />
-                    <Input
-                      className="h-7 w-32 text-sm"
-                      placeholder={t("Vulnerability class (optional)")}
-                      value={editVuln}
-                      onChange={(e) => setEditVuln(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") void saveEditGoal(g);
-                        if (e.key === "Escape") cancelEditGoal();
-                      }}
-                      disabled={goalBusy}
-                    />
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 shrink-0 px-1.5"
-                      disabled={goalBusy || !editText.trim()}
-                      onClick={() => void saveEditGoal(g)}
-                    >
-                      <CheckIcon className="size-3.5 text-emerald-500" />
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 shrink-0 px-1.5"
-                      disabled={goalBusy}
-                      onClick={cancelEditGoal}
-                    >
-                      <XIcon className="size-3.5" />
-                    </Button>
-                  </div>
-                ) : (
-                  <div key={g.id} className="flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm">
-                    <StatusBadge domain="goal" value={g.state} />
-                    <span className="min-w-0 flex-1 break-words">{g.text}</span>
-                    {g.vulnclass && (
-                      <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-xs">
-                        {g.vulnclass}
-                      </span>
-                    )}
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 shrink-0 px-1.5"
-                      disabled={goalBusy}
-                      onClick={() => startEditGoal(g)}
-                    >
-                      <PencilIcon className="size-3.5" />
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 shrink-0 px-1.5"
-                      disabled={goalBusy}
-                      onClick={() => void removeGoal(g)}
-                    >
-                      <Trash2Icon className="size-3.5 text-red-500" />
-                    </Button>
-                  </div>
-                ),
-              )}
-            </div>
-          ) : (
-            <p className="text-muted-foreground text-sm">
-              {t("No goals yet. Once added, the planner dispatches exploration intents from them and judges completion.")}
-            </p>
-          )}
-        </CardContent>
-      </Card>
-      {/* Operation constraints: allow / deny. Constraints are injected into the planner/worker system prompt at the next
-          planning round to bound exploration (injection can be toggled per planner/worker in system settings). Changes do not interrupt
-          immediately; the next planning round picks them up naturally. */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
@@ -598,7 +218,6 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           </CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
-          {/* Add form */}
           <div className="flex flex-wrap items-center gap-2">
             <NativeSelect
               size="sm"
@@ -628,7 +247,6 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             </Button>
             {conErr && <span className="text-xs text-red-500">{conErr}</span>}
           </div>
-          {/* Constraint list */}
           {constraints.length > 0 ? (
             <div className="flex flex-col gap-1.5">
               {constraints.map((c) =>
@@ -716,134 +334,6 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         </CardContent>
       </Card>
       <TaskInterceptRulesCard taskId={taskId} />
-      {coverage && coverage.enabled && (coverage.scope_rows > 0 || (coverage.gaps?.length ?? 0) > 0) && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-base">
-              <TargetIcon className="size-4 text-emerald-500" /> {t("Asset test coverage")}
-              <span className="text-muted-foreground text-xs font-normal">{t("(rough estimate, for reference only)")}</span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            <div className="flex items-baseline gap-3">
-              <span className="text-2xl font-semibold tabular-nums">
-                {coverage.pct != null ? Math.round(coverage.pct * 100) + "%" : "—"}
-              </span>
-              <span className="text-muted-foreground text-sm">
-                {t("Tested {tested} / in scope {total}", { tested: coverage.tested, total: coverage.denominator })}
-              </span>
-            </div>
-            {coverage.pct != null && <Progress value={Math.round(coverage.pct * 100)} />}
-            {coverage.by_type.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 text-xs">
-                {coverage.by_type.map((b) => (
-                  <span key={b.type} className="bg-muted rounded px-1.5 py-0.5">
-                    <span className="text-muted-foreground">
-                      {(taskAssetTypeLabel as (x: NewAssetType) => string | undefined)(b.type as NewAssetType) ||
-                        b.type}
-                    </span>{" "}
-                    <span className="tabular-nums font-medium">
-                      {b.tested}/{b.total}
-                    </span>
-                  </span>
-                ))}
-              </div>
-            )}
-            {coverage.completeness && !coverage.completeness.complete && (
-              <p className="text-muted-foreground text-xs">{coverage.completeness.caveat}</p>
-            )}
-            {coverage.gaps && (
-              <div className="text-xs">
-                <span className="font-medium">{t("Coverage gaps: {count}", { count: coverage.gaps.length })}</span>
-                <ul className="text-muted-foreground mt-1 list-disc pl-4">
-                  {coverage.gaps.map((g, i) => (
-                    <li key={i}>
-                      {t(g.kind)} {g.surface ? g.surface + " " : ""}
-                      {g.risk_area}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      )}
-      {/* LLM token usage: grouped by model, data from llm_records (requires LLM recording enabled). */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <CoinsIcon className="size-4 text-amber-500" /> {t("LLM token usage")}
-            <span className="text-muted-foreground text-xs font-normal">
-              {tokenTotals.calls > 0
-                ? t("(per model, {count} calls in total)", { count: tokenTotals.calls })
-                : t("(per model)")}
-            </span>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          {modelTokens.length > 0 ? (
-            <>
-              {/* Totals overview */}
-              <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-sm">
-                <span className="tabular-nums">
-                  <span className="text-muted-foreground">{t("Input")} </span>
-                  <span className="font-semibold">{fmtTokens(tokenTotals.input)}</span>
-                </span>
-                <span className="tabular-nums">
-                  <span className="text-muted-foreground">{t("Output")} </span>
-                  <span className="font-semibold">{fmtTokens(tokenTotals.output)}</span>
-                </span>
-                <span className="tabular-nums">
-                  <span className="text-muted-foreground">{t("Cache read")} </span>
-                  <span className="font-semibold">{fmtTokens(tokenTotals.cacheRead)}</span>
-                </span>
-                <span className="tabular-nums">
-                  <span className="text-muted-foreground">{t("Cache hit rate")} </span>
-                  <span className="font-semibold text-emerald-500">
-                    {cacheHitRate(tokenTotals.cacheRead, tokenTotals.input)}
-                  </span>
-                </span>
-              </div>
-              {/* Per-model detail table */}
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-muted-foreground border-b text-left text-xs">
-                      <th className="py-1.5 pr-3 font-medium">{t("Model")}</th>
-                      <th className="py-1.5 pr-3 text-right font-medium">{t("Calls")}</th>
-                      <th className="py-1.5 pr-3 text-right font-medium">{t("Input")}</th>
-                      <th className="py-1.5 pr-3 text-right font-medium">{t("Output")}</th>
-                      <th className="py-1.5 pr-3 text-right font-medium">{t("Cache read")}</th>
-                      <th className="py-1.5 text-right font-medium">{t("Hit rate")}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {modelTokens.map((m) => (
-                      <tr key={m.model} className="border-b last:border-0">
-                        <td className="max-w-[16rem] truncate py-1.5 pr-3 font-mono text-xs" title={m.model}>
-                          {m.model}
-                        </td>
-                        <td className="py-1.5 pr-3 text-right tabular-nums">{m.calls}</td>
-                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.input_tokens)}</td>
-                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.output_tokens)}</td>
-                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.cache_read_tokens)}</td>
-                        <td className="py-1.5 text-right tabular-nums text-emerald-500">
-                          {cacheHitRate(m.cache_read_tokens, m.input_tokens)}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          ) : (
-            <p className="text-muted-foreground text-sm">
-              {t("No LLM usage yet (the task has made no calls, or records are still being written).")}
-            </p>
-          )}
-        </CardContent>
-      </Card>
-      {/* Test scope: coverage denominator (coverage scope, not enforced); can be edited manually. */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
@@ -854,7 +344,6 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           </CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
-          {/* Add form */}
           <div className="flex flex-wrap items-center gap-2">
             <NativeSelect
               size="sm"
@@ -899,7 +388,6 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             </Button>
             {scopeErr && <span className="text-xs text-red-500">{scopeErr}</span>}
           </div>
-          {/* Scope list */}
           {scope.length > 0 ? (
             <div className="flex flex-col gap-1.5">
               {scope.map((row) => (
@@ -931,7 +419,225 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           )}
         </CardContent>
       </Card>
-      {/* Heartbeat */}
+    </div>
+  );
+}
+
+export function OverviewTab({ taskId }: { taskId: string }) {
+  const [task, setTask] = React.useState<Task | null>(null);
+  const [stats, setStats] = React.useState<Stats | null>(null);
+  const [intents, setIntents] = React.useState<TaskNode[]>([]);
+  const [findings, setFindings] = React.useState<Finding[]>([]);
+  const [coverage, setCoverage] = React.useState<{
+    enabled: boolean;
+    scope_rows: number;
+    denominator: number;
+    tested: number;
+    pct: number | null;
+    by_type: { type: string; total: number; tested: number }[];
+    gaps?: { kind: string; surface?: string; risk_area: string }[];
+    completeness?: { complete: boolean; state: string; caveat: string };
+  } | null>(null);
+  // Intent ids currently re-running ("__all__" means the batch); used to disable buttons + spinners.
+  const [rerunning, setRerunning] = React.useState<Set<string>>(new Set());
+  // Token usage per model (from the always-on llm_usage metering ledger, exact per call).
+  const [modelTokens, setModelTokens] = React.useState<ModelTokenStat[]>([]);
+  // Goal management: goal list + add form + inline edit state.
+  const [goals, setGoals] = React.useState<TaskGoal[]>([]);
+  const [goalText, setGoalText] = React.useState("");
+  const [goalVuln, setGoalVuln] = React.useState("");
+  const [goalBusy, setGoalBusy] = React.useState(false);
+  const [goalErr, setGoalErr] = React.useState("");
+  const [editingGoalId, setEditingGoalId] = React.useState<string | null>(null);
+  const [editText, setEditText] = React.useState("");
+  const [editVuln, setEditVuln] = React.useState("");
+
+  const loadTokens = React.useCallback(async () => {
+    try {
+      const resp = await api.tokensByModel(taskId);
+      setModelTokens(resp.models);
+    } catch {
+      // Ignore: without PG the endpoint errors and the card stays empty
+    }
+  }, [taskId]);
+
+  const loadGoals = React.useCallback(async () => {
+    try {
+      const resp = await api.taskGoals(taskId);
+      setGoals(resp.goals);
+    } catch {
+      // Ignore: transient error, the next poll retries
+    }
+  }, [taskId]);
+
+  const addGoal = async () => {
+    const text = goalText.trim();
+    if (!text) return;
+    setGoalBusy(true);
+    setGoalErr("");
+    try {
+      await api.addGoal(taskId, text, goalVuln.trim() || undefined);
+      setGoalText("");
+      setGoalVuln("");
+      await loadGoals();
+    } catch (e) {
+      setGoalErr(e instanceof Error ? e.message : t("Failed to add"));
+    } finally {
+      setGoalBusy(false);
+    }
+  };
+
+  const startEditGoal = (g: TaskGoal) => {
+    setEditingGoalId(g.id);
+    setEditText(g.text);
+    setEditVuln(g.vulnclass ?? "");
+  };
+
+  const cancelEditGoal = () => {
+    setEditingGoalId(null);
+    setEditText("");
+    setEditVuln("");
+  };
+
+  const saveEditGoal = async (g: TaskGoal) => {
+    const text = editText.trim();
+    if (!text) return;
+    setGoalBusy(true);
+    setGoalErr("");
+    try {
+      await api.updateGoal(taskId, g.id, text, editVuln.trim() || undefined);
+      cancelEditGoal();
+      await loadGoals();
+    } catch (e) {
+      setGoalErr(e instanceof Error ? e.message : t("Failed to save"));
+    } finally {
+      setGoalBusy(false);
+    }
+  };
+
+  const removeGoal = async (g: TaskGoal) => {
+    setGoals((prev) => prev.filter((x) => x.id !== g.id));
+    try {
+      await api.deleteGoal(taskId, g.id);
+    } catch {
+      await loadGoals();
+    }
+  };
+
+  const markRerun = (key: string, on: boolean) =>
+    setRerunning((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+
+  // Re-run one: set back to open (optimistic local state update, 3s poll as backstop); a worker re-claims it and runs from scratch.
+  const rerunOne = async (id: string) => {
+    markRerun(id, true);
+    try {
+      await api.rerunIntent(taskId, id);
+      setIntents((prev) => prev.map((i) => (i.id === id ? { ...i, state: "open" } : i)));
+    } catch {
+      // Ignore failures: the next poll still shows blocked and the user can click again
+    } finally {
+      markRerun(id, false);
+    }
+  };
+
+  // Re-run all of this task's blocked intents in bulk.
+  const rerunAll = async () => {
+    markRerun("__all__", true);
+    try {
+      await api.rerunBlocked(taskId);
+      setIntents((prev) => prev.map((i) => (i.state === "blocked" ? { ...i, state: "open" } : i)));
+    } catch {
+      // ignore
+    } finally {
+      markRerun("__all__", false);
+    }
+  };
+
+  React.useEffect(() => {
+    let cancelled = false;
+    let loading = false;
+
+    const load = async () => {
+      if (loading) return;
+      loading = true;
+      try {
+        const [taskResp, statsResp, intentsResp, findingsResp] = await Promise.all([
+          api.task(taskId),
+          api.stats(taskId),
+          api.intents(taskId),
+          api.findings(taskId),
+        ]);
+        if (cancelled) return;
+        const activeTask = statsResp.active_task;
+        setTask(
+          activeTask
+            ? {
+                ...taskResp,
+                in_flight: activeTask.in_flight,
+                goals_total: activeTask.goals_total,
+                goals_met: activeTask.goals_met,
+                engine_mode: statsResp.engine_mode ?? activeTask.engine_mode,
+                paused: activeTask.paused,
+              }
+            : taskResp,
+        );
+        setStats(statsResp);
+        setIntents(intentsResp);
+        setFindings(findingsResp);
+        api
+          .taskCoverage(taskId)
+          .then((c) => {
+            if (!cancelled) setCoverage(c);
+          })
+          .catch(() => {
+            // A transient coverage failure is retried by the next poll.
+          });
+      } catch {
+        // transient errors are ignored; the next poll will retry
+      } finally {
+        loading = false;
+      }
+    };
+
+    void load();
+    void loadTokens();
+    void loadGoals();
+    const stopPolling = setVisibleInterval(() => {
+      void load();
+      void loadTokens();
+      void loadGoals();
+    }, 3000);
+    return () => {
+      cancelled = true;
+      stopPolling();
+    };
+  }, [taskId, loadTokens, loadGoals]);
+
+  const running = intents.filter((i) => i.state === "running");
+  const open = intents.filter((i) => i.state === "open");
+  const blocked = intents.filter((i) => i.state === "blocked");
+  const taskFindings = findings.filter((f) => f.task_id === taskId);
+  const goalsPct = task?.goals_total ? Math.round(((task.goals_met ?? 0) / task.goals_total) * 100) : 0;
+  const tokenTotals = modelTokens.reduce(
+    (acc, m) => {
+      acc.input += m.input_tokens;
+      acc.output += m.output_tokens;
+      acc.cacheRead += m.cache_read_tokens;
+      acc.cacheWrite += m.cache_write_tokens;
+      acc.calls += m.calls;
+      return acc;
+    },
+    { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 },
+  );
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* 1. Heartbeat (executive live pulse first) */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
@@ -977,7 +683,50 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         </CardContent>
       </Card>
 
-      {/* Work set */}
+      {/* 2. Blocked intents — immediate action when failures occur */}
+      {blocked.length > 0 && (
+        <Card className="border-red-500/30">
+          <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <AlertTriangleIcon className="size-4 text-red-500" /> {t("Blocked/errored intents")}
+              <span className="text-xs font-normal text-muted-foreground">
+                {t("({count} in total, re-runnable)", { count: blocked.length })}
+              </span>
+            </CardTitle>
+            <Button size="sm" variant="outline" disabled={rerunning.has("__all__")} onClick={() => void rerunAll()}>
+              <RefreshCwIcon className={`size-3.5 ${rerunning.has("__all__") ? "animate-spin" : ""}`} />
+              {t("Re-run all")}
+            </Button>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-2">
+            {blocked.slice(0, 20).map((i) => (
+              <div key={i.id} className="flex items-center gap-2 text-sm">
+                <StatusBadge domain="intent" value={i.state} />
+                <span className="min-w-0 flex-1 truncate">{i.payload}</span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 shrink-0 px-2 text-xs"
+                  disabled={rerunning.has(i.id)}
+                  onClick={() => void rerunOne(i.id)}
+                >
+                  <RefreshCwIcon className={`size-3 ${rerunning.has(i.id) ? "animate-spin" : ""}`} />
+                  {t("Re-run")}
+                </Button>
+              </div>
+            ))}
+            {blocked.length > 20 && (
+              <p className="text-xs text-muted-foreground">
+                {t('Only the first 20 are shown; click "Re-run all" to handle the remaining {count}.', {
+                  count: blocked.length - 20,
+                })}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* 3. Work set */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <Card>
           <CardHeader>
@@ -1040,61 +789,274 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         </Card>
       </div>
 
-      {/* Blocked intents — errored/blocked intents (e.g. LLM network issues) that can be re-run in one click: set back to open,
-          a worker re-claims and re-runs from scratch (data already written to the graph is kept); a terminal/paused task is revived automatically. */}
-      {blocked.length > 0 && (
-        <Card className="border-red-500/30">
-          <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
-            <CardTitle className="flex items-center gap-2 text-sm">
-              <AlertTriangleIcon className="size-4 text-red-500" /> {t("Blocked/errored intents")}
-              <span className="text-xs font-normal text-muted-foreground">
-                {t("({count} in total, re-runnable)", { count: blocked.length })}
-              </span>
-            </CardTitle>
-            <Button size="sm" variant="outline" disabled={rerunning.has("__all__")} onClick={() => void rerunAll()}>
-              <RefreshCwIcon className={`size-3.5 ${rerunning.has("__all__") ? "animate-spin" : ""}`} />
-              {t("Re-run all")}
+      {/* 4. Task description & goal + Goal management */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <TargetIcon className="size-4 text-primary" /> {t("Task description & goal")}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="flex flex-col gap-1.5">
+            <div className="text-xs font-medium text-muted-foreground">{t("Description")}</div>
+            <p className="text-sm whitespace-pre-wrap break-words">{task?.description?.trim() || "—"}</p>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <div className="text-xs font-medium text-muted-foreground">{t("Goal")}</div>
+            <p className="text-sm whitespace-pre-wrap break-words">{task?.goal?.trim() || "—"}</p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <ListChecksIcon className="size-4 text-primary" /> {t("Goal management")}
+            <span className="text-muted-foreground text-xs font-normal">
+              {t("(final verifiable goals, {count} in total; adds/edits notify the planner and revive the task)", {
+                count: goals.length,
+              })}
+            </span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              className="h-7 min-w-56 flex-1 text-sm"
+              placeholder={t("Add a goal, e.g. 'gain unauthorized access with an admin account'")}
+              value={goalText}
+              onChange={(e) => setGoalText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void addGoal();
+              }}
+              disabled={goalBusy}
+            />
+            <Input
+              className="h-7 w-32 text-sm"
+              placeholder={t("Vulnerability class (optional)")}
+              value={goalVuln}
+              onChange={(e) => setGoalVuln(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void addGoal();
+              }}
+              disabled={goalBusy}
+            />
+            <Button size="sm" variant="outline" disabled={goalBusy || !goalText.trim()} onClick={() => void addGoal()}>
+              <PlusIcon className="size-3.5" /> {t("Add")}
             </Button>
+            {goalErr && <span className="text-xs text-red-500">{goalErr}</span>}
+          </div>
+          {goals.length > 0 ? (
+            <div className="flex flex-col gap-1.5">
+              {goals.map((g) =>
+                editingGoalId === g.id ? (
+                  <div key={g.id} className="flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-1.5">
+                    <Input
+                      className="h-7 min-w-56 flex-1 text-sm"
+                      value={editText}
+                      onChange={(e) => setEditText(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") void saveEditGoal(g);
+                        if (e.key === "Escape") cancelEditGoal();
+                      }}
+                      disabled={goalBusy}
+                      autoFocus
+                    />
+                    <Input
+                      className="h-7 w-32 text-sm"
+                      placeholder={t("Vulnerability class (optional)")}
+                      value={editVuln}
+                      onChange={(e) => setEditVuln(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") void saveEditGoal(g);
+                        if (e.key === "Escape") cancelEditGoal();
+                      }}
+                      disabled={goalBusy}
+                    />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 shrink-0 px-1.5"
+                      disabled={goalBusy || !editText.trim()}
+                      onClick={() => void saveEditGoal(g)}
+                    >
+                      <CheckIcon className="size-3.5 text-emerald-500" />
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 shrink-0 px-1.5"
+                      disabled={goalBusy}
+                      onClick={cancelEditGoal}
+                    >
+                      <XIcon className="size-3.5" />
+                    </Button>
+                  </div>
+                ) : (
+                  <div key={g.id} className="flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm">
+                    <StatusBadge domain="goal" value={g.state} />
+                    <span className="min-w-0 flex-1 break-words">{g.text}</span>
+                    {g.vulnclass && (
+                      <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-xs">
+                        {g.vulnclass}
+                      </span>
+                    )}
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 shrink-0 px-1.5"
+                      disabled={goalBusy}
+                      onClick={() => startEditGoal(g)}
+                    >
+                      <PencilIcon className="size-3.5" />
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 shrink-0 px-1.5"
+                      disabled={goalBusy}
+                      onClick={() => void removeGoal(g)}
+                    >
+                      <Trash2Icon className="size-3.5 text-red-500" />
+                    </Button>
+                  </div>
+                ),
+              )}
+            </div>
+          ) : (
+            <p className="text-muted-foreground text-sm">
+              {t("No goals yet. Once added, the planner dispatches exploration intents from them and judges completion.")}
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* 5. Coverage & Token usage */}
+      {coverage && coverage.enabled && (coverage.scope_rows > 0 || (coverage.gaps?.length ?? 0) > 0) && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <TargetIcon className="size-4 text-emerald-500" /> {t("Asset test coverage")}
+              <span className="text-muted-foreground text-xs font-normal">{t("(rough estimate, for reference only)")}</span>
+            </CardTitle>
           </CardHeader>
-          <CardContent className="flex flex-col gap-2">
-            {blocked.slice(0, 20).map((i) => (
-              <div key={i.id} className="flex items-center gap-2 text-sm">
-                <StatusBadge domain="intent" value={i.state} />
-                <span className="min-w-0 flex-1 truncate">{i.payload}</span>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-7 shrink-0 px-2 text-xs"
-                  disabled={rerunning.has(i.id)}
-                  onClick={() => void rerunOne(i.id)}
-                >
-                  <RefreshCwIcon className={`size-3 ${rerunning.has(i.id) ? "animate-spin" : ""}`} />
-                  {t("Re-run")}
-                </Button>
+          <CardContent className="flex flex-col gap-3">
+            <div className="flex items-baseline gap-3">
+              <span className="text-2xl font-semibold tabular-nums">
+                {coverage.pct != null ? Math.round(coverage.pct * 100) + "%" : "—"}
+              </span>
+              <span className="text-muted-foreground text-sm">
+                {t("Tested {tested} / in scope {total}", { tested: coverage.tested, total: coverage.denominator })}
+              </span>
+            </div>
+            {coverage.pct != null && <Progress value={Math.round(coverage.pct * 100)} />}
+            {coverage.by_type.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 text-xs">
+                {coverage.by_type.map((b) => (
+                  <span key={b.type} className="bg-muted rounded px-1.5 py-0.5">
+                    <span className="text-muted-foreground">
+                      {(taskAssetTypeLabel as (x: NewAssetType) => string | undefined)(b.type as NewAssetType) ||
+                        b.type}
+                    </span>{" "}
+                    <span className="tabular-nums font-medium">
+                      {b.tested}/{b.total}
+                    </span>
+                  </span>
+                ))}
               </div>
-            ))}
-            {blocked.length > 20 && (
-              <p className="text-xs text-muted-foreground">
-                {t('Only the first 20 are shown; click "Re-run all" to handle the remaining {count}.', {
-                  count: blocked.length - 20,
-                })}
-              </p>
+            )}
+            {coverage.completeness && !coverage.completeness.complete && (
+              <p className="text-muted-foreground text-xs">{coverage.completeness.caveat}</p>
+            )}
+            {coverage.gaps && (
+              <div className="text-xs">
+                <span className="font-medium">{t("Coverage gaps: {count}", { count: coverage.gaps.length })}</span>
+                <ul className="text-muted-foreground mt-1 list-disc pl-4">
+                  {coverage.gaps.map((g, i) => (
+                    <li key={i}>
+                      {t(g.kind)} {g.surface ? g.surface + " " : ""}
+                      {g.risk_area}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
           </CardContent>
         </Card>
       )}
 
-      {/* Stat cards */}
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
-        <StatCard label={t("Open intents")} value={open.length} icon={ShieldCheckIcon} sub={t("frontier open")} />
-        <StatCard label={t("Confirmed findings")} value={taskFindings.length} icon={BugIcon} sub={t("this task")} />
-        <StatCard
-          label={t("Total intents")}
-          value={intents.length}
-          icon={AlertTriangleIcon}
-          sub={t("all intents of this task")}
-        />
-      </div>
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <CoinsIcon className="size-4 text-amber-500" /> {t("LLM token usage")}
+            <span className="text-muted-foreground text-xs font-normal">
+              {tokenTotals.calls > 0
+                ? t("(per model, {count} calls in total)", { count: tokenTotals.calls })
+                : t("(per model)")}
+            </span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          {modelTokens.length > 0 ? (
+            <>
+              <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-sm">
+                <span className="tabular-nums">
+                  <span className="text-muted-foreground">{t("Input")} </span>
+                  <span className="font-semibold">{fmtTokens(tokenTotals.input)}</span>
+                </span>
+                <span className="tabular-nums">
+                  <span className="text-muted-foreground">{t("Output")} </span>
+                  <span className="font-semibold">{fmtTokens(tokenTotals.output)}</span>
+                </span>
+                <span className="tabular-nums">
+                  <span className="text-muted-foreground">{t("Cache read")} </span>
+                  <span className="font-semibold">{fmtTokens(tokenTotals.cacheRead)}</span>
+                </span>
+                <span className="tabular-nums">
+                  <span className="text-muted-foreground">{t("Cache hit rate")} </span>
+                  <span className="font-semibold text-emerald-500">
+                    {cacheHitRate(tokenTotals.cacheRead, tokenTotals.input)}
+                  </span>
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-muted-foreground border-b text-left text-xs">
+                      <th className="py-1.5 pr-3 font-medium">{t("Model")}</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">{t("Calls")}</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">{t("Input")}</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">{t("Output")}</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">{t("Cache read")}</th>
+                      <th className="py-1.5 text-right font-medium">{t("Hit rate")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {modelTokens.map((m) => (
+                      <tr key={m.model} className="border-b last:border-0">
+                        <td className="max-w-[16rem] truncate py-1.5 pr-3 font-mono text-xs" title={m.model}>
+                          {m.model}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">{m.calls}</td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.input_tokens)}</td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.output_tokens)}</td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.cache_read_tokens)}</td>
+                        <td className="py-1.5 text-right tabular-nums text-emerald-500">
+                          {cacheHitRate(m.cache_read_tokens, m.input_tokens)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : (
+            <p className="text-muted-foreground text-sm">
+              {t("No LLM usage yet (the task has made no calls, or records are still being written).")}
+            </p>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

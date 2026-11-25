@@ -221,7 +221,7 @@ func bashConcurrencySafe(input json.RawMessage) bool {
 		return false
 	}
 	cmd := strings.TrimSpace(in.Command)
-	if cmd == "" || strings.ContainsAny(cmd, "\n\r><;&`") || strings.Contains(cmd, "$(") {
+	if cmd == "" || hasUnsafeShellChars(cmd) {
 		return false
 	}
 	stages, ok := splitUnquotedPipes(cmd)
@@ -235,6 +235,56 @@ func bashConcurrencySafe(input json.RawMessage) bool {
 		}
 	}
 	return true
+}
+
+// hasUnsafeShellChars scans cmd tracking quote state, rejecting the shell
+// control characters the concurrency fast-path must not run: newlines and
+// carriage returns, backticks and $( everywhere except inside single quotes,
+// and ; & < > only outside quotes (quoted they are literal arguments — common
+// in read-only calls like curl -H 'Cookie: a=b; c=d'). The benign stderr
+// redirects "2>/dev/null" and "2>&1" are tolerated.
+func hasUnsafeShellChars(cmd string) bool {
+	s := strings.ReplaceAll(cmd, "2>/dev/null", "")
+	s = strings.ReplaceAll(s, "2>&1", "")
+	var sq, dq bool
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case sq:
+			if c == '\'' {
+				sq = false
+			}
+		case dq:
+			switch c {
+			case '"':
+				dq = false
+			case '`':
+				return true
+			case '$':
+				if i+1 < len(s) && s[i+1] == '(' {
+					return true
+				}
+			case '\\':
+				i++
+			}
+		default:
+			switch c {
+			case '\'':
+				sq = true
+			case '"':
+				dq = true
+			case '\n', '\r', '>', '<', ';', '&', '`':
+				return true
+			case '$':
+				if i+1 < len(s) && s[i+1] == '(' {
+					return true
+				}
+			case '\\':
+				i++
+			}
+		}
+	}
+	return false
 }
 
 func splitUnquotedPipes(s string) ([]string, bool) {

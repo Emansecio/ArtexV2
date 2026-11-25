@@ -76,8 +76,11 @@ func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.Co
 			note = "\nBy default the report agent verifies and binds traffic before writing the report. The reporter keeps verification commands, key output, any known real traffic IDs and their purpose in evidence, so the report agent can check them against the execution records; no extra packet capture is needed for binding. Explicit immediate binding is still supported: traffic_refs or evidence_hint_id may submit already-verified references, the latter reading the structured references of the given hint in this task; if either is invalid the whole report fails. TCP / no-capture cases do not need these optional parameters. The returned finding_id and finding_node_id denote the standalone record and the exploration node respectively."
 		case "add_hint", "add_task_hint":
 			note = "\nWhen handing off a confirmed vulnerability, keep the verified traffic's IDs, purpose, notes, and order in the corresponding hint's traffic_refs (top-level for a single hint, inside the corresponding hints element for a batch), and state in text exactly which vulnerability it proves. The caller must not hand off only text while dropping existing traffic references. Unverified candidates must not be passed as evidence."
-		case "get_finding_traffic", "bind_finding_traffic", "list_findings", "list_task_findings", "node_detail", "get_task_node_detail", "update_finding_report":
-			note = findingIDGuidance
+		case "update_finding_report":
+			// One-line note: the full ID conventions live once in the system
+			// guidance below — repeating the paragraph per tool wastes ~150
+			// tokens per duplicated description.
+			note = "\nThe finding_id parameter takes the exploration node ID (finding_node_id), not the standalone finding_id."
 		}
 		if note != "" {
 			out[i] = DecorateTool(tool, tool.Description()+note, tool.InputSchema())

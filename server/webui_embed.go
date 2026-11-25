@@ -3,9 +3,11 @@
 package server
 
 import (
+	"compress/gzip"
 	"embed"
 	"io"
 	"io/fs"
+	"mime"
 	"net/http"
 	"path"
 	"strings"
@@ -46,18 +48,56 @@ func (s *Server) webuiHandler() http.Handler {
 	})
 }
 
-// serveFileIfExists serves name from fsys when it exists as a regular file,
-// using the already-opened handle and appropriate HTTP cache headers.
-func serveFileIfExists(w http.ResponseWriter, r *http.Request, fsys fs.FS, name string) bool {
+func acceptsEncoding(r *http.Request, enc string) bool {
+	return strings.Contains(r.Header.Get("Accept-Encoding"), enc)
+}
+
+func openRegular(fsys fs.FS, name string) (fs.File, bool) {
 	f, err := fsys.Open(name)
 	if err != nil {
+		return nil, false
+	}
+	st, err := f.Stat()
+	if err != nil || st.IsDir() {
+		_ = f.Close()
+		return nil, false
+	}
+	return f, true
+}
+
+// serveFileIfExists serves name from fsys when it exists as a regular file (or
+// as pre-compressed .br/.gz variants produced by build.sh), with appropriate
+// HTTP cache headers and zero-CPU pre-compressed delivery.
+func serveFileIfExists(w http.ResponseWriter, r *http.Request, fsys fs.FS, name string) bool {
+	var (
+		f        fs.File
+		encoding string
+		gunzip   bool
+		ok       bool
+	)
+	if acceptsEncoding(r, "br") {
+		if f, ok = openRegular(fsys, name+".br"); ok {
+			encoding = "br"
+		}
+	}
+	if !ok && acceptsEncoding(r, "gzip") {
+		if f, ok = openRegular(fsys, name+".gz"); ok {
+			encoding = "gzip"
+		}
+	}
+	if !ok {
+		f, ok = openRegular(fsys, name)
+	}
+	if !ok {
+		if f, ok = openRegular(fsys, name+".gz"); ok {
+			gunzip = true
+		}
+	}
+	if !ok {
 		return false
 	}
 	defer f.Close()
-	st, statErr := f.Stat()
-	if statErr != nil || st.IsDir() {
-		return false
-	}
+
 	if strings.HasPrefix(name, "_next/static/") {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	} else {
@@ -73,6 +113,26 @@ func serveFileIfExists(w http.ResponseWriter, r *http.Request, fsys fs.FS, name 
 			return true
 		}
 	}
+
+	if ct := mime.TypeByExtension(path.Ext(name)); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	if encoding != "" {
+		w.Header().Add("Vary", "Accept-Encoding")
+		w.Header().Set("Content-Encoding", encoding)
+	} else if gunzip {
+		w.Header().Add("Vary", "Accept-Encoding")
+		zr, err := gzip.NewReader(f)
+		if err != nil {
+			http.Error(w, "corrupt embedded asset", http.StatusInternalServerError)
+			return true
+		}
+		defer zr.Close()
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(w, zr)
+		return true
+	}
+
 	if rs, ok := f.(io.ReadSeeker); ok {
 		http.ServeContent(w, r, path.Base(name), time.Time{}, rs)
 		return true

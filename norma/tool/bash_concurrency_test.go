@@ -21,6 +21,14 @@ func TestBashConcurrencySafe(t *testing.T) {
 	check(`openssl s_client -connect example.com:443 -servername example.com`, false, true)
 	check(`jq '.paths | keys' swagger.json`, false, true)
 
+	// Quoted metacharacters are literal arguments — safe in parallel.
+	check(`curl -s 'https://example.com/api?a=1&b=2'`, false, true)
+	check(`curl -s -H 'Cookie: session=x; theme=y' https://example.com`, false, true)
+	check(`curl -s -H 'Accept: text/html;q=0.9' https://example.com`, false, true)
+	check(`curl -s "https://example.com/api?a=1&b=2"`, false, true)
+	check(`curl -sI https://example.com 2>/dev/null`, false, true)
+	check(`curl -sI https://example.com 2>&1`, false, true)
+
 	// Mutations, chaining, redirection, subshells, backgrounding must serialize.
 	check(`curl -s https://example.com -o out.html`, false, false)
 	check(`curl -X POST https://example.com -d '{"a":1}'`, false, false)
@@ -30,4 +38,8 @@ func TestBashConcurrencySafe(t *testing.T) {
 	check(`sed -i 's/a/b/' file.txt`, false, false)
 	check(`curl -s https://example.com`, true, false)
 	check("curl -s https://example.com\nid", false, false)
+	check(`curl -s "https://example.com/$(id)"`, false, false)
+	check("curl -s \"https://example.com/`id`\"", false, false)
+	check(`curl -s https://example.com & sleep 1`, false, false)
+	check(`curl -s https://example.com 1>/dev/null`, false, false)
 }

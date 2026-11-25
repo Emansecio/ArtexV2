@@ -1,12 +1,17 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import * as React from "react";
 
 import { Card, CardContent } from "@/components/ui/card";
-import { ExplorationGraph } from "@/components/exploration-graph";
 import { api } from "@/lib/api";
 import type { Edge, TaskNode } from "@/lib/types";
 import { setVisibleInterval } from "@/lib/polling";
+
+const ExplorationGraph = dynamic(
+  () => import("@/components/exploration-graph").then((m) => m.ExplorationGraph),
+  { ssr: false, loading: () => <div className="flex h-[72vh] items-center justify-center text-xs text-muted-foreground">…</div> },
+);
 
 export function GraphTab({ taskId }: { taskId: string }) {
   const [nodes, setNodes] = React.useState<TaskNode[]>([]);

@@ -404,7 +404,7 @@ func (s *Server) toolUpdateCustomTool() actool.CoreTool {
 // notice a missing server (and say so) instead of silently degrading when the
 // catalog is cached but the server is unreachable.
 func (s *Server) toolMCPStatus() actool.CoreTool {
-	return wrTool("mcp_status",
+	return roTool("mcp_status",
 		"Report the health of every configured MCP server: name, transport, enabled, cached tool count, and the outcome of the last connect attempt (time, ok/error). Use this when tools you expect are missing or before relying on a skill-gated server.",
 		map[string]any{"type": "object", "properties": map[string]any{}},
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {

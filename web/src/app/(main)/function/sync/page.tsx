@@ -36,9 +36,9 @@ const ASSET_TYPES: { key: string; label: string }[] = [
 
 export default function AssetSyncPage() {
   return (
-    <div className="p-4 md:p-6">
-      <div className="mb-4">
-        <h1 className="font-semibold text-xl">{t("Asset sync")}</h1>
+    <div className="flex flex-1 flex-col gap-4">
+      <div>
+        <h1 className="font-semibold text-xl tracking-tight">{t("Asset sync")}</h1>
         <p className="text-muted-foreground text-sm">{t("Sync assets into the store from external data sources")}</p>
       </div>
       <Tabs defaultValue="scopesentry">

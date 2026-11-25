@@ -34,16 +34,31 @@ const (
 		"the END marker carrying the same nonce as its opening marker."
 )
 
-// withUntrustedNote returns system with untrustedSystemNote appended, unless a
-// segment already carries untrustedNoteMarker. The caller's slice is not
-// modified. The note goes last, so DynamicBoundary indices stay valid.
-func withUntrustedNote(system []string) []string {
+// WithUntrustedNote inserts untrustedSystemNote inside the static region of
+// system (before the DynamicBoundary), unless a segment already carries
+// untrustedNoteMarker, and returns the adjusted boundary. Appending past the
+// boundary would put ~70 static tokens outside the cached system prefix on
+// every Worker/Planner/MainAgent/Chat turn. The caller's slice is not modified.
+func WithUntrustedNote(system []string, boundary int) ([]string, int) {
 	for _, s := range system {
 		if strings.Contains(s, untrustedNoteMarker) {
-			return system
+			return system, boundary
 		}
 	}
-	return append(append([]string(nil), system...), untrustedSystemNote)
+	out := append([]string(nil), system...)
+	switch {
+	case boundary <= 0:
+		out = append(out, untrustedSystemNote)
+	case boundary < len(out):
+		out = append(out, "")
+		copy(out[boundary+1:], out[boundary:])
+		out[boundary] = untrustedSystemNote
+		boundary++
+	default: // boundary >= len(out): whole prompt is static — extend it
+		out = append(out, untrustedSystemNote)
+		boundary = len(out)
+	}
+	return out, boundary
 }
 
 // boundaryOverhead is the head budget held back when the boundary is on, so a

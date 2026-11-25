@@ -6,7 +6,27 @@ import Link from "next/link";
 import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 
-import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
+import {
+  ArchiveIcon,
+  ArrowLeftIcon,
+  BotIcon,
+  BrainIcon,
+  BugIcon,
+  CheckIcon,
+  CircleAlertIcon,
+  FileTextIcon,
+  GitForkIcon,
+  KeyRoundIcon,
+  LayoutDashboardIcon,
+  NetworkIcon,
+  PauseIcon,
+  PlayIcon,
+  RadarIcon,
+  RadioIcon,
+  RotateCwIcon,
+  ShieldAlertIcon,
+  ShieldCheckIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { StatusBadge } from "@/components/status-badge";
@@ -57,22 +77,95 @@ const FindingsTab = dynamic(() => import("./_tabs/findings-tab").then((m) => m.F
 const GraphTab = dynamic(() => import("./_tabs/graph-tab").then((m) => m.GraphTab), { ssr: false });
 const InterceptTab = dynamic(() => import("./_tabs/intercept-tab").then((m) => m.InterceptTab), { ssr: false });
 const OverviewTab = dynamic(() => import("./_tabs/overview-tab").then((m) => m.OverviewTab), { ssr: false });
+const TaskScopeRulesSection = dynamic(
+  () => import("./_tabs/overview-tab").then((m) => m.TaskScopeRulesSection),
+  { ssr: false },
+);
 const ReportTab = dynamic(() => import("./_tabs/report-tab").then((m) => m.ReportTab), { ssr: false });
 const RetestsTab = dynamic(() => import("./_tabs/retests-tab").then((m) => m.RetestsTab), { ssr: false });
 
-const TABS = [
-  { value: "sessions", label: t("Sessions") },
-  { value: "overview", label: t("Overview") },
-  { value: "graph", label: t("Exploration graph") },
-  { value: "broadcast", label: t("Broadcast") },
-  { value: "findings", label: t("Findings") },
-  { value: "retests", label: t("Retests") },
-  { value: "assets", label: t("Test assets") },
-  { value: "credentials", label: t("Credentials") },
-  { value: "coverage", label: t("Asset coverage") },
-  { value: "intercept", label: t("Interception approval") },
-  { value: "report", label: t("Report") },
+type PrimaryTab = "agents" | "overview" | "findings" | "graph" | "assets" | "approvals";
+
+const PRIMARY_TABS: { value: PrimaryTab; label: string; icon: React.ElementType }[] = [
+  { value: "agents", label: t("Agents"), icon: BotIcon },
+  { value: "overview", label: t("Overview"), icon: LayoutDashboardIcon },
+  { value: "findings", label: t("Findings"), icon: BugIcon },
+  { value: "graph", label: t("Graph"), icon: GitForkIcon },
+  { value: "assets", label: t("Assets & Scope"), icon: NetworkIcon },
+  { value: "approvals", label: t("Approvals"), icon: ShieldAlertIcon },
 ];
+
+type SubTabOption = { value: string; label: string; icon: React.ElementType };
+
+const SUB_TABS: Partial<Record<PrimaryTab, SubTabOption[]>> = {
+  agents: [
+    { value: "sessions", label: t("Live agents"), icon: BotIcon },
+    { value: "broadcast", label: t("Broadcast"), icon: RadioIcon },
+  ],
+  findings: [
+    { value: "findings", label: t("Findings"), icon: BugIcon },
+    { value: "retests", label: t("Retests"), icon: RotateCwIcon },
+    { value: "report", label: t("Report"), icon: FileTextIcon },
+  ],
+  graph: [
+    { value: "graph", label: t("Exploration graph"), icon: GitForkIcon },
+    { value: "coverage", label: t("Asset coverage"), icon: RadarIcon },
+  ],
+  assets: [
+    { value: "assets", label: t("Test assets"), icon: NetworkIcon },
+    { value: "credentials", label: t("Credentials"), icon: KeyRoundIcon },
+    { value: "scope", label: t("Scope & Rules"), icon: ShieldCheckIcon },
+  ],
+};
+
+function resolveTabParam(raw: string | null): { primary: PrimaryTab; view: string } {
+  switch (raw) {
+    case "broadcast":
+      return { primary: "agents", view: "broadcast" };
+    case "overview":
+      return { primary: "overview", view: "overview" };
+    case "findings":
+      return { primary: "findings", view: "findings" };
+    case "retests":
+      return { primary: "findings", view: "retests" };
+    case "report":
+      return { primary: "findings", view: "report" };
+    case "graph":
+      return { primary: "graph", view: "graph" };
+    case "coverage":
+      return { primary: "graph", view: "coverage" };
+    case "assets":
+      return { primary: "assets", view: "assets" };
+    case "credentials":
+      return { primary: "assets", view: "credentials" };
+    case "scope":
+      return { primary: "assets", view: "scope" };
+    case "intercept":
+    case "approvals":
+      return { primary: "approvals", view: "intercept" };
+    case "sessions":
+    case "agents":
+    default:
+      return { primary: "agents", view: "sessions" };
+  }
+}
+
+function defaultViewForPrimary(primary: PrimaryTab): string {
+  switch (primary) {
+    case "agents":
+      return "sessions";
+    case "overview":
+      return "overview";
+    case "findings":
+      return "findings";
+    case "graph":
+      return "graph";
+    case "assets":
+      return "assets";
+    case "approvals":
+      return "intercept";
+  }
+}
 
 function taskProfileIDs(task: Task): string[] {
   if (task.llm_profile_ids && task.llm_profile_ids.length > 0) {
@@ -232,10 +325,49 @@ function TaskDetailInner() {
   const [task, setTask] = React.useState<Task | null>(null);
   const [paused, setPaused] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
-  const [tab, setTab] = React.useState("sessions");
+  const initialTab = searchParams.get("tab");
+  const initialResolved = React.useMemo(() => resolveTabParam(initialTab), [initialTab]);
+  const [primaryTab, setPrimaryTab] = React.useState<PrimaryTab>(initialResolved.primary);
+  const [activeView, setActiveView] = React.useState<string>(initialResolved.view);
+  const [goalExpanded, setGoalExpanded] = React.useState(false);
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);
+
+  React.useEffect(() => {
+    const resolved = resolveTabParam(initialTab);
+    setPrimaryTab(resolved.primary);
+    setActiveView(resolved.view);
+    setGoalExpanded(false);
+  }, [id, initialTab]);
+
+  const syncTabUrl = React.useCallback((view: string) => {
+    const url = new URL(window.location.href);
+    if (view === "sessions") url.searchParams.delete("tab");
+    else url.searchParams.set("tab", view);
+    window.history.replaceState(null, "", url);
+  }, []);
+
+  const handlePrimaryTabChange = React.useCallback(
+    (next: string) => {
+      const nextPrimary = next as PrimaryTab;
+      const nextView = defaultViewForPrimary(nextPrimary);
+      setPrimaryTab(nextPrimary);
+      setActiveView(nextView);
+      syncTabUrl(nextView);
+    },
+    [syncTabUrl],
+  );
+
+  const handleSubViewChange = React.useCallback(
+    (nextView: string) => {
+      const resolved = resolveTabParam(nextView);
+      setPrimaryTab(resolved.primary);
+      setActiveView(resolved.view);
+      syncTabUrl(resolved.view);
+    },
+    [syncTabUrl],
+  );
 
   React.useEffect(() => {
     api
@@ -373,8 +505,14 @@ function TaskDetailInner() {
     </Button>
   );
 
+  const findingsCount = task.findings
+    ? task.findings.critical + task.findings.high + task.findings.medium + task.findings.low
+    : 0;
+
+  const subTabs = SUB_TABS[primaryTab];
+
   return (
-    <Tabs value={tab} onValueChange={setTab} className="flex flex-1 flex-col gap-0">
+    <Tabs value={primaryTab} onValueChange={handlePrimaryTabChange} className="flex flex-1 flex-col gap-0">
       {/* Top fixed area */}
       <header className="sticky top-0 z-10 flex flex-col gap-2 border-b bg-background/95 px-4 py-2.5 backdrop-blur lg:px-6">
         <div className="flex items-center gap-2">
@@ -424,58 +562,116 @@ function TaskDetailInner() {
             {controlLabel}
           </Button>
         </div>
-        <p className="truncate text-xs text-muted-foreground">{task.goal}</p>
-        {/* Tabs */}
-        <div className="no-scrollbar min-w-0 overflow-x-auto">
-          <TabsList variant="default" className="min-w-max">
-            {TABS.map((tabItem) => (
-              <TabsTrigger key={tabItem.value} value={tabItem.value}>
-                {tabItem.label}
-                {tabItem.value === "intercept" && interceptPendingCount > 0 && (
-                  <span className="ml-1.5 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white">
-                    {interceptPendingCount > 99 ? "99+" : interceptPendingCount}
-                  </span>
-                )}
-              </TabsTrigger>
-            ))}
-          </TabsList>
+        {task.goal && (
+          <button
+            type="button"
+            onClick={() => setGoalExpanded((v) => !v)}
+            aria-expanded={goalExpanded}
+            className={
+              goalExpanded
+                ? "text-left text-xs whitespace-pre-wrap text-muted-foreground hover:text-foreground"
+                : "truncate text-left text-xs text-muted-foreground hover:text-foreground"
+            }
+            title={goalExpanded ? t("Collapse") : t("Expand")}
+          >
+            {task.goal}
+          </button>
+        )}
+        {/* Primary tabs + optional compact sub-view switcher */}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="scroll-fade-x min-w-0">
+            <TabsList variant="line" className="min-w-max items-center">
+              {PRIMARY_TABS.map((tabItem) => {
+                const Icon = tabItem.icon;
+                return (
+                  <TabsTrigger
+                    key={tabItem.value}
+                    value={tabItem.value}
+                    className="gap-1.5 px-2.5"
+                    onClick={(e) => e.currentTarget.scrollIntoView({ block: "nearest", inline: "nearest" })}
+                  >
+                    <Icon className="size-3.5" />
+                    {tabItem.label}
+                    {tabItem.value === "findings" && findingsCount > 0 && (
+                      <span className="rounded-full bg-muted px-1.5 py-0.2 text-[10px] font-medium tabular-nums text-muted-foreground">
+                        {findingsCount}
+                      </span>
+                    )}
+                    {tabItem.value === "approvals" && interceptPendingCount > 0 && (
+                      <span className="ml-0.5 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white">
+                        {interceptPendingCount > 99 ? "99+" : interceptPendingCount}
+                      </span>
+                    )}
+                  </TabsTrigger>
+                );
+              })}
+            </TabsList>
+          </div>
+          {subTabs && subTabs.length > 1 && (
+            <div className="inline-flex items-center gap-0.5 rounded-lg bg-muted/60 p-0.5 text-xs">
+              {subTabs.map((item) => {
+                const SubIcon = item.icon;
+                const active = activeView === item.value;
+                return (
+                  <button
+                    key={item.value}
+                    type="button"
+                    onClick={() => handleSubViewChange(item.value)}
+                    className={
+                      active
+                        ? "inline-flex items-center gap-1.5 rounded-md bg-background px-2.5 py-1 font-medium text-foreground shadow-2xs transition-colors"
+                        : "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-muted-foreground transition-colors hover:text-foreground"
+                    }
+                  >
+                    <SubIcon className="size-3.5" />
+                    {item.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
       </header>
 
       {/* Tab content */}
       <div className="flex-1 p-4 lg:p-6">
-        <TabsContent value="sessions" className="mt-0">
-          <SessionsTab taskId={id} taskPaused={task?.status === "paused"} />
+        <TabsContent value="agents" className="mt-0">
+          {activeView === "broadcast" ? (
+            <BroadcastTab taskId={id} />
+          ) : (
+            <SessionsTab taskId={id} taskPaused={task?.status === "paused"} />
+          )}
         </TabsContent>
         <TabsContent value="overview" className="mt-0">
           <OverviewTab taskId={id} />
         </TabsContent>
-        <TabsContent value="graph" className="mt-0">
-          <GraphTab taskId={id} />
-        </TabsContent>
-        <TabsContent value="broadcast" className="mt-0">
-          <BroadcastTab taskId={id} />
-        </TabsContent>
         <TabsContent value="findings" className="mt-0">
-          <FindingsTab taskId={id} />
+          {activeView === "retests" ? (
+            <RetestsTab key={id} taskId={id} />
+          ) : activeView === "report" ? (
+            <ReportTab taskId={id} />
+          ) : (
+            <FindingsTab taskId={id} />
+          )}
         </TabsContent>
-        <TabsContent value="retests" className="mt-0">
-          <RetestsTab key={id} taskId={id} />
+        <TabsContent value="graph" className="mt-0">
+          {activeView === "coverage" ? (
+            <CoverageGraphTab taskId={id} coverageEnabled={task?.coverage_enabled !== false} />
+          ) : (
+            <GraphTab taskId={id} />
+          )}
         </TabsContent>
         <TabsContent value="assets" className="mt-0">
-          <AssetsTab taskId={id} />
+          {activeView === "credentials" ? (
+            <CredentialsTab taskId={id} />
+          ) : activeView === "scope" ? (
+            <TaskScopeRulesSection taskId={id} />
+          ) : (
+            <AssetsTab taskId={id} />
+          )}
         </TabsContent>
-        <TabsContent value="credentials" className="mt-0">
-          <CredentialsTab taskId={id} />
-        </TabsContent>
-        <TabsContent value="coverage" className="mt-0">
-          <CoverageGraphTab taskId={id} coverageEnabled={task?.coverage_enabled !== false} />
-        </TabsContent>
-        <TabsContent value="intercept" className="mt-0">
+        <TabsContent value="approvals" className="mt-0">
           <InterceptTab taskId={id} />
-        </TabsContent>
-        <TabsContent value="report" className="mt-0">
-          <ReportTab taskId={id} />
         </TabsContent>
       </div>
     </Tabs>

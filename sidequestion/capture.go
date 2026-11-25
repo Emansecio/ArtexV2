@@ -131,11 +131,18 @@ func Finish(ctx context.Context, messages []llm.Message) {
 		return
 	}
 	req := s.Request
-	var prefix []llm.Message
+	sent := len(req.Messages)
 	if len(req.Messages) > 0 && strings.HasPrefix(req.Messages[0].Text(), "<system-reminder>") {
-		prefix = append(prefix, req.Messages[0])
+		sent-- // the reminder is a host prefix, absent from Terminal.Messages
 	}
-	req.Messages = append(prefix, llm.MessagesForAPI(messages)...)
+	// Append only post-response tool results, keeping the sent (possibly
+	// ContextView-projected) prefix: rewriting it with the raw expanded history
+	// would bust prompt caches and re-inflate compressed content. When nothing
+	// new landed, the stored snapshot is already exact.
+	api := llm.MessagesForAPI(messages)
+	if len(api) > sent {
+		req.Messages = append(append([]llm.Message(nil), req.Messages...), api[sent:]...)
+	}
 	c.save(req, s.Model)
 }
 

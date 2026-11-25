@@ -126,6 +126,7 @@ func (d *DB) migrateStockBrowserMCP() error {
 		if _, err := d.Exec(`UPDATE mcp_servers SET command=$1, args=$2 WHERE name=$3`, newCommand, string(raw), browserMCPName); err != nil {
 			return fmt.Errorf("update browser mcp: %w", err)
 		}
+		d.InvalidateMCPCache()
 	}
 	return d.SetSetting(browserMCPDirectBinSetting, "done")
 }

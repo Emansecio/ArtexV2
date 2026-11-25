@@ -21,6 +21,12 @@ import (
 // the digest's OWNING store (the current task, or a read-only source task §2).
 func (t *ToolSet) digestMemberEntry(store *db.ExplorationStore, id int64) map[string]any {
 	n, _ := store.GetNode(id)
+	return t.digestMemberNodeEntry(id, n)
+}
+
+// digestMemberNodeEntry is digestMemberEntry with the node already loaded —
+// expand_digest batches members through NodesByIDs instead of one GetNode each.
+func (t *ToolSet) digestMemberNodeEntry(id int64, n *db.Node) map[string]any {
 	if n == nil {
 		return map[string]any{"id": id, "missing": true}
 	}
@@ -42,7 +48,7 @@ func (t *ToolSet) digestMemberEntry(store *db.ExplorationStore, id int64) map[st
 // stay reachable via expand_digest even when not shown inline — cold_digests is the
 // only exit for folded cold nodes. Shared by the current task overview and the
 // read-only related-task overview (§2 cross-task reuse).
-func coldDigestsRecent(store *db.ExplorationStore, cap int) (shown []map[string]any, moreIDs []int64) {
+func coldDigestsRecent(store *db.ExplorationStore, cap int, memberOf map[int64][]int64) (shown []map[string]any, moreIDs []int64) {
 	ads, err := store.ActiveDigests()
 	if err != nil || len(ads) == 0 {
 		return nil, nil
@@ -58,7 +64,14 @@ func coldDigestsRecent(store *db.ExplorationStore, cap int) (shown []map[string]
 			Body string `json:"body"`
 		}
 		_ = json.Unmarshal(d.Payload, &p)
-		ms, _ := store.DigestMembers(d.ID) // sorted asc → last = freshest
+		// memberOf carries digest→member-ids precomputed from an edge set the
+		// caller already loaded (covers edges), avoiding one DigestMembers
+		// query per digest; nil falls back to the per-digest read.
+		ms, mok := memberOf[d.ID]
+		if memberOf == nil || !mok {
+			ms, _ = store.DigestMembers(d.ID)
+		}
+		sort.Slice(ms, func(i, j int) bool { return ms[i] < ms[j] }) // sorted asc → last = freshest
 		var fresh int64
 		if len(ms) > 0 {
 			fresh = ms[len(ms)-1]
@@ -141,9 +154,14 @@ func (t *ToolSet) expandDigest() actool.CoreTool {
 			}
 			_ = json.Unmarshal(n.Payload, &p)
 			members, _ := store.DigestMembers(in.ID)
+			memberNodes, _ := store.NodesByIDs(members)
+			nodeByID := make(map[int64]*db.Node, len(memberNodes))
+			for _, mn := range memberNodes {
+				nodeByID[mn.ID] = mn
+			}
 			list := make([]map[string]any, 0, len(members))
 			for _, m := range members {
-				entry := t.digestMemberEntry(store, m)
+				entry := t.digestMemberNodeEntry(m, nodeByID[m])
 				if srcTaskID > 0 { // related task's members: read-only, carry the inherited marker (§2)
 					entry["inherited"] = true
 					entry["source_task_id"] = srcTaskID

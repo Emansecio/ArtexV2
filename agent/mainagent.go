@@ -134,7 +134,9 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(ctx, "mainagent", base)
 	defer cleanup()
+	def = deferBuiltinTools(tools, def, mainagentDeferredBuiltins)
 	// the main run directory <workDir>/tasks/<taskID>/main, created up front.
+
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
 	system, boundary := deferredSystem(mainAgentSystem(goal, m.workDir, mainDir), def)
@@ -220,4 +222,29 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		}
 	})
 	return text, err
+}
+
+// mainagentDeferredBuiltins — rarely-used tools for the main agent; they stay
+// discoverable via SearchExtraTools instead of inflating every turn's schema
+// block (~5-9K tokens of mostly-unused schemas).
+var mainagentDeferredBuiltins = []string{
+	"Write",
+	"Edit",
+	"MultiEdit",
+	"Glob",
+	"Grep",
+	"sleep",
+	"Monitor",
+	"TaskList",
+	"TaskStop",
+	"TaskOutput",
+	"insert_assets",
+	"add_company_scope",
+	"add_task_scope",
+	"list_untested_assets",
+	"report_finding",
+	"record_fact",
+	"expand_digest",
+	"search_all_worker_traces",
+	"get_worker_trace",
 }

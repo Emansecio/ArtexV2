@@ -9,9 +9,8 @@
 // module constants, toasts, non-React helpers) without hooks or re-render plumbing.
 //
 // To translate the UI into another language, add locales/<code>.json and register it below.
-
-import tr from "./locales/tr.json";
-import zhCN from "./locales/zh-CN.json";
+// Dictionaries are served on demand from /locales/<code>.json by I18nBootScript so
+// English sessions pay 0 bytes for unused translations.
 
 export type Locale = "tr" | "en" | "zh-CN";
 
@@ -27,17 +26,18 @@ export const LOCALES: { code: Locale; label: string }[] = [
 
 const STORAGE_KEY = "artex.locale";
 
-const DICTIONARIES: Record<Locale, Record<string, string>> = {
-  tr: tr as Record<string, string>,
-  en: {},
-  "zh-CN": zhCN as Record<string, string>,
-};
-
 const INTL_LOCALES: Record<Locale, string> = {
   tr: "tr-TR",
   en: "en-US",
   "zh-CN": "zh-CN",
 };
+
+function loadRuntimeDict(active: Locale): Record<string, string> {
+  if (active === "en" || typeof window === "undefined") return {};
+  const bag = (window as unknown as { __ARTEX_I18N__?: Record<string, Record<string, string>> }).__ARTEX_I18N__;
+  const d = bag?.[active];
+  return d && typeof d === "object" ? d : {};
+}
 
 function detectLocale(): Locale {
   // Prerendering (static export) has no window: it renders the default locale.
@@ -68,7 +68,7 @@ if (typeof document !== "undefined") document.documentElement.lang = locale;
 /** BCP 47 tag for Intl / toLocaleString calls, e.g. date.toLocaleString(intlLocale). */
 export const intlLocale = INTL_LOCALES[locale];
 
-const dict = DICTIONARIES[locale];
+const dict = loadRuntimeDict(locale);
 
 export type TVars = Record<string, string | number>;
 

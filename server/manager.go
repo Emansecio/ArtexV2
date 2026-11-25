@@ -55,10 +55,9 @@ type Task struct {
 	ActiveLLMProfileID *int64  `json:"active_llm_profile_id,omitempty"`
 	LLMChainRevision   int64   `json:"-"`
 	LLMFailoverState   string  `json:"llm_failover_state,omitempty"`
-	// LLMRotate (#85): per-intent round-robin over the task's LLM chain heads.
+	// LLMRotate (#85): per-intent deterministic pinning over the task's LLM
+	// chain heads.
 	LLMRotate         bool `json:"llm_rotate,omitempty"`
-	rotateMu          sync.Mutex
-	rotateNext        int
 	LLMFailoverReason string  `json:"llm_failover_reason,omitempty"`
 	SourceTaskIDs     []int64 `json:"source_task_ids,omitempty"`
 	CompanyIDs        []int64 `json:"company_ids,omitempty"`
@@ -88,6 +87,12 @@ type Task struct {
 	// a burst into one round, so several may pile up before drainTriggers() clears them.
 	trigMu          sync.Mutex
 	pendingTriggers []agent.TriggerEvent
+
+	// goalsGate, when non-nil, holds the planner loop until round-0 goal
+	// decomposition finishes — a seeded-intent task starts its workers on the
+	// seed while the LLM decomposes goals in parallel (closed = goals ready).
+	// Written once before engine.Run starts the loops; read only via channel.
+	goalsGate chan struct{}
 }
 
 // taskLifecycleState is an internally consistent view of the mutable task
@@ -195,22 +200,20 @@ func (t *Task) llmStateSnapshot() taskLLMState {
 	}
 }
 
-// nextRotatedProfile returns the chain head for the NEXT claimed worker
-// intent under per-intent rotation (#85): strict round-robin over the task's
-// chain. The active head stays authoritative for every non-worker role and for
+// nextRotatedProfile returns the chain head pinned to a worker intent under
+// per-intent rotation (#85): keyed deterministically by intent id so a resumed,
+// retried or human-messaged intent lands on the same profile (its warm
+// conversation cache) instead of advancing a mutable round-robin cursor.
+// The active head stays authoritative for every non-worker role and for
 // failover ordering; rotation only distributes worker lanes across heads.
-func (t *Task) nextRotatedProfile() (int64, bool) {
+func (t *Task) nextRotatedProfile(intentID int64) (int64, bool) {
 	t.llmMu.RLock()
 	defer t.llmMu.RUnlock()
-	t.rotateMu.Lock()
-	defer t.rotateMu.Unlock()
 	ids := t.LLMProfileIDs
 	if !t.LLMRotate || len(ids) == 0 {
 		return 0, false
 	}
-	pick := ids[t.rotateNext%len(ids)]
-	t.rotateNext++
-	return pick, true
+	return ids[int(intentID%int64(len(ids)))], true
 }
 
 func (t *Task) setLLMState(profileID, activeID *int64, profileIDs []int64, revision int64, state, reason string, rotate ...bool) bool {
@@ -297,6 +300,12 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+
+	// schedWake nudges the P3 trigger scheduler into an immediate step —
+	// wired by the Server when it starts the scheduler (nil without pg). The
+	// events it tracks (terminal task status, findings, met goals, tool calls,
+	// task creates) call wakeScheduler so they fire in ms, not next 30s tick.
+	schedWake func()
 }
 
 // Settings keys the UI toggles at runtime.
@@ -943,6 +952,7 @@ func (m *Manager) Close() error {
 	if m.traffic != nil {
 		m.traffic.Close()
 	}
+	flushUsageLedger(m.pg)
 	return m.pg.Close()
 }
 
@@ -1082,6 +1092,7 @@ func (m *Manager) CreateTaskWithOptions(description, goal string, opts pgdb.Task
 	m.tasks[t.ID] = t
 	m.active = t.ID
 	m.mu.Unlock()
+	m.wakeScheduler() // on_task_create event triggers + queued-slot reconcile
 	return t, nil
 }
 
@@ -1594,6 +1605,7 @@ func (m *Manager) SetTaskStatusGuarded(id, status, endReason string) (won bool, 
 	}
 	m.mu.Unlock()
 	m.extractLessons(n)
+	m.wakeScheduler() // a slot freed / task_timeout fired: reconcile + step now
 	return true, nil
 }
 
@@ -1627,6 +1639,7 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 	m.mu.Unlock()
 	if pgdb.IsTerminal(status) {
 		m.extractLessons(n)
+		m.wakeScheduler() // a slot freed / task_timeout fired: reconcile + step now
 	}
 	return nil
 }
@@ -2096,4 +2109,30 @@ func (t *Task) drainTriggers() []agent.TriggerEvent {
 	ev := t.pendingTriggers
 	t.pendingTriggers = nil
 	return ev
+}
+
+// wakeScheduler nudges the P3 trigger scheduler into an immediate step when the
+// Server wired one. Called on every event the scheduler's watermarks track —
+// terminal task status (on_task_timeout + queued-task slot promotion), findings
+// (via emitActivity tool_result), met goals, tool calls, and task creates.
+func (m *Manager) wakeScheduler() {
+	if m != nil && m.schedWake != nil {
+		m.schedWake()
+	}
+}
+
+// hasUrgentTrigger reports whether any pending trigger demands a real planning
+// round NOW — findings, goal add/edit/delete, hints and intent cancels all carry
+// decisions the planner must see (a "finding" may mean "prove the goal and stop
+// the other workers"; a "goal_edited" changes what the plan aims at). Only a
+// routine worker "done" wake may be quiet-skipped or debounce-coalesced.
+func (t *Task) hasUrgentTrigger() bool {
+	t.trigMu.Lock()
+	defer t.trigMu.Unlock()
+	for _, ev := range t.pendingTriggers {
+		if ev.Kind != "done" {
+			return true
+		}
+	}
+	return false
 }

@@ -167,6 +167,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	ctx = WithRunInfo(ctx, RunInfo{SessionID: sessionID})
 	tools, def, cleanup := AugmentTools(ctx, agentKey, base)
 	defer cleanup()
+	def = deferBuiltinTools(tools, def, chatDeferredBuiltins)
 
 	system, boundary := deferredSystem(chatSystem(agentKey, c.workDir, sessionWorkDir), def)
 	opts := agentcore.Options{
@@ -246,4 +247,22 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		}
 	})
 	return text, err
+}
+
+// chatDeferredBuiltins — rarely-used tools for chat agents; they stay
+// discoverable via SearchExtraTools instead of inflating every turn's schema
+// block (Auto also defers its rare admin tools).
+var chatDeferredBuiltins = []string{
+	"Monitor",
+	"TaskList",
+	"TaskStop",
+	"TaskOutput",
+	"sleep",
+	"MultiEdit",
+	"delete_assets_by_host",
+	"create_mcp",
+	"update_mcp",
+	"create_custom_tool",
+	"update_custom_tool",
+	"install_skill",
 }

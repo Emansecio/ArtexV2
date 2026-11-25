@@ -222,7 +222,11 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 		}
 		resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/v1/messages", body, func(r *http.Request) {
 			r.Header.Set("content-type", "application/json")
-			r.Header.Set("x-api-key", p.cfg.APIKey)
+			if p.cfg.UseBearerAuth {
+				r.Header.Set("authorization", "Bearer "+p.cfg.APIKey)
+			} else {
+				r.Header.Set("x-api-key", p.cfg.APIKey)
+			}
 			r.Header.Set("anthropic-version", p.cfg.APIVersion)
 			r.Header.Set("accept", "text/event-stream")
 		}, "anthropic")
@@ -270,7 +274,11 @@ func (p *anthropicProvider) Complete(ctx context.Context, req CompletionRequest)
 	}
 	resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/v1/messages", body, func(r *http.Request) {
 		r.Header.Set("content-type", "application/json")
-		r.Header.Set("x-api-key", p.cfg.APIKey)
+		if p.cfg.UseBearerAuth {
+			r.Header.Set("authorization", "Bearer "+p.cfg.APIKey)
+		} else {
+			r.Header.Set("x-api-key", p.cfg.APIKey)
+		}
 		r.Header.Set("anthropic-version", p.cfg.APIVersion)
 		r.Header.Set("accept", "application/json")
 	}, "anthropic")

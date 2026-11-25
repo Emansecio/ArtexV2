@@ -218,9 +218,11 @@ func (s *Session) View(msgs []llm.Message) []llm.Message {
 	// Check the request actually sent and, past 70% of the window, trim
 	// outgoing tool-result copies: this also bounds a model that ignores
 	// Compress. Originals, call arguments and tool pairing are untouched.
-	if limit := cfg.ModelContextLimit; limit > 0 && estimateMessages(out) > limit*7/10 {
+	// Hysteresis: trim at 75% down to 60% so consecutive turns don't each
+	// re-trim one message back into the early prefix (per-turn cache misses).
+	if limit := cfg.ModelContextLimit; limit > 0 && estimateMessages(out) > limit*3/4 {
 		var trimmed int
-		view, trimmed = boundToolCopies(view, limit*7/10, func(v []noa.CoreMessage) int {
+		view, trimmed = boundToolCopies(view, limit*3/5, func(v []noa.CoreMessage) int {
 			return estimateMessages(Reassemble(v, msgs, sc, opts))
 		})
 		if trimmed > 0 {

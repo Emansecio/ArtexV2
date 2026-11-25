@@ -181,6 +181,7 @@ func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
 			}
 		}
 		cancel()
+		usageWG.Wait() // usage row writes are async since the bounded queue landed
 		var count, input, output int
 		var worker, status string
 		err = pg.QueryRow(`SELECT count(*),max(input_tokens),max(output_tokens),max(worker),max(status)

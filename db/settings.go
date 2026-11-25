@@ -8,11 +8,25 @@ import (
 // Settings is a tiny key-value store for global app config the UI toggles at
 // runtime (e.g. traffic_capture). Missing keys fall back to caller defaults.
 
+// settingEntry is the cached (decrypted) result of one settings row lookup.
+type settingEntry struct {
+	value string
+	ok    bool
+}
+
 // GetSetting returns the stored value and ok=false when the key is unset. A
-// secret setting (secretSettingKeys) is decrypted.
+// secret setting (secretSettingKeys) is decrypted. Results are cached briefly
+// (configCacheTTL) — settings are read on every agent run but written rarely;
+// SetSetting/InsertSettingIfAbsent/RotatePassword/InsertPassword invalidate.
 func (d *DB) GetSetting(key string) (value string, ok bool, err error) {
+	cacheKey := "set:" + key
+	if v, hit := d.cfgRef().get(cacheKey); hit {
+		e := v.(settingEntry)
+		return e.value, e.ok, nil
+	}
 	err = d.QueryRow(`SELECT value FROM settings WHERE key=$1`, key).Scan(&value)
 	if err == sql.ErrNoRows {
+		d.cfgRef().put(cacheKey, settingEntry{})
 		return "", false, nil
 	}
 	if err != nil {
@@ -23,6 +37,7 @@ func (d *DB) GetSetting(key string) (value string, ok bool, err error) {
 			return "", false, err
 		}
 	}
+	d.cfgRef().put(cacheKey, settingEntry{value: value, ok: true})
 	return value, true, nil
 }
 
@@ -43,6 +58,9 @@ func (d *DB) SetSetting(key, value string) error {
 	_, err = d.Exec(`
 INSERT INTO settings(key, value) VALUES ($1, $2)
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, key, value)
+	if err == nil {
+		d.cfgRef().drop("set:" + key)
+	}
 	return err
 }
 
@@ -65,6 +83,9 @@ ON CONFLICT (key) DO NOTHING`, key, value)
 	n, err := res.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	if n > 0 {
+		d.cfgRef().drop("set:" + key)
 	}
 	return n > 0, nil
 }
@@ -102,6 +123,7 @@ RETURNING value`, versionKey).Scan(&raw); err != nil {
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	d.cfgRef().drop("set:"+hashKey, "set:"+versionKey)
 	return n, nil
 }
 
@@ -139,6 +161,7 @@ ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, ver
 	if err := tx.Commit(); err != nil {
 		return 0, false, err
 	}
+	d.cfgRef().drop("set:"+hashKey, "set:"+versionKey)
 	return 1, true, nil
 }
 

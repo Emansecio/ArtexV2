@@ -77,6 +77,7 @@ WHERE key=$1 AND system AND NOT(COALESCE(schema->'properties','{}'::jsonb) ? $2)
 		}
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
+	s.m.pg.InvalidateToolCache()
 }
 
 func (s *Server) registerFindingTraffic(mux *http.ServeMux) {

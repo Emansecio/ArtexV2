@@ -1,11 +1,16 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import * as React from "react";
 
-import { ExplorationGraph } from "@/components/exploration-graph";
 import { api } from "@/lib/api";
 import type { Edge, TaskNode } from "@/lib/types";
 import { t } from "@/i18n";
+
+const ExplorationGraph = dynamic(
+  () => import("@/components/exploration-graph").then((m) => m.ExplorationGraph),
+  { ssr: false, loading: () => <div className="flex h-[68vh] items-center justify-center text-xs text-muted-foreground">…</div> },
+);
 
 // FindingLineageView renders the exploration sub-graph from the task's initial
 // node down to this finding's node — the same exploration graph canvas as the task graph,

@@ -254,6 +254,9 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, err.Error())
 		return
 	}
+	// Commit queued usage-ledger writes before the cascade can remove their
+	// task row — the async recorder must not outlive its FK target.
+	flushUsageLedger(s.m.pg)
 	result, err := s.m.DeleteTask(id, opts)
 	if err != nil {
 		var committed *taskDeleteCommittedError
@@ -2579,8 +2582,21 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	provider := strings.TrimSpace(req.Provider)
-	// Ollama serves its model list keyless on the local server: no key gate.
-	if apiKey == "" && provider != "ollama" {
+	// Resolve live OAuth access tokens for subscription-backed providers.
+	if provider == "chatgpt" || provider == "anthropic-oauth" {
+		oauthProv := "chatgpt"
+		if provider == "anthropic-oauth" {
+			oauthProv = "anthropic"
+		}
+		tok, err := s.ensureOAuth().AccessToken(r.Context(), oauthProv, false)
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		apiKey = tok
+	}
+	// Ollama and OpenCode public model lists run keyless; other cloud formats need a key.
+	if apiKey == "" && provider != "ollama" && provider != "opencode-zen" && provider != "opencode-go" {
 		msg := "no API Key provided"
 		if withheld {
 			msg = "no API Key provided: the saved key is only sent to the endpoint it was saved for; enter the key to list models from a different base URL or provider"
@@ -2615,14 +2631,37 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 
 	var candidates []candidate
 	switch provider {
-	case "openai", "openai-responses":
-		// Responses API shares the OpenAI model list at /v1/models; tolerate a full
-		// endpoint URL of either format.
+	case "openai", "openai-responses", "chatgpt":
+		// Responses API and Sign in with ChatGPT share the OpenAI model list at /v1/models.
 		if baseURL == "" {
 			baseURL = "https://api.openai.com/v1"
 		}
 		b := strings.TrimRight(strings.TrimSuffix(strings.TrimSuffix(baseURL, "/chat/completions"), "/responses"), "/")
 		candidates = append(candidates, candidate{b + "/models", bearerHdr()})
+	case "opencode-zen", "opencode-go":
+		if baseURL == "" {
+			if provider == "opencode-go" {
+				baseURL = agent.DefaultOpenCodeGoBaseURL
+			} else {
+				baseURL = agent.DefaultOpenCodeZenBaseURL
+			}
+		}
+		b := strings.TrimRight(strings.TrimSuffix(strings.TrimSuffix(baseURL, "/chat/completions"), "/responses"), "/")
+		hdr := http.Header{}
+		if apiKey != "" {
+			hdr.Set("Authorization", "Bearer "+apiKey)
+		}
+		candidates = append(candidates, candidate{b + "/models", hdr})
+	case "anthropic-oauth":
+		if baseURL == "" {
+			baseURL = "https://api.anthropic.com"
+		}
+		b := strings.TrimRight(strings.TrimSuffix(baseURL, "/v1/messages"), "/")
+		hdr := http.Header{}
+		hdr.Set("Authorization", "Bearer "+apiKey)
+		hdr.Set("anthropic-version", "2023-06-01")
+		hdr.Set("anthropic-beta", "oauth-2025-04-20")
+		candidates = append(candidates, candidate{b + "/v1/models", hdr})
 	case "ollama":
 		// OpenAI-compatible list at {base}/v1/models. Tolerate base URLs with or
 		// without the /v1 suffix (and a full endpoint URL). No auth needed; when a

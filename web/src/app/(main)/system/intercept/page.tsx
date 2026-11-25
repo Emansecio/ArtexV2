@@ -639,7 +639,7 @@ export default function InterceptPage() {
   // ---- render ----
 
   return (
-    <div className="flex flex-1 flex-col gap-5 p-6">
+    <div className="flex flex-1 flex-col gap-5">
 
       {/* ---- header ---- */}
       <div className="flex items-center gap-2.5">

@@ -26,6 +26,9 @@ type SummaryOptions struct {
 	MaxOutputTokens int
 	NonStreaming    bool
 	Prompt          string // optional override for compactPrompt
+	// SessionPrefixFn, when set, resolves the live session's request prefix at
+	// call time (see SessionPrefix). Nil → legacy standalone summary request.
+	SessionPrefixFn func() *SessionPrefix
 }
 
 // ProviderSummarizer builds a Summarizer backed by an llm.Provider. It replays
@@ -41,6 +44,19 @@ func ProviderSummarizer(p llm.Provider, maxOutputTokens int, nonStreaming bool) 
 	})
 }
 
+// SessionPrefix carries the live session's request prefix so the summarization
+// call can fork the warm prompt cache instead of paying 100% uncached input on
+// the whole history ([tools, system, reminder, head-messages] must match the
+// session's wire bytes to hit). Set only when the summarizer runs on the same
+// provider/model as the session.
+type SessionPrefix struct {
+	Tools           []llm.ToolSchema
+	System          []string
+	DynamicBoundary int
+	PromptCacheKey  string
+	SystemReminder  string
+}
+
 // ProviderSummarizerWithOptions builds a Summarizer with optional prompt and
 // token cap overrides.
 func ProviderSummarizerWithOptions(p llm.Provider, opts SummaryOptions) Summarizer {
@@ -54,9 +70,13 @@ func ProviderSummarizerWithOptions(p llm.Provider, opts SummaryOptions) Summariz
 	}
 	return func(ctx context.Context, msgs []llm.Message) (string, error) {
 		work := pairForReplay(msgs)
+		var fork *SessionPrefix
+		if opts.SessionPrefixFn != nil {
+			fork = opts.SessionPrefixFn()
+		}
 		var lastErr error
 		for attempt := 0; attempt <= maxPTLRetries; attempt++ {
-			raw, err := streamSummary(ctx, p, maxOut, work, opts.NonStreaming, prompt)
+			raw, err := streamSummary(ctx, p, maxOut, work, opts.NonStreaming, prompt, fork)
 			if err == nil {
 				return formatCompactSummary(raw), nil
 			}
@@ -77,11 +97,14 @@ func ProviderSummarizerWithOptions(p llm.Provider, opts SummaryOptions) Summariz
 // streamSummary issues one summary request (head + summary-request message),
 // retrying transient (non-overflow) stream failures. Overflow is returned
 // immediately so the caller can truncate and retry at a coarser granularity.
-func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.Message, nonStreaming bool, prompt string) (string, error) {
+func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.Message, nonStreaming bool, prompt string, fork *SessionPrefix) (string, error) {
 	if prompt == "" {
 		prompt = compactPrompt
 	}
-	reqMsgs := make([]llm.Message, 0, len(head)+1)
+	reqMsgs := make([]llm.Message, 0, len(head)+2)
+	if fork != nil && fork.SystemReminder != "" {
+		reqMsgs = append(reqMsgs, llm.UserText(fork.SystemReminder))
+	}
 	reqMsgs = append(reqMsgs, head...)
 	reqMsgs = append(reqMsgs, llm.UserText(prompt))
 	req := llm.CompletionRequest{
@@ -89,6 +112,16 @@ func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.M
 		Messages:  reqMsgs,
 		MaxTokens: maxOut,
 		Thinking:  "disabled",
+	}
+	if fork != nil {
+		// Cache-fork: send the session's exact tools/system/cache key so the
+		// shared prefix ([tools, system]) hits the warm prompt cache; the
+		// summary instructions ride after the dynamic boundary.
+		sys := append([]string(nil), fork.System...)
+		req.System = append(sys, summarySystemPrompt)
+		req.DynamicBoundary = fork.DynamicBoundary
+		req.Tools = fork.Tools
+		req.PromptCacheKey = fork.PromptCacheKey
 	}
 	var lastErr error
 	for range maxStreamingRetries {

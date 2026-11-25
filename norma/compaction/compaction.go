@@ -22,6 +22,7 @@ package compaction
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"strings"
 	"sync"
@@ -81,6 +82,8 @@ func (c *Config) defaults() {
 var compactableTools = map[string]bool{
 	"Read": true, "Bash": true, "Grep": true, "Glob": true,
 	"WebFetch": true, "WebSearch": true, "Edit": true, "Write": true,
+	// Actual wire names (the tools above use the built-in registry naming).
+	"web_search": true, "SearchExtraTools": true, "shell_send": true,
 }
 
 const (
@@ -133,6 +136,24 @@ func (c *Compactor) isCompactableTool(name string) bool {
 		return c.compactable[name]
 	}
 	return compactableTools[name]
+}
+
+// isCompactableUse resolves the effective tool name for a tool_use block:
+// deferred built-ins and MCP tools invoked through ExecuteExtraTool report
+// their inner tool_name, and MCP results (mcp__server__tool) are always
+// re-fetchable read payloads, so they are compactable by construction.
+func (c *Compactor) isCompactableUse(b llm.ContentBlock) bool {
+	name := b.Name
+	if name == "ExecuteExtraTool" {
+		var in struct {
+			ToolName string `json:"tool_name"`
+		}
+		if err := json.Unmarshal(b.Input, &in); err != nil || in.ToolName == "" {
+			return false
+		}
+		name = in.ToolName
+	}
+	return c.isCompactableTool(name) || strings.HasPrefix(name, "mcp__")
 }
 
 // --- threshold math ---
@@ -259,7 +280,10 @@ func (c *Compactor) Pre(ctx context.Context, msgs []llm.Message, lastInputTokens
 			}
 		}
 	} else if c.cfg.SpeculativePreCompact && !c.tripped && c.summarize != nil {
-		if tok >= int(float64(c.autoThreshold())*0.80) {
+		// 0.90 (not 0.80): speculative summarization is a full-context LLM
+		// call — starting it at 80% burned a mostly-discarded summary on runs
+		// that finished before ever reaching autoThreshold.
+		if tok >= int(float64(c.autoThreshold())*0.90) {
 			c.maybeStartSpeculative(ctx, msgs)
 		}
 	}
@@ -397,7 +421,7 @@ func (c *Compactor) microCompactWithFlush(msgs []llm.Message, forceFlush bool) (
 	var ids []string
 	for _, m := range msgs[start:] {
 		for _, b := range m.Content {
-			if b.Type == llm.BlockToolUse && c.isCompactableTool(b.Name) {
+			if b.Type == llm.BlockToolUse && c.isCompactableUse(b) {
 				ids = append(ids, b.ID)
 			}
 		}

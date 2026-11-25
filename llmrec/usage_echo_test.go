@@ -103,6 +103,7 @@ func TestStreamUsageEchoLedgerRow(t *testing.T) {
 			profile := "usage-echo-" + uuid.NewString()
 			t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM llm_usage WHERE profile_name=$1`, profile) })
 			drainRecorderStream(t, t.Context(), Wrap(echoStreamProvider{start: tc.start, delta: tc.delta}, pg, "fixture", profile, "", "", func() bool { return false }))
+			usageWG.Wait() // usage row writes are async since the bounded queue landed
 			var rows int
 			var got llm.Usage
 			err := pg.QueryRow(`SELECT count(*), COALESCE(sum(input_tokens),0), COALESCE(sum(output_tokens),0), COALESCE(sum(cache_read),0), COALESCE(sum(cache_write),0)

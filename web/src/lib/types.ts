@@ -1243,6 +1243,22 @@ export interface LLMPoolStatus {
   chain: LLMPoolMember[];
 }
 
+export interface OAuthProviderStatus {
+  provider: "chatgpt" | "anthropic";
+  connected: boolean;
+  pending: boolean;
+  account_hint?: string;
+  expires_at?: number;
+  last_error?: string;
+}
+
+export interface OAuthStartResult {
+  provider: string;
+  auth_url: string;
+  redirect_uri: string;
+  state: string;
+}
+
 // ---- Agents ----
 export interface Agent {
   id: string;

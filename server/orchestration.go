@@ -44,7 +44,7 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
 	tools = append(tools, s.platformTools()...) // platform operation tools (create/edit skills/tools/MCP, for Auto)
-	custom, err := s.customTools()
+	custom, customToolRows, err := s.customToolsAndRows()
 	if err != nil {
 		log.Printf("[custom-tool] load failed: %v", err)
 		return tools, nil
@@ -54,8 +54,7 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	// name into a deferred entry only for agents it's actually bound to (so we don't
 	// advertise a tool the per-agent binding will drop from the callable set).
 	deferred := map[string][]string{}
-	rows, _ := s.m.pg.ListCustomTools()
-	for _, t := range rows {
+	for _, t := range customToolRows {
 		if t.Deferred && t.Enabled {
 			deferred[t.Key] = t.Agents
 		}
@@ -622,6 +621,8 @@ WHERE key='record_fact' AND system AND (schema->'properties'->'facts'->'items') 
   AND NOT(COALESCE(schema->'properties'->'facts'->'items'->'properties','{}'::jsonb) ? 'source')`, string(itemProps["source"]))
 		if err != nil {
 			log.Printf("[facts] upgrade record_fact.source: %v", err)
+		} else {
+			s.m.pg.InvalidateToolCache()
 		}
 		return
 	}
@@ -650,6 +651,8 @@ func (s *Server) seedTaskScopeDescription() {
 WHERE key='add_task_scope' AND system AND description=$2`, seed.Desc, oldTaskScopeDescription)
 		if err != nil {
 			log.Printf("[tools] upgrade add_task_scope description: %v", err)
+		} else {
+			s.m.pg.InvalidateToolCache()
 		}
 		return
 	}
@@ -1057,7 +1060,9 @@ func (s *Server) seedTaskCredentialBindings() {
 func (s *Server) healListTaskCredentialsSchema() {
 	if _, err := s.m.pg.Exec(`UPDATE tools SET schema = schema - 'required', updated_at=now() WHERE key='list_task_credentials' AND schema->'required' = '[""]'::jsonb`); err != nil {
 		log.Printf("[tools] heal list_task_credentials schema failed: %v", err)
+		return
 	}
+	s.m.pg.InvalidateToolCache()
 }
 
 func (s *Server) seedWorkerReadbackRebind() {

@@ -12,6 +12,7 @@
 package intercept
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 // ctxKey is the unexported context key type to avoid collisions.
@@ -114,14 +116,22 @@ func TargetScopeFromContext(ctx context.Context) (s TargetScope, ok bool) {
 // and the argv tokens pre-parsed (nil for non-argv rules).
 type compiledRule struct {
 	db.InterceptRule
-	re   *regexp.Regexp
-	argv []string
+	re           *regexp.Regexp
+	argv         []string
+	patternB     []byte // precomputed []byte(Pattern) for literal tool_input rules
+	configDigest string // digest of the rule JSON, computed once at compile
 }
 
 // compileRule prepares a rule for matching. ok is false for a rule whose
 // pattern does not compile; such a rule is skipped rather than crashing.
 func compileRule(r db.InterceptRule) (compiledRule, bool) {
 	cr := compiledRule{InterceptRule: r}
+	if configJSON, err := json.Marshal(r); err == nil {
+		cr.configDigest = digestInput(configJSON)
+	}
+	if r.MatchType == "" || r.MatchType == "contains" {
+		cr.patternB = []byte(r.Pattern)
+	}
 	switch r.MatchType {
 	case "regex":
 		re, err := regexp.Compile(r.Pattern)
@@ -205,6 +215,7 @@ type Interceptor struct {
 	mu           sync.RWMutex
 	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
 	enabledTools map[string]bool // nil means not loaded yet
+	judgeCfg     *JudgeConfig    // nil = not resolved yet; dropped on Invalidate/SetJudgeConfig
 	pending      *pendingManager
 	reviewer     Reviewer  // nil = freeform LLM fallback judge not wired
 	completer    Completer // nil = closed-question judge not wired
@@ -286,6 +297,7 @@ func (i *Interceptor) Invalidate() {
 	i.mu.Lock()
 	i.cached = nil
 	i.enabledTools = nil
+	i.judgeCfg = nil
 	i.mu.Unlock()
 }
 
@@ -469,10 +481,29 @@ type JudgeConfig struct {
 	AskTimeoutAction  string `json:"ask_timeout_action"` // allow|deny
 }
 
-// judgeConfig reads the judge configuration from settings, applying defaults for
-// missing/invalid keys. Read fresh on each fallback judgement — the LLM call that
-// follows dwarfs a few KV reads, and freshness avoids a cache-invalidation path.
+// judgeConfig returns the resolved judge configuration, cached on the
+// interceptor: Judge() runs it on EVERY unmatched enabled tool call, and the 8
+// sequential settings reads it used to do are pure overhead when the judge is
+// off (the default). Every llm_judge_* writer goes through SetJudgeConfig, and
+// Invalidate() drops it alongside the rule cache.
 func (i *Interceptor) judgeConfig() JudgeConfig {
+	i.mu.RLock()
+	if i.judgeCfg != nil {
+		c := *i.judgeCfg
+		i.mu.RUnlock()
+		return c
+	}
+	i.mu.RUnlock()
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.judgeCfg == nil {
+		c := i.resolveJudgeConfig()
+		i.judgeCfg = &c
+	}
+	return *i.judgeCfg
+}
+
+func (i *Interceptor) resolveJudgeConfig() JudgeConfig {
 	c := JudgeConfig{
 		Enabled:           i.db.GetBool(settingJudgeEnabled, false),
 		Mode:              i.getSettingChoice(settingJudgeMode, JudgeModeClosed, JudgeModeClosed, JudgeModeFreeform),
@@ -561,6 +592,9 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	if err := i.db.SetSetting(settingJudgeAskTimeoutAction, c.AskTimeoutAction); err != nil {
 		return err
 	}
+	i.mu.Lock()
+	i.judgeCfg = nil
+	i.mu.Unlock()
 	return nil
 }
 
@@ -682,15 +716,15 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	if err != nil || len(rules) == 0 {
 		return Decision{}, false
 	}
+	var st matchState
 	for _, r := range rules {
-		if ruleMatches(r, toolName, input) {
+		if ruleMatches(r, toolName, input, &st) {
 			msg := r.Message
 			if msg == "" {
 				msg = defaultMessage(r.Action, r.Name)
 			}
-			configJSON, _ := json.Marshal(r.InterceptRule)
 			return Decision{
-				RuleName: r.Name, ConfigDigest: digestInput(configJSON),
+				RuleName: r.Name, ConfigDigest: r.configDigest,
 				Action:         r.Action,
 				Message:        msg,
 				RuleID:         r.ID,
@@ -727,17 +761,17 @@ func (i *Interceptor) MatchBuiltin(toolName string, input []byte) (Decision, boo
 	if err != nil {
 		return Decision{}, false
 	}
+	var st matchState
 	for _, r := range rules {
-		if r.Action != "deny" || !strings.HasPrefix(r.Name, builtinRulePrefix) || !ruleMatches(r, toolName, input) {
+		if r.Action != "deny" || !strings.HasPrefix(r.Name, builtinRulePrefix) || !ruleMatches(r, toolName, input, &st) {
 			continue
 		}
 		msg := r.Message
 		if msg == "" {
 			msg = defaultMessage(r.Action, r.Name)
 		}
-		configJSON, _ := json.Marshal(r.InterceptRule)
 		return Decision{
-			RuleName: r.Name, ConfigDigest: digestInput(configJSON),
+			RuleName: r.Name, ConfigDigest: r.configDigest,
 			Action:  r.Action,
 			Message: msg,
 			RuleID:  r.ID,
@@ -771,37 +805,110 @@ func (i *Interceptor) SetRulesForTest(rules []db.InterceptRule) {
 	i.mu.Unlock()
 }
 
-func ruleMatches(r compiledRule, toolName string, input []byte) bool {
+// matchState caches the decoded Bash command, its derived prefix, and its
+// parsed AST across the rules of a single Match call, so argv rules do not
+// re-unmarshal and re-parse the same input once per rule.
+type matchState struct {
+	done      bool
+	cmd       string
+	prefix    []string
+	prefixErr bool
+	file      *syntax.File
+	fileErr   bool
+}
+
+func (s *matchState) load(toolName string, input []byte) {
+	if s.done {
+		return
+	}
+	s.done = true
+	if toolName != "Bash" {
+		return
+	}
+	var in struct {
+		Command string `json:"command"`
+	}
+	if json.Unmarshal(input, &in) != nil || strings.TrimSpace(in.Command) == "" {
+		return
+	}
+	s.cmd = in.Command
+}
+
+func (s *matchState) prefixMatches(tokens []string) bool {
+	if len(tokens) == 0 {
+		return false
+	}
+	if s.prefix == nil && !s.prefixErr {
+		s.prefix, _ = ArgvPrefix(s.cmd)
+		if s.prefix == nil {
+			s.prefixErr = true
+		}
+	}
+	if len(s.prefix) != len(tokens) {
+		return false
+	}
+	for i := range s.prefix {
+		if s.prefix[i] != tokens[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *matchState) compoundMatches(tokens []string) bool {
+	if len(tokens) == 0 {
+		return false
+	}
+	if s.file == nil && !s.fileErr {
+		f, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(s.cmd), "")
+		if err != nil {
+			s.fileErr = true
+			return false
+		}
+		s.file = f
+	}
+	if s.file == nil {
+		return false
+	}
+	return bashFileMatchesArgv(tokens, s.file, 0)
+}
+
+func ruleMatches(r compiledRule, toolName string, input []byte, st *matchState) bool {
 	if r.MatchType == "argv" {
 		// Bash only, on the parsed command; match_target is always tool_input.
 		// Allow rules stay strictly limited to a single simple command with
 		// exact derived prefix and denylist enforcement. Deny and ask rules
 		// walk every call in a compound Bash command, stripping known wrappers
 		// and recursing into eval / shell -c payloads.
+		st.load(toolName, input)
+		if st.cmd == "" {
+			return false
+		}
 		if r.Action == "allow" {
 			if CheckArgvAllow(r.argv) != nil {
 				return false
 			}
-			return r.MatchTarget == "tool_input" && argvRuleMatches(r.argv, toolName, input)
+			return r.MatchTarget == "tool_input" && st.prefixMatches(r.argv)
 		}
 		if r.Action == "deny" || r.Action == "ask" {
-			return r.MatchTarget == "tool_input" && argvCompoundMatches(r.argv, toolName, input)
+			return r.MatchTarget == "tool_input" && st.compoundMatches(r.argv)
 		}
 		return false
 	}
-	var subject string
 	switch r.MatchTarget {
 	case "tool_name":
-		subject = toolName
+		if r.MatchType == "regex" {
+			return r.re != nil && r.re.MatchString(toolName)
+		}
+		return strings.Contains(toolName, r.Pattern)
 	case "tool_input":
-		subject = string(input)
+		if r.MatchType == "regex" {
+			return r.re != nil && r.re.Match(input)
+		}
+		return bytes.Contains(input, r.patternB)
 	default:
 		return false
 	}
-	if r.MatchType == "regex" {
-		return r.re != nil && r.re.MatchString(subject)
-	}
-	return strings.Contains(subject, r.Pattern)
 }
 
 func defaultMessage(action, name string) string {

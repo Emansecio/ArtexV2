@@ -2,6 +2,7 @@
 
 import * as React from "react";
 
+import dynamic from "next/dynamic";
 import Link from "next/link";
 
 import {
@@ -9,18 +10,21 @@ import {
   ArrowUpRightIcon,
   BugIcon,
   ClockIcon,
+  MessageSquareIcon,
   NetworkIcon,
+  PlusIcon,
+  ShieldAlertIcon,
   ShieldCheckIcon,
   TargetIcon,
   ZapIcon,
 } from "lucide-react";
-import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
 import { Progress } from "@/components/ui/progress";
+import { Skeleton } from "@/components/ui/skeleton";
 import { api } from "@/lib/api";
 import type {
   Activity,
@@ -45,11 +49,16 @@ import { setVisibleInterval } from "@/lib/polling";
 
 // ── chart constants ───────────────────────────────────────────────────────────
 
+const DailyTrendChart = dynamic(
+  () => import("./_components/daily-trend-chart").then((m) => m.DailyTrendChart),
+  { ssr: false, loading: () => <Skeleton className="h-[200px] w-full" /> },
+);
+
 const dailyTrendConfig = {
   input: { label: t("Input"), color: "hsl(217 91% 60%)" },
   output: { label: t("Output"), color: "hsl(263 70% 60%)" },
   cacheRead: { label: t("Cache read"), color: "hsl(160 60% 45%)" },
-} satisfies ChartConfig;
+};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -106,7 +115,7 @@ function statusBg(code: number): string {
 // ── sub-components ────────────────────────────────────────────────────────────
 
 function LiveDot({ className }: { className?: string }) {
-  return <span className={cn("inline-block size-1.5 shrink-0 animate-pulse rounded-full bg-blue-400", className)} />;
+  return <span className={cn("inline-block size-1.5 shrink-0 motion-safe:animate-pulse rounded-full bg-blue-400", className)} />;
 }
 
 function SectionTitle({
@@ -135,6 +144,7 @@ export default function DashboardPage() {
   // data state
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [findings, setFindings] = React.useState<Finding[]>([]);
+  const [findingTotal, setFindingTotal] = React.useState<number | null>(null);
   const [findingSev, setFindingSev] = React.useState<Record<string, number>>({});
   const [stats, setStats] = React.useState<Stats | null>(null);
   const [settings, setSettings] = React.useState<Settings | null>(null);
@@ -150,6 +160,8 @@ export default function DashboardPage() {
   const [skills, setSkills] = React.useState<SkillItem[]>([]);
   const [tools, setTools] = React.useState<Tool[]>([]);
   const [llmProfiles, setLLMProfiles] = React.useState<LLMProfile[]>([]);
+  const [loaded, setLoaded] = React.useState(false);
+  const [tasksLoaded, setTasksLoaded] = React.useState(false);
 
   // The task list is the most expensive dashboard source. Poll it independently
   // so a large history cannot hold back every other dashboard panel.
@@ -167,6 +179,7 @@ export default function DashboardPage() {
         /* transient errors — next poll retries */
       } finally {
         loading = false;
+        if (alive) setTasksLoaded(true);
       }
     };
     void load();
@@ -196,6 +209,7 @@ export default function DashboardPage() {
         ]);
         if (!alive) return;
         setFindings(fPage.items ?? []);
+        setFindingTotal(fStats?.total ?? fPage.total ?? (fPage.items?.length ?? 0));
         if (fStats) {
           setFindingSev({
             critical: fStats.critical ?? 0,
@@ -214,6 +228,7 @@ export default function DashboardPage() {
         // Preserve stale data and retry on the next interval.
       } finally {
         loading = false;
+        if (alive) setLoaded(true);
       }
     };
     void load();
@@ -523,106 +538,269 @@ export default function DashboardPage() {
   return (
     <div className="flex flex-1 flex-col gap-4 pb-6">
       {/* ── Header ── */}
-      <div>
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-semibold tracking-tight">{t("Overview")}</h1>
+          <h1 className="text-xl font-semibold tracking-tight">{t("Overview")}</h1>
           <p className="text-xs text-muted-foreground">{t("System-wide status · live refresh")}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button asChild size="sm" variant="outline">
+            <Link href="/chat">
+              <MessageSquareIcon />
+              {t("Chat")}
+            </Link>
+          </Button>
+          <Button asChild size="sm">
+            <Link href="/function/tasks">
+              <PlusIcon />
+              {t("New task")}
+            </Link>
+          </Button>
         </div>
       </div>
 
-      {/* ── Row 1: 5 stat cards ── */}
+      {/* ── Pending approvals banner ── */}
+      {pendingCount > 0 && (
+        <Link
+          href="/system/intercept/approvals"
+          className="flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-xs transition-colors hover:bg-amber-500/15"
+        >
+          <span className="flex items-center gap-2 font-medium text-amber-600 dark:text-amber-400">
+            <ShieldAlertIcon className="size-4 shrink-0" />
+            {t("Pending approvals ({count})", { count: pendingCount })}
+          </span>
+          <ArrowUpRightIcon className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+        </Link>
+      )}
+
+      {/* ── Row 1: 5 clickable stat cards ── */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
         {/* Active tasks */}
-        <Card className="gap-1">
-          <CardHeader className="pb-0">
-            <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <TargetIcon className="size-3" /> {t("Active tasks")}
-            </div>
-            <div className="flex items-baseline gap-1.5">
-              <span className="text-2xl font-semibold tabular-nums">{tasksByStatus.running ?? 0}</span>
-              <span className="text-xs text-muted-foreground">/ {tasks.length}</span>
-            </div>
-          </CardHeader>
-          <CardContent className="flex flex-wrap gap-x-2.5 gap-y-0.5 text-[10px]">
-            {(tasksByStatus.running ?? 0) > 0 && (
-              <span className="text-blue-400">{t("Exploring {count}", { count: tasksByStatus.running })}</span>
-            )}
-            {(tasksByStatus.paused ?? 0) > 0 && (
-              <span className="text-amber-400">{t("Paused {count}", { count: tasksByStatus.paused })}</span>
-            )}
-            {(tasksByStatus.done ?? 0) > 0 && (
-              <span className="text-emerald-400">{t("Completed {count}", { count: tasksByStatus.done })}</span>
-            )}
-            {tasks.length === 0 && <span className="text-muted-foreground">{t("No tasks")}</span>}
-          </CardContent>
-        </Card>
+        <Link href="/function/tasks" className="group block">
+          <Card className="h-full gap-1 transition-colors group-hover:border-primary/40">
+            <CardHeader className="pb-0">
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span className="flex items-center gap-1.5">
+                  <TargetIcon className="size-3.5" /> {t("Active tasks")}
+                </span>
+                <ArrowUpRightIcon className="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
+              </div>
+              {!tasksLoaded ? (
+                <Skeleton className="mt-1 h-7 w-16" />
+              ) : (
+                <div className="flex items-baseline gap-1.5">
+                  <span className="text-2xl font-semibold tabular-nums">{tasksByStatus.running ?? 0}</span>
+                  <span className="text-xs text-muted-foreground">/ {tasks.length}</span>
+                </div>
+              )}
+            </CardHeader>
+            <CardContent className="flex flex-wrap gap-x-2.5 gap-y-0.5 text-[11px]">
+              {(tasksByStatus.running ?? 0) > 0 && (
+                <span className="text-blue-400">{t("Exploring {count}", { count: tasksByStatus.running })}</span>
+              )}
+              {(tasksByStatus.paused ?? 0) > 0 && (
+                <span className="text-amber-400">{t("Paused {count}", { count: tasksByStatus.paused })}</span>
+              )}
+              {(tasksByStatus.done ?? 0) > 0 && (
+                <span className="text-emerald-400">{t("Completed {count}", { count: tasksByStatus.done })}</span>
+              )}
+              {tasksLoaded && tasks.length === 0 && <span className="text-muted-foreground">{t("No tasks")}</span>}
+            </CardContent>
+          </Card>
+        </Link>
 
         {/* Confirmed findings */}
-        <Card className="gap-1">
-          <CardHeader className="pb-0">
-            <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <BugIcon className="size-3" /> {t("Confirmed findings")}
-            </div>
-            <div className="text-2xl font-semibold tabular-nums">{findings.length}</div>
-          </CardHeader>
-          <CardContent className="flex flex-wrap gap-2.5 text-[10px]">
-            <span className="text-rose-500">{t("Critical {count}", { count: findingsBySev.critical })}</span>
-            <span className="text-red-400">{t("High {count}", { count: findingsBySev.high })}</span>
-            <span className="text-amber-400">{t("Medium {count}", { count: findingsBySev.medium })}</span>
-            <span className="text-slate-400">{t("Low {count}", { count: findingsBySev.low })}</span>
-          </CardContent>
-        </Card>
+        <Link href="/function/findings" className="group block">
+          <Card className="h-full gap-1 transition-colors group-hover:border-primary/40">
+            <CardHeader className="pb-0">
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span className="flex items-center gap-1.5">
+                  <BugIcon className="size-3.5" /> {t("Confirmed findings")}
+                </span>
+                <ArrowUpRightIcon className="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
+              </div>
+              {!loaded ? (
+                <Skeleton className="mt-1 h-7 w-14" />
+              ) : (
+                <div className="text-2xl font-semibold tabular-nums">{findingTotal ?? findings.length}</div>
+              )}
+            </CardHeader>
+            <CardContent className="flex flex-wrap gap-2.5 text-[11px]">
+              <span className="text-rose-500">{t("Critical {count}", { count: findingsBySev.critical })}</span>
+              <span className="text-red-400">{t("High {count}", { count: findingsBySev.high })}</span>
+              <span className="text-amber-400">{t("Medium {count}", { count: findingsBySev.medium })}</span>
+              <span className="text-slate-400">{t("Low {count}", { count: findingsBySev.low })}</span>
+            </CardContent>
+          </Card>
+        </Link>
 
         {/* Asset nodes */}
-        <Card className="gap-1">
-          <CardHeader className="pb-0">
-            <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <NetworkIcon className="size-3" /> {t("Asset nodes")}
-            </div>
-            <div className="text-2xl font-semibold tabular-nums">{totalAssets}</div>
-          </CardHeader>
-          <CardContent className="text-[10px] text-muted-foreground">{t("Shared across tasks")}</CardContent>
-        </Card>
+        <Link href="/function/assets" className="group block">
+          <Card className="h-full gap-1 transition-colors group-hover:border-primary/40">
+            <CardHeader className="pb-0">
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span className="flex items-center gap-1.5">
+                  <NetworkIcon className="size-3.5" /> {t("Asset nodes")}
+                </span>
+                <ArrowUpRightIcon className="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
+              </div>
+              {!loaded ? (
+                <Skeleton className="mt-1 h-7 w-16" />
+              ) : (
+                <div className="text-2xl font-semibold tabular-nums">{totalAssets}</div>
+              )}
+            </CardHeader>
+            <CardContent className="text-[11px] text-muted-foreground">{t("Shared across tasks")}</CardContent>
+          </Card>
+        </Link>
 
         {/* Traffic exchanges */}
-        <Card className="gap-1">
-          <CardHeader className="pb-0">
-            <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <ActivityIcon className="size-3" /> {t("Traffic exchanges")}
-            </div>
-            <div className="text-2xl font-semibold tabular-nums">{traffic.length}</div>
-          </CardHeader>
-          <CardContent className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-            {settings?.traffic_capture ? (
-              <>
-                <LiveDot />
-                <span>{t("Recording")}</span>
-              </>
-            ) : (
-              <span>{t("Capture is off")}</span>
-            )}
-          </CardContent>
-        </Card>
+        <Link href="/function/traffic" className="group block">
+          <Card className="h-full gap-1 transition-colors group-hover:border-primary/40">
+            <CardHeader className="pb-0">
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span className="flex items-center gap-1.5">
+                  <ActivityIcon className="size-3.5" /> {t("Traffic exchanges")}
+                </span>
+                <ArrowUpRightIcon className="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
+              </div>
+              {!loaded ? (
+                <Skeleton className="mt-1 h-7 w-16" />
+              ) : (
+                <div className="text-2xl font-semibold tabular-nums">{traffic.length}</div>
+              )}
+            </CardHeader>
+            <CardContent className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              {settings?.traffic_capture ? (
+                <>
+                  <LiveDot />
+                  <span>{t("Recording")}</span>
+                </>
+              ) : (
+                <span>{t("Capture is off")}</span>
+              )}
+            </CardContent>
+          </Card>
+        </Link>
 
         {/* LLM usage */}
-        <Card className="gap-1">
-          <CardHeader className="pb-0">
-            <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <ZapIcon className="size-3" /> {t("Token usage")}
-            </div>
-            <div className="text-2xl font-semibold tabular-nums">
-              {fmtTokens(displayedTokens.input + displayedTokens.output) || "—"}
-            </div>
-          </CardHeader>
-          <CardContent className="text-[10px] text-muted-foreground">
-            {t("In {input} (incl. cache {cache}) · Out {output}", {
-              input: fmtTokens(displayedTokens.input),
-              cache: fmtTokens(displayedTokens.cacheRead),
-              output: fmtTokens(displayedTokens.output),
-            })}
-          </CardContent>
-        </Card>
+        <Link href="/function/llm-records" className="group block">
+          <Card className="h-full gap-1 transition-colors group-hover:border-primary/40">
+            <CardHeader className="pb-0">
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span className="flex items-center gap-1.5">
+                  <ZapIcon className="size-3.5" /> {t("Token usage")}
+                </span>
+                <ArrowUpRightIcon className="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
+              </div>
+              {!loaded ? (
+                <Skeleton className="mt-1 h-7 w-20" />
+              ) : (
+                <div className="text-2xl font-semibold tabular-nums">
+                  {fmtTokens(displayedTokens.input + displayedTokens.output) || "—"}
+                </div>
+              )}
+            </CardHeader>
+            <CardContent className="text-[11px] text-muted-foreground">
+              {t("In {input} (incl. cache {cache}) · Out {output}", {
+                input: fmtTokens(displayedTokens.input),
+                cache: fmtTokens(displayedTokens.cacheRead),
+                output: fmtTokens(displayedTokens.output),
+              })}
+            </CardContent>
+          </Card>
+        </Link>
       </div>
+
+      {/* ── Row 2: Task table (prioritized above telemetry) ── */}
+      <Card className="overflow-hidden p-0">
+        <div className="flex items-center justify-between border-b px-4 py-3">
+          <div className="flex items-center gap-1.5 text-xs font-semibold">
+            <ClockIcon className="size-3.5 text-muted-foreground" />
+            {t("Tasks")}
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">{t("{count} tasks", { count: tasks.length })}</span>
+            <Link
+              href="/function/tasks"
+              className="flex items-center gap-0.5 text-xs text-muted-foreground hover:text-foreground"
+            >
+              {t("All")} <ArrowUpRightIcon className="size-3" />
+            </Link>
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse text-xs">
+            <thead>
+              <tr className="border-b">
+                {["Task", "Status", "Engine", "Goal progress", "In flight", "Last activity"].map((h) => (
+                  <th
+                    key={h}
+                    className="px-4 py-2 text-left text-[11px] font-medium text-muted-foreground first:pl-4"
+                  >
+                    {t(h)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sortedTasks.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="px-4 py-6 text-center text-xs text-muted-foreground">
+                    {t("No tasks")}
+                  </td>
+                </tr>
+              ) : (
+                sortedTasks.map((t) => {
+                  const goalsPct = t.goals_total ? Math.round(((t.goals_met ?? 0) / t.goals_total) * 100) : null;
+                  return (
+                    <tr key={t.id} className="border-b last:border-0 transition-colors hover:bg-muted/30">
+                      <td className="max-w-xs px-4 py-3">
+                        <Link href={`/function/tasks/detail?id=${t.id}`} className="group flex flex-col">
+                          <span className="truncate font-medium group-hover:underline">{t.name || t.description}</span>
+                          <span className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">#{t.id}</span>
+                        </Link>
+                      </td>
+                      <td className="px-4 py-3">
+                        <StatusBadge domain="task" value={t.status} dot className="px-1.5 py-0 text-[11px]" />
+                      </td>
+                      <td className="px-4 py-3">
+                        <StatusBadge
+                          domain="engine"
+                          value={t.engine_mode ?? "idle"}
+                          className="px-1.5 py-0 text-[11px]"
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        {goalsPct !== null ? (
+                          <div className="flex items-center gap-2">
+                            <Progress value={goalsPct} className="h-1.5 w-14" />
+                            <span className="tabular-nums text-muted-foreground">
+                              {t.goals_met ?? 0}/{t.goals_total}
+                            </span>
+                          </div>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums">
+                        {(t.in_flight ?? 0) > 0 ? (
+                          <span className="font-semibold">{t.in_flight}</span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-muted-foreground">
+                        {fmtRel(t.last_activity_unix ?? t.created_unix)}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
 
       {/* ── Row 2: LLM token usage ── */}
       <Card className="p-4">
@@ -843,46 +1021,7 @@ export default function DashboardPage() {
                 {t("No data")}
               </div>
             ) : (
-              <ChartContainer config={dailyTrendConfig} className="h-[200px] w-full">
-                <BarChart data={dailyTokenData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }} maxBarSize={40}>
-                  <CartesianGrid vertical={false} />
-                  <XAxis
-                    dataKey="date"
-                    tickLine={false}
-                    axisLine={false}
-                    tick={{ fontSize: 10 }}
-                    tickMargin={6}
-                    interval="preserveStartEnd"
-                  />
-                  <YAxis
-                    tickFormatter={(v) => fmtTokens(Number(v))}
-                    tickLine={false}
-                    axisLine={false}
-                    tick={{ fontSize: 10 }}
-                    width={44}
-                  />
-                  <ChartTooltip
-                    cursor={false}
-                    content={
-                      <ChartTooltipContent
-                        indicator="line"
-                        formatter={(value, name) => (
-                          <div className="flex w-full items-center justify-between gap-4">
-                            <span>
-                              {(dailyTrendConfig as Record<string, { label: string }>)[String(name)]?.label ??
-                                String(name)}
-                            </span>
-                            <span className="font-mono font-semibold tabular-nums">{fmtTokens(Number(value))}</span>
-                          </div>
-                        )}
-                      />
-                    }
-                  />
-                  <Bar dataKey="input" stackId="1" fill="var(--color-input)" radius={[0, 0, 0, 0]} />
-                  <Bar dataKey="output" stackId="1" fill="var(--color-output)" radius={[0, 0, 0, 0]} />
-                  <Bar dataKey="cacheRead" stackId="1" fill="var(--color-cacheRead)" radius={[4, 4, 0, 0]} />
-                </BarChart>
-              </ChartContainer>
+              <DailyTrendChart data={dailyTokenData} config={dailyTrendConfig} />
             )}
           </div>
         </div>
@@ -997,95 +1136,7 @@ export default function DashboardPage() {
         </Card>
       </div>
 
-      {/* ── Row 4: Task table ── */}
-      <Card className="overflow-hidden p-0">
-        <div className="flex items-center justify-between border-b px-4 py-3">
-          <div className="flex items-center gap-1.5 text-xs font-semibold">
-            <ClockIcon className="size-3.5 text-muted-foreground" />
-            {t("Tasks")}
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] text-muted-foreground">{t("{count} tasks", { count: tasks.length })}</span>
-            <Link
-              href="/function/tasks"
-              className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground"
-            >
-              {t("All")} <ArrowUpRightIcon className="size-3" />
-            </Link>
-          </div>
-        </div>
-        <table className="w-full border-collapse text-xs">
-          <thead>
-            <tr className="border-b">
-              {["Task", "Status", "Engine", "Goal progress", "In flight", "Last activity"].map((h) => (
-                <th
-                  key={h}
-                  className="px-4 py-2 text-left text-[9px] font-semibold uppercase tracking-widest text-muted-foreground first:pl-4"
-                >
-                  {t(h)}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {sortedTasks.length === 0 ? (
-              <tr>
-                <td colSpan={6} className="px-4 py-6 text-center text-xs text-muted-foreground">
-                  {t("No tasks")}
-                </td>
-              </tr>
-            ) : (
-              sortedTasks.map((t) => {
-                const goalsPct = t.goals_total ? Math.round(((t.goals_met ?? 0) / t.goals_total) * 100) : null;
-                return (
-                  <tr key={t.id} className="border-b last:border-0 transition-colors hover:bg-muted/30">
-                    <td className="max-w-xs px-4 py-3">
-                      <Link href={`/function/tasks/detail?id=${t.id}`} className="group flex flex-col">
-                        <span className="truncate font-medium group-hover:underline">{t.description}</span>
-                        <span className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">{t.id}</span>
-                      </Link>
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusBadge domain="task" value={t.status} dot className="px-1.5 py-0 text-[10px]" />
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusBadge
-                        domain="engine"
-                        value={t.engine_mode ?? "idle"}
-                        className="px-1.5 py-0 text-[10px]"
-                      />
-                    </td>
-                    <td className="px-4 py-3">
-                      {goalsPct !== null ? (
-                        <div className="flex items-center gap-2">
-                          <Progress value={goalsPct} className="h-1 w-14" />
-                          <span className="tabular-nums text-muted-foreground">
-                            {t.goals_met ?? 0}/{t.goals_total}
-                          </span>
-                        </div>
-                      ) : (
-                        <span className="text-muted-foreground">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 tabular-nums">
-                      {(t.in_flight ?? 0) > 0 ? (
-                        <span className="font-semibold">{t.in_flight}</span>
-                      ) : (
-                        <span className="text-muted-foreground">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 tabular-nums text-muted-foreground">
-                      {fmtRel(t.last_activity_unix ?? t.created_unix)}
-                    </td>
-                  </tr>
-                );
-              })
-            )}
-          </tbody>
-        </table>
-      </Card>
-
-      {/* ── Row 5: Asset distribution | Traffic status codes | Interception & pending approvals ── */}
+      {/* ── Row 4: Asset distribution | Traffic status codes | Interception & pending approvals ── */}
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
         {/* Asset distribution */}
         <Card className="p-4">

@@ -70,6 +70,8 @@ import type {
   ModelTokenStat,
   NotificationChannel,
   NotificationDelivery,
+  OAuthProviderStatus,
+  OAuthStartResult,
   NotificationFilter,
   NotificationMeta,
   PromptVar,
@@ -319,6 +321,7 @@ export const api = {
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
+  localLogin: () => post<{ token: string }>("/auth/local", {}),
   initPassword: (password: string, setupToken: string) =>
     post<{ token: string }>("/auth/init", { password, setup_token: setupToken }),
   changePassword: (oldPassword: string, newPassword: string) =>
@@ -1218,6 +1221,14 @@ export const api = {
       proxy,
       profile_id,
     }),
+  llmOAuthStatus: () =>
+    get<{ providers: OAuthProviderStatus[] }>("/llm/oauth/status").then((r) => arr(r.providers)),
+  startLLMOAuth: (provider: "chatgpt" | "anthropic") =>
+    post<OAuthStartResult>("/llm/oauth/start", { provider }),
+  completeLLMOAuth: (provider: "chatgpt" | "anthropic", input: string) =>
+    post<OAuthProviderStatus>("/llm/oauth/complete", { provider, input }),
+  logoutLLMOAuth: (provider: "chatgpt" | "anthropic") =>
+    post<{ ok: boolean }>("/llm/oauth/logout", { provider }),
 
   // ---- agents ----
   agents: () => get<{ agents: Agent[] }>("/agents").then((r) => arr(r.agents)),

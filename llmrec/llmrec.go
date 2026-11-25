@@ -10,6 +10,8 @@ import (
 	"iter"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -21,6 +23,61 @@ import (
 // message_stop while its context was still live. The call did not complete,
 // so it is metered as an error rather than inferred from ctx.Err().
 var errStreamAbandoned = errors.New("llmrec: consumer stopped reading before message_stop")
+
+// usageWrite is one llm_usage row bound to the pool that produced it.
+type usageWrite struct {
+	pg *db.DB
+	u  *db.LLMUsage
+}
+
+// usageQueue is a bounded package-wide queue drained by a single writer
+// goroutine, so no LLM turn blocks on telemetry persistence. llm_usage is an
+// append-only ledger that deliberately survives task deletion, so a late
+// insert cannot recreate deleted rows; and budget metering runs through the
+// synchronous ctx usage sink, so a row dropped under extreme backlog only
+// leaves a gap in the ledger — never a miscounted budget.
+const usageQueueCap = 1024
+
+var (
+	usageQueue   = make(chan usageWrite, usageQueueCap)
+	usageDrainer sync.Once
+	usageDropped atomic.Uint64
+	usageWG      sync.WaitGroup // in-flight queued writes; tests wait on it before reading the ledger
+)
+
+func startUsageDrainer() {
+	usageDrainer.Do(func() {
+		go func() {
+			for w := range usageQueue {
+				if err := w.pg.InsertLLMUsage(w.u); err != nil {
+					log.Printf("[llmusage] insert: %v", err)
+				}
+				usageWG.Done()
+			}
+		}()
+	})
+}
+
+// FlushUsage blocks until every queued llm_usage write has been attempted.
+// Callers that read the ledger right after a call (tests, shutdown hooks)
+// need it; LLM turns themselves never wait.
+func FlushUsage() {
+	startUsageDrainer()
+	usageWG.Wait()
+}
+
+func enqueueUsage(pg *db.DB, u *db.LLMUsage) {
+	startUsageDrainer()
+	usageWG.Add(1)
+	select {
+	case usageQueue <- usageWrite{pg, u}:
+	default:
+		usageWG.Done()
+		if n := usageDropped.Add(1); n == 1 || n%100 == 0 {
+			log.Printf("[llmusage] usage insert backlog full; dropped %d rows total", n)
+		}
+	}
+}
 
 type taskIDContextKey struct{}
 type workerContextKey struct{}
@@ -349,7 +406,7 @@ func (r *Recorder) recordUsage(ctx context.Context, taskID string, expID int64, 
 	if r.pg == nil {
 		return
 	}
-	err := r.pg.InsertLLMUsage(&db.LLMUsage{
+	enqueueUsage(r.pg, &db.LLMUsage{
 		TaskID:        taskID,
 		ExplorationID: expID,
 		Worker:        worker,
@@ -362,9 +419,6 @@ func (r *Recorder) recordUsage(ctx context.Context, taskID string, expID int64, 
 		CacheWrite:    usage.CacheWriteTokens,
 		Status:        status,
 	})
-	if err != nil {
-		log.Printf("[llmusage] insert: %v", err)
-	}
 }
 
 // record persists one LLM call to PostgreSQL before the provider stream returns.

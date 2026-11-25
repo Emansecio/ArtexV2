@@ -86,9 +86,9 @@ func TestSignedThinkingIsNotRewritten(t *testing.T) {
 	}
 }
 
-// Only large, non-Compress tool results are trimmed, largest first, keeping
+// Only large, non-Compress tool results are trimmed, oldest first, keeping
 // both ends around the marker.
-func TestBoundToolCopiesTrimsLargestNonCompressResults(t *testing.T) {
+func TestBoundToolCopiesTrimsOldestNonCompressResults(t *testing.T) {
 	big := strings.Repeat("é", 3000) // multi-byte runes
 	medium := strings.Repeat("m", 1000)
 	small := strings.Repeat("s", 400)
@@ -107,18 +107,24 @@ func TestBoundToolCopiesTrimsLargestNonCompressResults(t *testing.T) {
 		}
 		return n
 	}
-	// Trimming the largest eligible result is enough to reach this target.
+	// Oldest-first: trimming the oldest eligible result (medium) does not reach
+	// the target alone, so the next-oldest (big) is trimmed too.
 	out, trimmed := boundToolCopies(view, size(view)-2000, size)
-	if trimmed != 1 {
-		t.Fatalf("trimmed %d copies, want 1", trimmed)
+	if trimmed != 2 {
+		t.Fatalf("trimmed %d copies, want 2", trimmed)
 	}
-	r := []rune(big)
-	want := string(r[:128]) + boundMarker + string(r[len(r)-128:])
-	if out[2].Text != want {
-		t.Fatalf("largest result not trimmed to head+marker+tail: %q", out[2].Text)
+	trim := func(s string) string {
+		r := []rune(s)
+		return string(r[:128]) + boundMarker + string(r[len(r)-128:])
 	}
-	if out[1].Text != medium || out[3].Text != big || out[4].Text != small || out[0].Text != orig[0].Text {
-		t.Fatal("a copy other than the largest eligible result changed")
+	if out[1].Text != trim(medium) || out[2].Text != trim(big) {
+		t.Fatalf("oldest results not trimmed to head+marker+tail: %q / %q", out[1].Text, out[2].Text)
+	}
+	if out[3].Text != big || out[4].Text != small || out[0].Text != orig[0].Text {
+		t.Fatal("a copy other than the oldest eligible results changed")
+	}
+	if size(out) > size(view)-2000 {
+		t.Fatal("target size not reached")
 	}
 	if !reflect.DeepEqual(view, orig) {
 		t.Fatal("the input view was modified")
@@ -130,8 +136,9 @@ func TestBoundToolCopiesTrimsLargestNonCompressResults(t *testing.T) {
 	}
 }
 
-// A long session whose model never compresses stays under 70% of the window,
-// with the originals, call arguments and tool pairing untouched.
+// A long session whose model never compresses stays under 75% of the window
+// (the trim trigger), with the originals, call arguments and tool pairing
+// untouched.
 func TestUncooperativeLongSessionStaysUnderToolBudget(t *testing.T) {
 	const window = 40000
 	sess := simSession(t, window)
@@ -145,8 +152,8 @@ func TestUncooperativeLongSessionStaysUnderToolBudget(t *testing.T) {
 	}
 	before := mustJSON(t, a.history)
 	view := sess.View(a.history)
-	if final := estimateMessages(view); final > window*7/10 {
-		t.Fatalf("final request %d tokens, over 70%% of the %d window", final, window)
+	if final := estimateMessages(view); final > window*3/4 {
+		t.Fatalf("final request %d tokens, over 75%% of the %d window", final, window)
 	}
 	if sess.lastTruncatedCount == 0 {
 		t.Fatal("no tool-result copy was trimmed")

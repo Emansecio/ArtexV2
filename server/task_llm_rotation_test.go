@@ -84,7 +84,7 @@ func TestRotationConcurrentProvidersAndPrecedence(t *testing.T) {
 	done := make(chan error, 3)
 	dispatch := func(want int) {
 		t.Helper()
-		head, _ := task.nextRotatedProfile()
+		head, _ := task.nextRotatedProfile(int64(want))
 		go func() {
 			_, _, _, err := runtime.Complete(withLLMProfilePin(ctx, head), llm.CompletionRequest{})
 			done <- err
@@ -167,7 +167,7 @@ func TestRotationConcurrentDispatchAndUpdates(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			id, ok := task.nextRotatedProfile()
+			id, ok := task.nextRotatedProfile(int64(i))
 			if !ok {
 				t.Error("missing assignment")
 				return
@@ -193,7 +193,7 @@ func TestRotationConcurrentDispatchAndUpdates(t *testing.T) {
 		}
 	}()
 	for i := 0; i < workers; i++ {
-		task.nextRotatedProfile()
+		task.nextRotatedProfile(int64(i))
 		task.llmStateSnapshot()
 	}
 	wg.Wait()
@@ -203,16 +203,21 @@ func TestNextRotatedProfileRoundRobin(t *testing.T) {
 	tk := &Task{LLMProfileIDs: []int64{3, 1, 2}, LLMRotate: true}
 	want := []int64{3, 1, 2, 3, 1}
 	for i, w := range want {
-		got, ok := tk.nextRotatedProfile()
+		got, ok := tk.nextRotatedProfile(int64(i))
 		if !ok || got != w {
 			t.Fatalf("rotation %d: got=%d ok=%v want=%d", i, got, ok, w)
 		}
 	}
-	if _, ok := (&Task{}).nextRotatedProfile(); ok {
+	// Deterministic pinning: the same intent always lands on the same head so a
+	// resumed/retried intent keeps its warm provider cache.
+	if got, _ := tk.nextRotatedProfile(4); got != tk.LLMProfileIDs[1] {
+		t.Fatalf("repeat pin for intent 4: got=%d want=%d", got, tk.LLMProfileIDs[1])
+	}
+	if _, ok := (&Task{}).nextRotatedProfile(0); ok {
 		t.Fatal("empty chain must not rotate")
 	}
 	tk.setLLMState(nil, nil, []int64{3, 1, 2}, 1, "ready", "", false)
-	if _, ok := tk.nextRotatedProfile(); ok {
+	if _, ok := tk.nextRotatedProfile(0); ok {
 		t.Fatal("disabled rotation must not assign a pin")
 	}
 }
@@ -272,7 +277,7 @@ func TestIntentWorkContextRotatesWithCachedExecCtx(t *testing.T) {
 
 	// A paused task must roll back without advancing the rotation counter.
 	e.Pause(taskID, agent.AbortPausedByUser)
-	if _, _, _, ok := e.intentWorkContext(context.Background(), tk); ok {
+	if _, _, _, ok := e.intentWorkContext(context.Background(), tk, 0); ok {
 		t.Fatal("paused task unexpectedly yielded a work context")
 	}
 	e.Resume(tk)
@@ -281,13 +286,13 @@ func TestIntentWorkContextRotatesWithCachedExecCtx(t *testing.T) {
 
 	// A deleting task must also roll back without advancing the rotation counter.
 	e.BeginDelete(taskID)
-	if _, _, _, ok := e.intentWorkContext(context.Background(), tk); ok {
+	if _, _, _, ok := e.intentWorkContext(context.Background(), tk, 0); ok {
 		t.Fatal("deleting task unexpectedly yielded a work context")
 	}
 	e.AbortDelete(taskID, false)
 
 	// Two consecutive claimed intents must carry distinct rotated pins (A then B).
-	_, workA, cancelA, ok := e.intentWorkContext(context.Background(), tk)
+	_, workA, cancelA, ok := e.intentWorkContext(context.Background(), tk, 0)
 	if !ok {
 		t.Fatal("first intentWorkContext failed")
 	}
@@ -297,7 +302,7 @@ func TestIntentWorkContextRotatesWithCachedExecCtx(t *testing.T) {
 		t.Fatalf("first workCtx pin = (%d, %v), want (%d, true)", gotA, okA, profileA)
 	}
 
-	_, workB, cancelB, ok := e.intentWorkContext(context.Background(), tk)
+	_, workB, cancelB, ok := e.intentWorkContext(context.Background(), tk, 1)
 	if !ok {
 		t.Fatal("second intentWorkContext failed")
 	}

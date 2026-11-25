@@ -274,6 +274,7 @@ func TestTaskLLMRetryKeepsOneLedgerRowPerPhysicalCall(t *testing.T) {
 			if r.err != nil {
 				t.Fatal(r.err)
 			}
+			llmrec.FlushUsage() // ledger writes are async since the bounded queue landed
 			var rows, failed int
 			if err := pg.QueryRow(`SELECT count(*), count(*) FILTER (WHERE status='error') FROM llm_usage WHERE task_id=$1`, taskID).Scan(&rows, &failed); err != nil {
 				t.Fatal(err)

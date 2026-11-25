@@ -6,6 +6,7 @@ import {
   Brain,
   Bug,
   ClipboardList,
+  Cpu,
   FolderOpen,
   FolderSync,
   LayoutDashboard,
@@ -78,16 +79,9 @@ export const sidebarItems: NavGroup[] = [
     id: 2,
     label: t("Exploration"),
     items: [
-      {
-        id: "assets-group",
-        title: t("Assets"),
-        icon: Network,
-        subItems: [
-          { id: "assets", title: t("Assets"), url: "/function/assets", icon: Network },
-          { id: "sync", title: t("Asset Sync"), url: "/function/sync", icon: FolderSync },
-          { id: "workspace", title: t("Workspace"), url: "/function/workspace", icon: FolderOpen },
-        ],
-      },
+      { id: "assets", title: t("Assets"), url: "/function/assets", icon: Network },
+      { id: "sync", title: t("Asset Sync"), url: "/function/sync", icon: FolderSync },
+      { id: "workspace", title: t("Workspace"), url: "/function/workspace", icon: FolderOpen },
       { id: "traffic", title: t("Traffic"), url: "/function/traffic", icon: Activity },
       {
         id: "traces",
@@ -104,12 +98,12 @@ export const sidebarItems: NavGroup[] = [
     id: 3,
     label: t("AI & Governance"),
     items: [
+      { id: "models", title: t("Models & Fallbacks"), url: "/models", icon: Brain },
       {
         id: "ai-engine",
         title: t("AI Engine"),
-        icon: Brain,
+        icon: Cpu,
         subItems: [
-          { id: "llm", title: t("LLM"), url: "/system/llm", icon: Brain },
           { id: "agents", title: t("Agent"), url: "/system/agents", icon: Bot },
           { id: "mcp", title: t("MCP"), url: "/system/mcp", icon: Plug },
           { id: "skills", title: t("Skill"), url: "/system/skills", icon: Sparkles },
@@ -132,16 +126,9 @@ export const sidebarItems: NavGroup[] = [
     id: 4,
     label: t("System"),
     items: [
-      {
-        id: "system",
-        title: t("System"),
-        icon: Settings2,
-        subItems: [
-          { id: "settings", title: t("System Settings"), url: "/system/settings", icon: Settings2 },
-          { id: "notify", title: t("Notifications"), url: "/system/notify", icon: BellRing },
-          { id: "logs", title: t("Logs"), url: "/system/logs", icon: ScrollText },
-        ],
-      },
+      { id: "settings", title: t("System Settings"), url: "/system/settings", icon: Settings2 },
+      { id: "notify", title: t("Notifications"), url: "/system/notify", icon: BellRing },
+      { id: "logs", title: t("Logs"), url: "/system/logs", icon: ScrollText },
     ],
   },
 ];

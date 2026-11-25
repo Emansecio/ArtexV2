@@ -1273,11 +1273,14 @@ WHERE exploration_id=$1 AND kind='goal' AND state='open')`, s.expID).Scan(&exist
 }
 
 // OpenGoalFingerprint returns a stable fingerprint of the open-goal set: the
-// sorted goal ids joined by commas, "" when none. Planner quiet-mode (#79) uses
-// it to tell "the goal set changed since the last planning round" apart from
-// "nothing the plan depends on changed".
+// sorted "id:updated_at" pairs joined by commas, "" when none. Planner
+// quiet-mode (#79) uses it to tell "the goal set changed since the last
+// planning round" apart from "nothing the plan depends on changed".
+// updated_at is mixed in so an in-place goal edit (NotifyGoalEdited) busts the
+// fingerprint — hashing ids alone would let a quiet skip drain a goal_edited
+// trigger without the planner ever seeing the change.
 func (s *ExplorationStore) OpenGoalFingerprint() (string, error) {
-	rows, err := s.db.Query(`SELECT id FROM exploration_nodes
+	rows, err := s.db.Query(`SELECT id, updated_at FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='goal' AND state='open' ORDER BY id`, s.expID)
 	if err != nil {
 		return "", err
@@ -1286,10 +1289,11 @@ WHERE exploration_id=$1 AND kind='goal' AND state='open' ORDER BY id`, s.expID)
 	var ids []string
 	for rows.Next() {
 		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var ts time.Time
+		if err := rows.Scan(&id, &ts); err != nil {
 			return "", err
 		}
-		ids = append(ids, strconv.FormatInt(id, 10))
+		ids = append(ids, strconv.FormatInt(id, 10)+":"+strconv.FormatInt(ts.UnixNano(), 10))
 	}
 	return strings.Join(ids, ","), rows.Err()
 }
@@ -2141,6 +2145,52 @@ func (s *ExplorationStore) ActivityTraceForTerminalIntent(nodeID int64, limit in
 	}
 	defer rows.Close()
 	return scanTrace(rows)
+}
+
+// WorkerOutputText returns the latest 'result' (preferred) or 'text' activity
+// text for one intent — detail when present, summary as fallback. One indexed
+// query; "" when the intent produced no output row yet.
+func (s *ExplorationStore) WorkerOutputText(nodeID int64) (string, error) {
+	var out sql.NullString
+	err := s.db.QueryRow(`SELECT COALESCE(NULLIF(detail,''), summary) FROM activity
+WHERE exploration_id=$1 AND node_id=$2 AND kind IN ('result','text')
+ORDER BY (kind='result') DESC, id DESC LIMIT 1`, s.expID, nodeID).Scan(&out)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return out.String, err
+}
+
+// TerminalIntentResultSummaries maps intent node id → latest result/text
+// summary for the given terminal intents, in one DISTINCT ON query (the
+// per-intent ActivityPageForTerminalIntent loop it replaces was an N+1). Rows
+// are restricted to intents still terminal at query time, same eligibility as
+// ActivityPageForTerminalIntent.
+func (s *ExplorationStore) TerminalIntentResultSummaries(nodeIDs []int64) (map[int64]string, error) {
+	out := map[int64]string{}
+	if len(nodeIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(`SELECT DISTINCT ON (a.node_id) a.node_id, a.summary
+FROM activity a
+JOIN exploration_nodes n ON n.id=a.node_id AND n.exploration_id=a.exploration_id
+WHERE a.exploration_id=$1 AND a.node_id = ANY($2::bigint[])
+  AND n.kind='intent' AND n.state IN ('done','blocked','exhausted','stopped')
+  AND a.kind IN ('result','text')
+ORDER BY a.node_id, (a.kind='result') DESC, a.id DESC`, s.expID, nodeIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var sum sql.NullString
+		if err := rows.Scan(&id, &sum); err != nil {
+			return nil, err
+		}
+		out[id] = sum.String
+	}
+	return out, rows.Err()
 }
 
 // ActivityTraceSearch finds steps whose summary OR detail matches q

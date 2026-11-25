@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { EllipsisVertical, KeyRound, LogOut } from "lucide-react";
+import { EllipsisVertical, Home } from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
@@ -18,7 +18,19 @@ import { t } from "@/i18n";
 import { auth } from "@/lib/auth";
 import { getInitials } from "@/lib/utils";
 
-import { ChangePasswordDialog } from "./change-password-dialog";
+const WELCOME_STORAGE_KEY = "artex.welcome.v2";
+
+function readOperatorName(fallback: string): string {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(WELCOME_STORAGE_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as { operatorName?: string };
+    return parsed.operatorName?.trim() || fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 export function NavUser({
   user,
@@ -30,12 +42,14 @@ export function NavUser({
   };
 }) {
   const { isMobile } = useSidebar();
-  const [pwOpen, setPwOpen] = React.useState(false);
+  const [displayName, setDisplayName] = React.useState(user.name);
 
-  function handleLogout() {
+  React.useEffect(() => {
+    setDisplayName(readOperatorName(user.name));
+  }, [user.name]);
+
+  function openWelcome() {
     auth.clearToken();
-    // Hard navigation: let the browser start a fresh request with the cleared cookie,
-    // so middleware reads the empty token correctly and lets /login through
     window.location.href = "/login";
   }
 
@@ -49,12 +63,12 @@ export function NavUser({
               className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
             >
               <Avatar className="h-8 w-8 rounded-lg grayscale">
-                <AvatarImage src={user.avatar || undefined} alt={user.name} />
-                <AvatarFallback className="rounded-lg">{getInitials(user.name)}</AvatarFallback>
+                <AvatarImage src={user.avatar || undefined} alt={displayName} />
+                <AvatarFallback className="rounded-lg">{getInitials(displayName)}</AvatarFallback>
               </Avatar>
               <div className="grid flex-1 text-left text-sm leading-tight">
-                <span className="truncate font-medium">{user.name}</span>
-                <span className="truncate text-muted-foreground text-xs">{user.email}</span>
+                <span className="truncate font-medium">{displayName}</span>
+                <span className="truncate text-muted-foreground text-xs">{t("Local workspace")}</span>
               </div>
               <EllipsisVertical className="ml-auto size-4" />
             </SidebarMenuButton>
@@ -68,29 +82,23 @@ export function NavUser({
             <DropdownMenuLabel className="p-0 font-normal">
               <div className="flex items-center gap-2 px-1 py-1.5 text-left text-sm">
                 <Avatar className="h-8 w-8 rounded-lg">
-                  <AvatarImage src={user.avatar || undefined} alt={user.name} />
-                  <AvatarFallback className="rounded-lg">{getInitials(user.name)}</AvatarFallback>
+                  <AvatarImage src={user.avatar || undefined} alt={displayName} />
+                  <AvatarFallback className="rounded-lg">{getInitials(displayName)}</AvatarFallback>
                 </Avatar>
                 <div className="grid flex-1 text-left text-sm leading-tight">
-                  <span className="truncate font-medium">{user.name}</span>
-                  <span className="truncate text-muted-foreground text-xs">{user.email}</span>
+                  <span className="truncate font-medium">{displayName}</span>
+                  <span className="truncate text-muted-foreground text-xs">{t("Local workspace")}</span>
                 </div>
               </div>
             </DropdownMenuLabel>
             <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={() => setPwOpen(true)}>
-              <KeyRound />
-              {t("Change password")}
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={handleLogout} className="text-destructive focus:text-destructive">
-              <LogOut />
-              {t("Sign out")}
+            <DropdownMenuItem onClick={openWelcome}>
+              <Home />
+              {t("Welcome screen")}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </SidebarMenuItem>
-      <ChangePasswordDialog open={pwOpen} onOpenChange={setPwOpen} />
     </SidebarMenu>
   );
 }

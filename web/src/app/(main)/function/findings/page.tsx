@@ -12,9 +12,11 @@ import {
   ClockIcon,
   DownloadIcon,
   FileUpIcon,
+  FilterXIcon,
   InfoIcon,
   SearchIcon,
   ShieldAlertIcon,
+  SlidersHorizontalIcon,
   TriangleAlertIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -22,6 +24,7 @@ import { toast } from "sonner";
 import { FindingRetestDialog } from "@/components/finding-retest-dialog";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -34,6 +37,7 @@ import {
 } from "@/components/ui/dialog";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
@@ -897,15 +901,90 @@ export default function FindingsPage() {
   }
 
   const statCards = [
-    { label: t("Total findings"), value: stats.total, icon: BugIcon },
-    { label: t("Pending"), value: stats.pending, tone: "text-amber-500", icon: ClockIcon },
-    { label: t("Submitted"), value: stats.submitted, tone: "text-amber-500", icon: FileUpIcon },
-    { label: t("Accepted"), value: stats.accepted, tone: "text-emerald-500", icon: CircleCheckIcon },
-    { label: t("Critical"), value: stats.critical, tone: "text-rose-600", icon: ShieldAlertIcon },
-    { label: t("High"), value: stats.high, tone: "text-red-500", icon: TriangleAlertIcon },
-    { label: t("Medium"), value: stats.medium, tone: "text-amber-500", icon: TriangleAlertIcon },
-    { label: t("Low"), value: stats.low, tone: "text-slate-500", icon: InfoIcon },
+    {
+      label: t("Total findings"),
+      value: stats.total,
+      icon: BugIcon,
+      active: severity === "all" && status === "all" && reportState === "all",
+      onClick: () => {
+        setSeverity("all");
+        setStatus("all");
+        setReportState("all");
+      },
+    },
+    {
+      label: t("Pending"),
+      value: stats.pending,
+      tone: "text-amber-500",
+      icon: ClockIcon,
+      active: status === "pending",
+      onClick: () => setStatus((cur) => (cur === "pending" ? "all" : "pending")),
+    },
+    {
+      label: t("Submitted"),
+      value: stats.submitted,
+      tone: "text-amber-500",
+      icon: FileUpIcon,
+      active: reportState === "submitted",
+      onClick: () => setReportState((cur) => (cur === "submitted" ? "all" : "submitted")),
+    },
+    {
+      label: t("Accepted"),
+      value: stats.accepted,
+      tone: "text-emerald-500",
+      icon: CircleCheckIcon,
+      active: reportState === "accepted",
+      onClick: () => setReportState((cur) => (cur === "accepted" ? "all" : "accepted")),
+    },
+    {
+      label: t("Critical"),
+      value: stats.critical,
+      tone: "text-rose-600",
+      icon: ShieldAlertIcon,
+      active: severity === "critical",
+      onClick: () => setSeverity((cur) => (cur === "critical" ? "all" : "critical")),
+    },
+    {
+      label: t("High"),
+      value: stats.high,
+      tone: "text-red-500",
+      icon: TriangleAlertIcon,
+      active: severity === "high",
+      onClick: () => setSeverity((cur) => (cur === "high" ? "all" : "high")),
+    },
+    {
+      label: t("Medium"),
+      value: stats.medium,
+      tone: "text-amber-500",
+      icon: TriangleAlertIcon,
+      active: severity === "medium",
+      onClick: () => setSeverity((cur) => (cur === "medium" ? "all" : "medium")),
+    },
+    {
+      label: t("Low"),
+      value: stats.low,
+      tone: "text-slate-500",
+      icon: InfoIcon,
+      active: severity === "low",
+      onClick: () => setSeverity((cur) => (cur === "low" ? "all" : "low")),
+    },
   ];
+  const secondaryFilterCount =
+    (reportState !== "all" ? 1 : 0) +
+    (verificationStatus !== "all" ? 1 : 0) +
+    (vulnclass !== "all" ? 1 : 0) +
+    (task !== "all" ? 1 : 0);
+  const hasAnyFilter =
+    Boolean(search.trim()) || severity !== "all" || status !== "all" || secondaryFilterCount > 0;
+  const resetAllFilters = () => {
+    setSearch("");
+    setSeverity("all");
+    setStatus("all");
+    setReportState("all");
+    setVerificationStatus("all");
+    setVulnclass("all");
+    setTask("all");
+  };
 
   // The "current filter" count in the export dialog: both views share the same filters, only the counting source differs.
   // The flat and asset views share the flat list state; the grouped view's figure comes from the group API's finding_total.
@@ -978,19 +1057,26 @@ export default function FindingsPage() {
         </Tabs>
       </div>
       <div className="flex flex-1 flex-col gap-4 md:gap-6">
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-8">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-8">
           {statCards.map((stat) => {
             const StatIcon = stat.icon;
             return (
-              <Card key={stat.label} className="gap-1 py-4">
-                <CardHeader className="px-4">
-                  <CardDescription>{stat.label}</CardDescription>
-                  <CardTitle className={cn("flex items-center gap-2 text-2xl tabular-nums", stat.tone)}>
-                    <StatIcon className="size-5" aria-hidden="true" />
-                    {stat.value}
-                  </CardTitle>
-                </CardHeader>
-              </Card>
+              <button key={stat.label} type="button" onClick={stat.onClick} className="text-left">
+                <Card
+                  className={cn(
+                    "h-full gap-1 py-4 transition-colors hover:border-primary/40",
+                    stat.active && "border-primary/60 ring-1 ring-primary/30",
+                  )}
+                >
+                  <CardHeader className="px-4">
+                    <CardDescription>{stat.label}</CardDescription>
+                    <CardTitle className={cn("flex items-center gap-2 text-2xl tabular-nums", stat.tone)}>
+                      <StatIcon className="size-5" aria-hidden="true" />
+                      {stat.value}
+                    </CardTitle>
+                  </CardHeader>
+                </Card>
+              </button>
             );
           })}
         </div>
@@ -1046,77 +1132,101 @@ export default function FindingsPage() {
             </SelectContent>
           </Select>
 
-          <Select value={reportState} onValueChange={(v) => setReportState(v as "all" | FindingReportState)}>
-            <SelectTrigger size="sm" className="w-40">
-              <SelectValue placeholder={t("Report stage")} />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("All report stages")}</SelectItem>
-              {FINDING_REPORT_STATES.map((st) => (
-                <SelectItem key={st} value={st}>
-                  {REPORT_STATE_META[st].label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-
-          <Select
-            value={verificationStatus}
-            onValueChange={(v) => setVerificationStatus(v as "all" | VerificationStatus)}
-          >
-            <SelectTrigger size="sm" className="w-48">
-              <SelectValue placeholder={t("Verification")} />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("All verification states")}</SelectItem>
-              {VERIFICATION_STATUSES.map((st) => (
-                <SelectItem key={st} value={st}>
-                  {VERIFICATION_META[st].label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-
-          <Select value={vulnclass} onValueChange={setVulnclass}>
-            <SelectTrigger size="sm" className="w-40">
-              <SelectValue placeholder={t("Vulnerability type")} />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("All types")}</SelectItem>
-              {stats.vulnclasses.map((vc) => (
-                <SelectItem key={vc} value={vc}>
-                  {vc}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-
-          <Select value={task} onValueChange={setTask}>
-            <SelectTrigger size="sm" className="w-48">
-              <SelectValue placeholder={t("Task")} />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("All tasks")}</SelectItem>
-              <SelectItem value={UNASSIGNED_TASK}>{t("Unlinked / task deleted")}</SelectItem>
-              {(stats.tasks ?? []).map((option) => {
-                const id = String(option.id);
-                const label = option.name || option.description || t("Task #{id} (deleted)", { id });
-                return (
-                  <SelectItem key={id} value={id}>
-                    <span className="flex w-full items-center gap-2">
-                      <span className="max-w-[14rem] truncate" title={label}>
-                        {label}
-                      </span>
-                      <span className="inline-flex items-center gap-1 text-muted-foreground tabular-nums">
-                        <BugIcon className="size-3.5" aria-hidden="true" />
-                        {option.count}
-                      </span>
-                    </span>
-                  </SelectItem>
-                );
-              })}
-            </SelectContent>
-          </Select>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button size="sm" variant="outline" className="gap-1.5">
+                <SlidersHorizontalIcon className="size-3.5" />
+                {t("Filters")}
+                {secondaryFilterCount > 0 && (
+                  <Badge variant="secondary" className="px-1.5 py-0 text-[10px] tabular-nums">
+                    {secondaryFilterCount}
+                  </Badge>
+                )}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="grid w-80 gap-3 p-4">
+              <div className="grid gap-1.5">
+                <span className="text-xs font-medium text-muted-foreground">{t("Report stage")}</span>
+                <Select value={reportState} onValueChange={(v) => setReportState(v as "all" | FindingReportState)}>
+                  <SelectTrigger size="sm" className="w-full">
+                    <SelectValue placeholder={t("Report stage")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">{t("All report stages")}</SelectItem>
+                    {FINDING_REPORT_STATES.map((st) => (
+                      <SelectItem key={st} value={st}>
+                        {REPORT_STATE_META[st].label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid gap-1.5">
+                <span className="text-xs font-medium text-muted-foreground">{t("Verification")}</span>
+                <Select
+                  value={verificationStatus}
+                  onValueChange={(v) => setVerificationStatus(v as "all" | VerificationStatus)}
+                >
+                  <SelectTrigger size="sm" className="w-full">
+                    <SelectValue placeholder={t("Verification")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">{t("All verification states")}</SelectItem>
+                    {VERIFICATION_STATUSES.map((st) => (
+                      <SelectItem key={st} value={st}>
+                        {VERIFICATION_META[st].label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid gap-1.5">
+                <span className="text-xs font-medium text-muted-foreground">{t("Vulnerability type")}</span>
+                <Select value={vulnclass} onValueChange={setVulnclass}>
+                  <SelectTrigger size="sm" className="w-full">
+                    <SelectValue placeholder={t("Vulnerability type")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">{t("All types")}</SelectItem>
+                    {stats.vulnclasses.map((vc) => (
+                      <SelectItem key={vc} value={vc}>
+                        {vc}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid gap-1.5">
+                <span className="text-xs font-medium text-muted-foreground">{t("Task")}</span>
+                <Select value={task} onValueChange={setTask}>
+                  <SelectTrigger size="sm" className="w-full">
+                    <SelectValue placeholder={t("Task")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">{t("All tasks")}</SelectItem>
+                    <SelectItem value={UNASSIGNED_TASK}>{t("Unlinked / task deleted")}</SelectItem>
+                    {(stats.tasks ?? []).map((option) => {
+                      const id = String(option.id);
+                      const label = option.name || option.description || t("Task #{id} (deleted)", { id });
+                      return (
+                        <SelectItem key={id} value={id}>
+                          <span className="flex w-full items-center gap-2">
+                            <span className="max-w-[14rem] truncate" title={label}>
+                              {label}
+                            </span>
+                            <span className="inline-flex items-center gap-1 text-muted-foreground tabular-nums">
+                              <BugIcon className="size-3.5" aria-hidden="true" />
+                              {option.count}
+                            </span>
+                          </span>
+                        </SelectItem>
+                      );
+                    })}
+                  </SelectContent>
+                </Select>
+              </div>
+            </PopoverContent>
+          </Popover>
 
           <Select value={sort} onValueChange={(v) => setSort(v as "severity" | "time")}>
             <SelectTrigger size="sm" className="w-36">
@@ -1127,6 +1237,13 @@ export default function FindingsPage() {
               <SelectItem value="time">{t("By time")}</SelectItem>
             </SelectContent>
           </Select>
+
+          {hasAnyFilter && (
+            <Button size="sm" variant="ghost" onClick={resetAllFilters}>
+              <FilterXIcon className="size-3.5" />
+              {t("Clear filters")}
+            </Button>
+          )}
 
           <div className="ml-auto flex items-center gap-3">
             {selectedIds.size > 0 && (

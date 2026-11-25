@@ -27,8 +27,12 @@ export function ThemeSwitcher() {
     void persistPreference("theme_mode", nextTheme);
   };
 
+  const themeLabel = t("Current theme: {theme}. Click to cycle themes", {
+    theme: THEME_LABELS[themeMode] ?? themeMode,
+  });
+
   return (
-    <Button size="icon" onClick={cycleTheme} aria-label={t("Current theme: {theme}. Click to cycle themes", { theme: THEME_LABELS[themeMode] ?? themeMode })}>
+    <Button variant="ghost" size="icon-sm" onClick={cycleTheme} aria-label={themeLabel} title={themeLabel}>
       {/* SYSTEM */}
       <Monitor className="hidden [html[data-theme-mode=system]_&]:block" />
 

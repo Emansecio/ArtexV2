@@ -358,9 +358,16 @@ func timeoutOr(ms, def int) time.Duration {
 // shell-kind tools are environment hints only — they surface in the Bash tool
 // description via ToolResolve and do NOT create callable tool entries here.
 func (s *Server) customTools() ([]actool.CoreTool, error) {
+	tools, _, err := s.customToolsAndRows()
+	return tools, err
+}
+
+// customToolsAndRows is customTools plus the rows it built from, so callers
+// that also need the raw rows (hostTools' deferred map) avoid a second query.
+func (s *Server) customToolsAndRows() ([]actool.CoreTool, []*db.Tool, error) {
 	rows, err := s.m.pg.ListCustomTools()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := make([]actool.CoreTool, 0, len(rows))
 	for _, t := range rows {
@@ -369,7 +376,7 @@ func (s *Server) customTools() ([]actool.CoreTool, error) {
 		}
 		out = append(out, s.buildCustomTool(t))
 	}
-	return out, nil
+	return out, rows, nil
 }
 
 // buildCustomTool turns one custom-tool row into a CoreTool. Empty schema → a thin

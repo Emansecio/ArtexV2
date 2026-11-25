@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -163,7 +164,7 @@ func (d *DB) ProfileByID(id int64) (*LLMProfile, error) {
 // slice front to back.
 func (d *DB) PoolProfiles() ([]*LLMProfile, error) {
 	rows, err := d.Query(`SELECT ` + profileColsKey + ` FROM llm_profiles
-WHERE (COALESCE(api_key,'') <> '' OR format='ollama') AND (is_default OR NOT pool_exclude)
+WHERE (COALESCE(api_key,'') <> '' OR format IN ('ollama','chatgpt','anthropic-oauth')) AND (is_default OR NOT pool_exclude)
 ORDER BY is_default DESC, priority DESC, id ASC`)
 	if err != nil {
 		return nil, err
@@ -631,6 +632,11 @@ func (d *DB) UpdateAgentMeta(key, name, description string) error {
 // via FK; tools.agents bindings for the key are cleaned by the caller.
 func (d *DB) DeleteAgent(key string) error {
 	_, err := d.Exec(`DELETE FROM agents WHERE key=$1 AND builtin=false`, key)
+	if err == nil {
+		d.cfgRef().dropPrefix("vis:")
+		d.cfgRef().dropPrefix("skills:")
+		d.cfgRef().dropPrefix("prompt:")
+	}
 	return err
 }
 
@@ -782,13 +788,24 @@ func (d *DB) PromptVars(agentID int64) ([]PromptVar, error) {
 }
 
 // CurrentPrompt returns the agent's active template text ("" if none set yet).
+// Cached briefly (configCacheTTL): prompt overrides are resolved on every agent
+// run while SavePrompt is a rare UI action (which invalidates the key).
 func (d *DB) CurrentPrompt(agentID int64) (string, error) {
+	cacheKey := "prompt:" + strconv.FormatInt(agentID, 10)
+	if v, hit := d.cfgRef().get(cacheKey); hit {
+		return v.(string), nil
+	}
 	var tmpl sql.NullString
 	err := d.QueryRow(`SELECT p.template_text FROM agents a JOIN agent_prompts p ON p.id=a.current_prompt_id WHERE a.id=$1`, agentID).Scan(&tmpl)
 	if err == sql.ErrNoRows {
+		d.cfgRef().put(cacheKey, "")
 		return "", nil
 	}
-	return tmpl.String, err
+	if err != nil {
+		return "", err
+	}
+	d.cfgRef().put(cacheKey, tmpl.String)
+	return tmpl.String, nil
 }
 
 // SeedPromptIfEmpty writes the code-default template as the agent's first prompt
@@ -832,7 +849,11 @@ func (d *DB) SavePrompt(agentID int64, template, note, by string) (int, error) {
 	if _, err := tx.Exec(`UPDATE agents SET current_prompt_id=$1 WHERE id=$2`, pid, agentID); err != nil {
 		return 0, err
 	}
-	return ver, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	d.cfgRef().drop("prompt:" + strconv.FormatInt(agentID, 10))
+	return ver, nil
 }
 
 type PromptVersion struct {
@@ -878,7 +899,21 @@ type MCPServer struct {
 	Tools          []string        `json:"tools,omitempty"` // cached tool names (mcp_tools_cache)
 }
 
+// ListMCP returns every MCP server row, ordered by id. Cached briefly
+// (configCacheTTL): it is re-read on every agent assembly while writes are rare
+// admin actions; SaveMCP/DeleteMCP/UpdateMCPHealth invalidate.
 func (d *DB) ListMCP() ([]*MCPServer, error) {
+	if v, hit := d.cfgRef().get("mcp:list"); hit {
+		// Deep-copy: the API mask step rewrites m.Env in place — shared cache
+		// pointers must be read-only to callers.
+		cached := v.([]*MCPServer)
+		out := make([]*MCPServer, len(cached))
+		for i, m := range cached {
+			cp := *m
+			out[i] = &cp
+		}
+		return out, nil
+	}
 	rows, err := d.Query(`SELECT id,name,transport,COALESCE(command,''),args,env,COALESCE(url,''),enabled,insecure,COALESCE(timeout_seconds,120),last_connect_at,last_connect_ok,last_connect_err FROM mcp_servers ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -908,7 +943,13 @@ func (d *DB) ListMCP() ([]*MCPServer, error) {
 	for _, m := range out {
 		m.Tools, _ = d.MCPToolNames(m.ID)
 	}
-	return out, nil
+	d.cfgRef().put("mcp:list", out)
+	cloned := make([]*MCPServer, len(out))
+	for i, m := range out {
+		cp := *m
+		cloned[i] = &cp
+	}
+	return cloned, nil
 }
 
 // MCPToolNames returns the cached tool names for a server (empty until discovered).
@@ -969,18 +1010,28 @@ ON CONFLICT (server_id, tool_name) DO UPDATE SET description=EXCLUDED.descriptio
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	d.cfgRef().drop("mcp:list")
+	return nil
 }
 
 // UpdateMCPHealth records the outcome of one connect attempt. The WHERE clause
 // skips the write when nothing changed, so per-run wiring does not amplify writes.
 func (d *DB) UpdateMCPHealth(id int64, ok bool, errMsg string) error {
-	_, err := d.Exec(`UPDATE mcp_servers
+	res, err := d.Exec(`UPDATE mcp_servers
 		SET last_connect_at = now(), last_connect_ok = $2, last_connect_err = NULLIF($3, '')
 		WHERE id = $1
 		  AND (last_connect_ok IS DISTINCT FROM $2 OR last_connect_err IS DISTINCT FROM NULLIF($3, '') OR last_connect_at IS NULL)`,
 		id, ok, errMsg)
-	return err
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		d.cfgRef().drop("mcp:list")
+	}
+	return nil
 }
 
 func (d *DB) SaveMCP(m *MCPServer) (int64, error) {
@@ -1003,10 +1054,16 @@ func (d *DB) SaveMCP(m *MCPServer) (int64, error) {
 		var id int64
 		err := d.QueryRow(`INSERT INTO mcp_servers(name,transport,command,args,env,url,enabled,insecure,timeout_seconds) VALUES ($1,$2,NULLIF($3,''),$4,$5,NULLIF($6,''),$7,$8,$9) RETURNING id`,
 			m.Name, m.Transport, m.Command, args, env, m.URL, m.Enabled, m.Insecure, timeout).Scan(&id)
+		if err == nil {
+			d.cfgRef().drop("mcp:list")
+		}
 		return id, err
 	}
 	_, err = d.Exec(`UPDATE mcp_servers SET name=$1,transport=$2,command=NULLIF($3,''),args=$4,env=$5,url=NULLIF($6,''),enabled=$7,insecure=$8,timeout_seconds=$9 WHERE id=$10`,
 		m.Name, m.Transport, m.Command, args, env, m.URL, m.Enabled, m.Insecure, timeout, m.ID)
+	if err == nil {
+		d.cfgRef().drop("mcp:list")
+	}
 	return m.ID, err
 }
 
@@ -1022,13 +1079,27 @@ func (d *DB) DeleteMCP(id int64) error {
 	if _, err := tx.Exec(`DELETE FROM mcp_servers WHERE id=$1`, id); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	d.cfgRef().drop("mcp:list")
+	d.cfgRef().dropPrefix("vis:")
+	return nil
 }
 
 // ---------- Skill visibility (agent × skill_name) ----------
 
 // AgentSkillNames returns the skill directory names visible to an agent.
+// Cached briefly (configCacheTTL): read on every agent assembly; visibility
+// writes invalidate.
 func (d *DB) AgentSkillNames(agentID int64) ([]string, error) {
+	cacheKey := "skills:" + strconv.FormatInt(agentID, 10)
+	if v, hit := d.cfgRef().get(cacheKey); hit {
+		cached := v.([]string)
+		out := make([]string, len(cached))
+		copy(out, cached)
+		return out, nil
+	}
 	rows, err := d.Query(`SELECT skill_name FROM agent_skill_visibility WHERE agent_id=$1 AND enabled ORDER BY skill_name`, agentID)
 	if err != nil {
 		return nil, err
@@ -1042,7 +1113,13 @@ func (d *DB) AgentSkillNames(agentID int64) ([]string, error) {
 		}
 		out = append(out, name)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	d.cfgRef().put(cacheKey, out)
+	outCopy := make([]string, len(out))
+	copy(outCopy, out)
+	return outCopy, nil
 }
 
 // SkillAgents returns the agent IDs that can see a skill.
@@ -1086,7 +1163,11 @@ ON CONFLICT (agent_id,skill_name) DO UPDATE SET enabled=true`, agentID, name); e
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	d.cfgRef().drop("skills:" + strconv.FormatInt(agentID, 10))
+	return nil
 }
 
 // ToggleSkillVisibility sets one (agent, skill_name) visibility on/off.
@@ -1096,26 +1177,42 @@ ON CONFLICT (agent_id,skill_name) DO UPDATE SET enabled=true`, agentID, name); e
 // same to an insert-if-absent seed, or the builtin skill is resurrected on the
 // next start.
 func (d *DB) ToggleSkillVisibility(agentID int64, skillName string, on bool) error {
+	var err error
 	if on {
-		_, err := d.Exec(`INSERT INTO agent_skill_visibility(agent_id,skill_name,enabled) VALUES ($1,$2,true)
+		_, err = d.Exec(`INSERT INTO agent_skill_visibility(agent_id,skill_name,enabled) VALUES ($1,$2,true)
 ON CONFLICT (agent_id,skill_name) DO UPDATE SET enabled=true`, agentID, skillName)
-		return err
-	}
-	_, err := d.Exec(`INSERT INTO agent_skill_visibility(agent_id,skill_name,enabled) VALUES ($1,$2,false)
+	} else {
+		_, err = d.Exec(`INSERT INTO agent_skill_visibility(agent_id,skill_name,enabled) VALUES ($1,$2,false)
 ON CONFLICT (agent_id,skill_name) DO UPDATE SET enabled=false`, agentID, skillName)
+	}
+	if err == nil {
+		d.cfgRef().drop("skills:" + strconv.FormatInt(agentID, 10))
+	}
 	return err
 }
 
 // DeleteSkillVisibility removes all visibility rows for a skill (called on skill delete).
 func (d *DB) DeleteSkillVisibility(skillName string) error {
 	_, err := d.Exec(`DELETE FROM agent_skill_visibility WHERE skill_name=$1`, skillName)
+	if err == nil {
+		d.cfgRef().dropPrefix("skills:")
+	}
 	return err
 }
 
 // ---------- Visibility (agent × mcp) ----------
 
-// AgentVisible returns the resource ids of a kind visible to an agent.
+// AgentVisible returns the resource ids of a kind visible to an agent. Cached
+// briefly (configCacheTTL): read on every agent assembly; visibility writes
+// invalidate.
 func (d *DB) AgentVisible(agentID int64, kind string) ([]int64, error) {
+	cacheKey := "vis:" + strconv.FormatInt(agentID, 10) + ":" + kind
+	if v, hit := d.cfgRef().get(cacheKey); hit {
+		cached := v.([]int64)
+		out := make([]int64, len(cached))
+		copy(out, cached)
+		return out, nil
+	}
 	rows, err := d.Query(`SELECT resource_id FROM agent_visibility WHERE agent_id=$1 AND resource_kind=$2 AND enabled`, agentID, kind)
 	if err != nil {
 		return nil, err
@@ -1129,7 +1226,13 @@ func (d *DB) AgentVisible(agentID int64, kind string) ([]int64, error) {
 		}
 		out = append(out, id)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	d.cfgRef().put(cacheKey, out)
+	outCopy := make([]int64, len(out))
+	copy(outCopy, out)
+	return outCopy, nil
 }
 
 // ResourceAgents returns the agent ids that can see a resource.
@@ -1168,16 +1271,24 @@ ON CONFLICT (agent_id,resource_kind,resource_id,mcp_tool_name) DO UPDATE SET ena
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	d.cfgRef().drop("vis:" + strconv.FormatInt(agentID, 10) + ":" + kind)
+	return nil
 }
 
 // ToggleVisibility sets one (agent, kind, resource) visibility on/off (idempotent).
 func (d *DB) ToggleVisibility(agentID int64, kind string, resourceID int64, on bool) error {
+	var err error
 	if on {
-		_, err := d.Exec(`INSERT INTO agent_visibility(agent_id,resource_kind,resource_id,enabled) VALUES ($1,$2,$3,true)
+		_, err = d.Exec(`INSERT INTO agent_visibility(agent_id,resource_kind,resource_id,enabled) VALUES ($1,$2,$3,true)
 ON CONFLICT (agent_id,resource_kind,resource_id,mcp_tool_name) DO UPDATE SET enabled=true`, agentID, kind, resourceID)
-		return err
+	} else {
+		_, err = d.Exec(`DELETE FROM agent_visibility WHERE agent_id=$1 AND resource_kind=$2 AND resource_id=$3`, agentID, kind, resourceID)
 	}
-	_, err := d.Exec(`DELETE FROM agent_visibility WHERE agent_id=$1 AND resource_kind=$2 AND resource_id=$3`, agentID, kind, resourceID)
+	if err == nil {
+		d.cfgRef().drop("vis:" + strconv.FormatInt(agentID, 10) + ":" + kind)
+	}
 	return err
 }

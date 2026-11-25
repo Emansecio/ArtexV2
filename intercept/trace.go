@@ -76,8 +76,9 @@ func (t *Trace) Append(e db.InterceptContextEntry) {
 func (t *Trace) Start(id, tool string, input []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.calls[id] = &tracedCall{key: tool + ":" + digestInput(input), audit: db.InterceptAudit{
-		RunID: t.runID, ToolUseID: id, Correlation: "exact", InputDigest: digestInput(input),
+	dig := digestInput(input)
+	t.calls[id] = &tracedCall{key: tool + ":" + dig, audit: db.InterceptAudit{
+		RunID: t.runID, ToolUseID: id, Correlation: "exact", InputDigest: dig,
 		UserMessage: t.user, UserTruncated: t.userCut, CapturedAt: time.Now().UTC(),
 		Context: append([]db.InterceptContextEntry{}, t.entries...), ContextTruncated: t.cut,
 	}}

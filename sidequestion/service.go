@@ -27,6 +27,10 @@ type Answer struct {
 	Text    string
 	Usage   llm.Usage
 	ToolUse bool
+	// Delta carries only the newly streamed text chunk for the current update
+	// call — materializing Text per event copies the whole accumulated buffer
+	// on every token (O(N²)); stream consumers should append Delta instead.
+	Delta string
 }
 
 func (s SideQuestionService) Answer(ctx context.Context, req llm.CompletionRequest, streaming bool, update func(Answer)) (out Answer, err error) {
@@ -41,7 +45,7 @@ func (s SideQuestionService) Answer(ctx context.Context, req llm.CompletionReque
 			switch ev.Type {
 			case llm.SETextDelta:
 				tb.WriteString(ev.Text)
-				out.Text = tb.String()
+				out.Delta = ev.Text
 			case llm.SEToolUseStart:
 				out.ToolUse = true
 			case llm.SEMessageStart:
@@ -54,6 +58,7 @@ func (s SideQuestionService) Answer(ctx context.Context, req llm.CompletionReque
 			}
 			if update != nil {
 				update(out)
+				out.Delta = ""
 			}
 			if ctx.Err() != nil {
 				err = ctx.Err()
@@ -61,6 +66,7 @@ func (s SideQuestionService) Answer(ctx context.Context, req llm.CompletionReque
 			}
 		}
 		out.Text = tb.String()
+		out.Delta = ""
 		if err == nil && !complete {
 			err = errors.New("model response was interrupted, please ask again")
 		}

@@ -97,6 +97,12 @@ type Config struct {
 	// global policy → built-in default, resolved server-side). See RetryConfig for
 	// the per-layer semantics; zero values = fully inherit the built-in defaults.
 	Retry RetryConfig
+	// OAuthSource, when set, supplies live Bearer tokens for FormatChatGPT and
+	// FormatAnthropicOAuth. Kept as a comparable interface (not a func) so Config
+	// remains comparable with ==.
+	OAuthSource interface {
+		AccessToken(ctx context.Context, provider string, forceRefresh bool) (string, error)
+	}
 }
 
 // RetryConfig holds the retry parameters that travel with one LLM config. The
@@ -143,6 +149,17 @@ const (
 // OpenAI's public endpoint).
 const FormatOllama llm.Format = "ollama"
 
+// Subscription OAuth and OpenCode gateway formats (reference: Orb Providers.swift).
+const (
+	FormatChatGPT        llm.Format = "chatgpt"
+	FormatAnthropicOAuth llm.Format = "anthropic-oauth"
+	FormatOpenCodeZen    llm.Format = "opencode-zen"
+	FormatOpenCodeGo     llm.Format = "opencode-go"
+
+	DefaultOpenCodeZenBaseURL = "https://opencode.ai/zen/v1"
+	DefaultOpenCodeGoBaseURL  = "https://opencode.ai/zen/go/v1"
+)
+
 // DefaultOllamaBaseURL is the base of Ollama's OpenAI-compatible endpoint the
 // provider appends /chat/completions to. Must never end up empty: with an
 // empty BaseURL, the SDK would fall back to OpenAI's public endpoint.
@@ -171,9 +188,24 @@ func normalizeOllamaBaseURL(raw string) string {
 	return b
 }
 
-// NeedsAPIKey reports whether this provider format requires an API key to be
-// usable. Ollama (local server) is keyless; every cloud format needs one.
-func (c Config) NeedsAPIKey() bool { return c.Format != FormatOllama }
+// NeedsAPIKey reports whether this provider format requires a static API key.
+// Local Ollama and OAuth-backed formats (chatgpt, anthropic-oauth) do not.
+func (c Config) NeedsAPIKey() bool {
+	return c.Format != FormatOllama && c.Format != FormatChatGPT && c.Format != FormatAnthropicOAuth
+}
+
+// OAuthProvider returns the oauth.Manager provider key ("chatgpt" or "anthropic")
+// when this config uses OAuth authentication, or "" for API-key/local formats.
+func (c Config) OAuthProvider() string {
+	switch c.Format {
+	case FormatChatGPT:
+		return "chatgpt"
+	case FormatAnthropicOAuth:
+		return "anthropic"
+	default:
+		return ""
+	}
+}
 
 // CompactionWindow returns the model context window in TOKENS for compaction
 // thresholds, resolved from the user-configured size (ContextWindowK). 0/unset →
@@ -210,8 +242,13 @@ func (c Config) ContextWindowTokens() int {
 
 const (
 	defaultMaxToolOutputChars = 8000
-	defaultMicroCompactRatio  = 0.35
-	defaultMicroCompactBatch  = 4
+	// MicroCompact mutates earlier tool_result blocks in place, breaking the
+	// prompt-cache prefix from the first mutated message onward — on cached
+	// providers the invalidation cost dwarfs the savings until the window is
+	// mostly full. Keep prefixes immutable through normal runs (0.70) and sweep
+	// in large infrequent batches (12) instead of every 4 compactable calls.
+	defaultMicroCompactRatio  = 0.70
+	defaultMicroCompactBatch  = 12
 	defaultMicroKeepRecent    = 4
 	defaultSummaryMaxTokens   = 4096
 	defaultCompactWindowCapK  = 160
@@ -442,13 +479,45 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		}
 	case "ollama":
 		c.Format = FormatOllama
-		// Ollama's OpenAI-compatible endpoint lives at /v1 and the provider
-		// appends "/chat/completions". Never leave it empty: an empty BaseURL
-		// would let the SDK fall back to OpenAI's public endpoint with this
-		// profile's request.
 		c.BaseURL = normalizeOllamaBaseURL(c.BaseURL)
 		if c.Model == "" {
 			c.Model = "llama3.2"
+		}
+	case "chatgpt":
+		c.Format = FormatChatGPT
+		c.BaseURL = strings.TrimRight(strings.TrimSuffix(c.BaseURL, "/responses"), "/")
+		if c.BaseURL == "" {
+			c.BaseURL = "https://api.openai.com/v1"
+		}
+		if c.Model == "" {
+			c.Model = "gpt-5.4"
+		}
+	case "anthropic-oauth":
+		c.Format = FormatAnthropicOAuth
+		c.BaseURL = strings.TrimRight(strings.TrimSuffix(c.BaseURL, "/v1/messages"), "/")
+		if c.BaseURL == "" {
+			c.BaseURL = "https://api.anthropic.com"
+		}
+		if c.Model == "" {
+			c.Model = "claude-opus-4-8"
+		}
+	case "opencode-zen":
+		c.Format = FormatOpenCodeZen
+		c.BaseURL = strings.TrimRight(strings.TrimSuffix(c.BaseURL, "/chat/completions"), "/")
+		if c.BaseURL == "" {
+			c.BaseURL = DefaultOpenCodeZenBaseURL
+		}
+		if c.Model == "" {
+			c.Model = "claude-sonnet-4-6"
+		}
+	case "opencode-go":
+		c.Format = FormatOpenCodeGo
+		c.BaseURL = strings.TrimRight(strings.TrimSuffix(c.BaseURL, "/chat/completions"), "/")
+		if c.BaseURL == "" {
+			c.BaseURL = DefaultOpenCodeGoBaseURL
+		}
+		if c.Model == "" {
+			c.Model = "deepseek-v3.2"
 		}
 	default:
 		c.Format = llm.FormatAnthropic
@@ -481,6 +550,14 @@ func (c Config) Provider() string {
 		return "openai-responses"
 	case FormatOllama:
 		return "ollama"
+	case FormatChatGPT:
+		return "chatgpt"
+	case FormatAnthropicOAuth:
+		return "anthropic-oauth"
+	case FormatOpenCodeZen:
+		return "opencode-zen"
+	case FormatOpenCodeGo:
+		return "opencode-go"
 	}
 	return "anthropic"
 }
@@ -501,7 +578,11 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	// driven fallbacks: BaseURL to OpenAI's public endpoint, APIKey to
 	// OPENAI_API_KEY. A local Ollama ignores the placeholder token; a gateway
 	// that requires one carries a real key in the profile.
-	if wireFormat == FormatOllama {
+	var useBearerAuth bool
+	var toolsAsInputItem bool
+	var extraHeaders map[string]string
+	switch wireFormat {
+	case FormatOllama:
 		wireFormat = llm.FormatOpenAI
 		if strings.TrimSpace(baseURL) == "" {
 			baseURL = DefaultOllamaBaseURL
@@ -509,13 +590,51 @@ func (c Config) NewProvider() (llm.Provider, error) {
 		if strings.TrimSpace(apiKey) == "" {
 			apiKey = ollamaPlaceholderKey
 		}
+	case FormatChatGPT:
+		wireFormat = llm.FormatOpenAIResponses
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = "https://api.openai.com/v1"
+		}
+		toolsAsInputItem = true
+	case FormatAnthropicOAuth:
+		wireFormat = llm.FormatAnthropic
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = "https://api.anthropic.com"
+		}
+		useBearerAuth = true
+		extraHeaders = map[string]string{"anthropic-beta": "oauth-2025-04-20"}
+	case FormatOpenCodeZen:
+		wireFormat = llm.FormatOpenAI
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = DefaultOpenCodeZenBaseURL
+		}
+	case FormatOpenCodeGo:
+		wireFormat = llm.FormatOpenAI
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = DefaultOpenCodeGoBaseURL
+		}
+	}
+	// OpenCode gateways authenticate Anthropic Messages routes with Bearer (Orb: takesBearerOnMessages).
+	if wireFormat == llm.FormatAnthropic && strings.Contains(strings.ToLower(baseURL), "opencode.ai") {
+		useBearerAuth = true
+	}
+	var tokenFunc func(ctx context.Context, forceRefresh bool) (string, error)
+	if prov := c.OAuthProvider(); prov != "" && c.OAuthSource != nil {
+		src := c.OAuthSource
+		tokenFunc = func(ctx context.Context, forceRefresh bool) (string, error) {
+			return src.AccessToken(ctx, prov, forceRefresh)
+		}
 	}
 	lc := llm.Config{
-		Format:     wireFormat,
-		BaseURL:    baseURL,
-		APIKey:     apiKey,
-		Model:      c.Model,
-		HTTPClient: client,
+		Format:           wireFormat,
+		BaseURL:          baseURL,
+		APIKey:           apiKey,
+		Model:            c.Model,
+		HTTPClient:       client,
+		TokenFunc:        tokenFunc,
+		UseBearerAuth:    useBearerAuth,
+		ExtraHeaders:     extraHeaders,
+		ToolsAsInputItem: toolsAsInputItem,
 	}
 	// The thinking on/off and effort fields are each passed through as-is (empty =
 	// the field is not sent). The two are decoupled: send only thinking.type, only
@@ -543,7 +662,14 @@ func (c Config) NewProvider() (llm.Provider, error) {
 		lc.PromptCacheEnabled = &on
 		lc.PromptCacheTTL = promptCacheTTL()
 		lc.PromptCacheRetention = openAICacheRetention()
-		lc.OpenAICacheControl = openAICacheControlEnabled()
+		lc.OpenAICacheControl = openAICacheControlEnabled() ||
+			// OpenRouter → Claude gateways understand Anthropic-style
+			// cache_control on the OpenAI wire format; enable it unless the
+			// env explicitly opted out.
+			(!isFalsy(os.Getenv("ARTEX_OPENAI_CACHE_CONTROL")) &&
+				lc.Format == llm.FormatOpenAI &&
+				strings.Contains(strings.ToLower(lc.BaseURL), "openrouter.ai") &&
+				strings.Contains(strings.ToLower(lc.Model), "claude"))
 		lc.StripOldReasoning = stripOldReasoningEnabled()
 	}
 	return llm.NewProvider(lc)
@@ -610,7 +736,7 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 	// Stable across a session's turns and distinct across sessions — exactly what
 	// a session-keyed prompt cache wants. Skipped when no session id is present.
 	if t.sessionHeaderKey != "" {
-		if sid := transcript.SessionIDFrom(req.Context()); sid != "" {
+		if sid := transcript.SessionHeaderIDFrom(req.Context()); sid != "" {
 			req.Header.Set(t.sessionHeaderKey, sid)
 		}
 	}

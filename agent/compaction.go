@@ -298,7 +298,7 @@ func (c *Compactor) foldBlocksParallel(ctx context.Context, ts *db.ExplorationSt
 // changed, so any member that has since gone hot (revived) is dropped from the
 // covers set. If the block dissolves below K it is skipped.
 func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *coldGraph, b block, nodeByID map[int64]*db.Node, cvers map[int64]int, generation int) {
-	body, err := c.compress(ctx, g, b, nodeByID)
+	body, err := c.compress(ctx, ts.ID(), g, b, nodeByID)
 	if err != nil {
 		log.Printf("[compaction] compress exp=%d block=%v: %v", ts.ID(), b.Members, err)
 		return
@@ -589,12 +589,13 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 
 // compress runs the §4 body LLM call on one block. Uses the same model the agent
 // runs on; thinking disabled (a pure summarization step).
-func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
+func (c *Compactor) compress(ctx context.Context, expID int64, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
 	req := llm.CompletionRequest{
-		System:    []string{compressionSystem},
-		Messages:  []llm.Message{llm.UserText(buildCompressionInput(g, b, nodeByID))},
-		MaxTokens: 1500,
-		Thinking:  "disabled",
+		System:         []string{compressionSystem},
+		Messages:       []llm.Message{llm.UserText(buildCompressionInput(g, b, nodeByID))},
+		MaxTokens:      1500,
+		Thinking:       "disabled",
+		PromptCacheKey: fmt.Sprintf("artex-exp-%d-compactor", expID),
 	}
 	msg, _, _, err := c.prov.Complete(ctx, req)
 	if err != nil {

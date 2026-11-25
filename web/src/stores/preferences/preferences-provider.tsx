@@ -74,11 +74,16 @@ export const PreferencesStoreProvider = ({
     const domState = readDomState();
     domSnapshotRef.current = domState;
 
-    store.setState((prev) => ({
-      ...prev,
-      ...domState,
-      isSynced: true,
-    }));
+    store.setState((prev) => {
+      const definedDomState = Object.fromEntries(
+        Object.entries(domState).filter(([, value]) => value !== undefined),
+      ) as Partial<PreferencesState>;
+      return {
+        ...prev,
+        ...definedDomState,
+        isSynced: true,
+      };
+    });
   }, [store]);
 
   useEffect(() => {

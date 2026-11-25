@@ -242,6 +242,7 @@ WHERE key=$1 AND system AND NOT(COALESCE(schema->'properties','{}'::jsonb) ? $2)
 			log.Printf("[verification] upgrade update_finding_report.%s: %v", name, err)
 		}
 	}
+	s.m.pg.InvalidateToolCache()
 }
 
 // seedFindingEvidenceSchema adds the optional counterevidence /
@@ -277,6 +278,7 @@ WHERE key=$1 AND system AND NOT(COALESCE(schema->'properties','{}'::jsonb) ? $2)
 				log.Printf("[evidence] upgrade report_finding.%s: %v", name, err)
 			}
 		}
+		s.m.pg.InvalidateToolCache()
 		return
 	}
 }

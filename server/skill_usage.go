@@ -25,14 +25,20 @@ const maxLedgerSkillName = 128
 // matter — a miss tells you which procedure the agents wished existed.
 type meteredSkill struct {
 	actool.CoreTool
-	pg       *db.DB
+	pg       skillUsageWriter
 	reg      *skill.Registry
 	agentKey string
 	ri       agent.RunInfo
 }
 
+// skillUsageWriter is the narrow insert surface meteredSkill needs — *db.DB in
+// production, the async usageSink wrapper, or a test fake.
+type skillUsageWriter interface {
+	InsertSkillUsage(*db.SkillUsage) error
+}
+
 // meterSkillTool returns t unchanged when there is no DB to meter into.
-func meterSkillTool(t actool.CoreTool, pg *db.DB, reg *skill.Registry, agentKey string, ri agent.RunInfo) actool.CoreTool {
+func meterSkillTool(t actool.CoreTool, pg skillUsageWriter, reg *skill.Registry, agentKey string, ri agent.RunInfo) actool.CoreTool {
 	if pg == nil {
 		return t
 	}

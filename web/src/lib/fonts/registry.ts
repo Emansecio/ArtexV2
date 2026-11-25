@@ -9,23 +9,8 @@ const geistMono = localFont({ src: "../../../node_modules/geist/dist/fonts/geist
 
 export const fontRegistry = {
   geist: { label: "Geist", font: geist },
-  inter: { label: "Inter", font: geist },
-  notoSans: { label: "Noto Sans", font: geist },
-  nunitoSans: { label: "Nunito Sans", font: geist },
-  figtree: { label: "Figtree", font: geist },
-  roboto: { label: "Roboto", font: geist },
-  raleway: { label: "Raleway", font: geist },
-  dmSans: { label: "DM Sans", font: geist },
-  publicSans: { label: "Public Sans", font: geist },
-  outfit: { label: "Outfit", font: geist },
   geistMono: { label: "Geist Mono", font: geistMono },
   geistPixelSquare: { label: "Geist Pixel Square", font: GeistPixelSquare },
-  jetBrainsMono: { label: "JetBrains Mono", font: geistMono },
-  notoSerif: { label: "Noto Serif", font: geist },
-  robotoSlab: { label: "Roboto Slab", font: geist },
-  merriweather: { label: "Merriweather", font: geist },
-  lora: { label: "Lora", font: geist },
-  playfairDisplay: { label: "Playfair Display", font: geist },
 } as const;
 
 export type FontKey = keyof typeof fontRegistry;

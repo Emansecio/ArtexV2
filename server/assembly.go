@@ -101,12 +101,15 @@ func listToolsCached(pg *db.DB) ([]cachedToolRow, error) {
 // capture is on) to add to EVERY agent's base list — the DB tools table then
 // filters them per-agent binding. Empty/nil → no host tools this run (capture off).
 func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string), priv ExecPrivilege) {
-	wireAgentAugmentWithPool(nil, pg, skillDir, hostTools, priv)
+	wireAgentAugmentWithPool(nil, pg, skillDir, hostTools, priv, nil)
 }
 
-func wireAgentAugmentWithPool(pool *mcpPool, pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string), priv ExecPrivilege) {
+func wireAgentAugmentWithPool(pool *mcpPool, pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string), priv ExecPrivilege, agentByKey func(string) (*db.Agent, error)) {
+	if agentByKey == nil {
+		agentByKey = pg.GetAgentByKey
+	}
 	agent.SetToolAugment(func(ctx context.Context, agentKey string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
-		a, err := pg.GetAgentByKey(agentKey)
+		a, err := agentByKey(agentKey)
 		if err != nil || a == nil {
 			return nil, agent.DeferredInfo{}, nil
 		}
@@ -264,7 +267,7 @@ func wireAgentAugmentWithPool(pool *mcpPool, pg *db.DB, skillDir string, hostToo
 			// so the run's task/session ids ride in on the ctx (agent.RunInfo). Read it
 			// once here — this closure is rebuilt per run, so the captured value always
 			// belongs to this run.
-			extra = append(extra, meterSkillTool(reg.Tool(), pg, reg, a.Key, agent.RunInfoFrom(ctx)))
+			extra = append(extra, meterSkillTool(reg.Tool(), usageRecorderFor(pg), reg, a.Key, agent.RunInfoFrom(ctx)))
 		}
 
 		// host tools (traffic / orchestration / custom) — added to every agent's base;
@@ -332,7 +335,10 @@ func seedPrompts(pg *db.DB) {
 // tool-assembly time each built-in tool is filtered by its agent binding / enabled
 // flag and, if kept, wrapped so the model sees the DB-overridden description/schema
 // and default params get injected. MCP/skill/host tools have no row and pass through.
-func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
+func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool, agentByKey func(string) (*db.Agent, error)) {
+	if agentByKey == nil {
+		agentByKey = pg.GetAgentByKey
+	}
 	agent.SetFindingTrafficBindingEnabled(func() bool { return pg.GetBool(settingAgentTrafficBinding, false) })
 	// Seed the built-in domain tools (first-insert only; DO NOTHING preserves edits).
 	// No startup prune: rows we didn't seed are left alone so future user-defined
@@ -371,7 +377,7 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		}
 		runInfo := agent.RunInfoFrom(ctx)
 		resolve := func(t actool.CoreTool, ct cachedToolRow) actool.CoreTool {
-			return meterTool(agent.DecorateTool(t, ct.row.Description, ct.schema), pg, ct.row.Key, agentKey, runInfo)
+			return meterTool(agent.DecorateTool(t, ct.row.Description, ct.schema), usageRecorderFor(pg), ct.row.Key, agentKey, runInfo)
 		}
 		out := tools[:0:0]
 		for _, t := range tools {
@@ -439,7 +445,7 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		// and COUPLE the Bash description addendum so it points at shell_open — and never
 		// dangles when off. See docs/interactive-shell-design.md §14.2.
 		if !actool.InteractiveShellDisabled() {
-			if a, err := pg.GetAgentByKey(agentKey); err == nil && a != nil && a.InteractiveShell {
+			if a, err := agentByKey(agentKey); err == nil && a != nil && a.InteractiveShell {
 				out = append(out, actool.ShellSessionTools()...)
 				for i, t := range out {
 					if t.Name() == "Bash" {

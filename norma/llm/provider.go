@@ -146,6 +146,17 @@ type Config struct {
 	// delivering any data frame before timing out and allowing failover.
 	// 0 uses the default (45s, or NORMA_STREAM_IDLE_TIMEOUT_SEC); negative disables.
 	StreamIdleTimeout time.Duration
+	// TokenFunc, when set, dynamically resolves an OAuth Bearer access token
+	// before each request (and is re-invoked with forceRefresh=true once on 401).
+	TokenFunc func(ctx context.Context, forceRefresh bool) (string, error)
+	// UseBearerAuth sends `Authorization: Bearer <key>` instead of `x-api-key`
+	// on Anthropic Messages requests (used by Claude OAuth and OpenCode gateways).
+	UseBearerAuth bool
+	// ExtraHeaders are applied to every outbound LLM request (e.g. anthropic-beta).
+	ExtraHeaders map[string]string
+	// ToolsAsInputItem sends Responses API tools as an `additional_tools` input
+	// item instead of top-level `tools` (required by Sign in with ChatGPT).
+	ToolsAsInputItem bool
 
 	limiter *rateLimiter // built from RateLimit by NewProvider; shared via the provider
 }

@@ -264,6 +264,7 @@ function SidebarTrigger({
       data-slot="sidebar-trigger"
       variant="ghost"
       size="icon-sm"
+      title={`${t("Toggle Sidebar")} (⌘B)`}
       className={cn(className)}
       onClick={(event) => {
         onClick?.(event)

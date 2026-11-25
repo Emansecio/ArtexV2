@@ -57,6 +57,7 @@ type oaTool struct {
 		Description string         `json:"description"`
 		Parameters  map[string]any `json:"parameters"`
 	} `json:"function"`
+	CacheControl map[string]any `json:"cache_control,omitempty"`
 }
 
 type oaThinking struct {
@@ -287,8 +288,21 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 
 	useCache := p.cfg.promptCacheEnabled()
 	var wireMsgs any = msgs
+	var sysParts []oaContentPart
 	if useCache && p.cfg.OpenAICacheControl {
-		wireMsgs = toOAWireMessages(msgs, anthropicCacheControl(p.cfg.PromptCacheTTL))
+		cc := anthropicCacheControl(p.cfg.PromptCacheTTL)
+		// Honor DynamicBoundary like the Anthropic path: the static system
+		// prefix gets its own cached part so per-run dynamic tail content does
+		// not poison the cross-worker shared prefix.
+		if b := req.DynamicBoundary; b > 0 && b < len(req.System) {
+			if static := joinSystem(req.System[:b]); static != "" {
+				sysParts = append(sysParts, oaContentPart{Type: "text", Text: static, CacheControl: cc})
+			}
+			if dyn := joinSystem(req.System[b:]); dyn != "" {
+				sysParts = append(sysParts, oaContentPart{Type: "text", Text: dyn})
+			}
+		}
+		wireMsgs = toOAWireMessages(msgs, cc, sysParts)
 	}
 
 	body := oaReq{
@@ -327,28 +341,30 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 		ot.Function.Parameters = t.InputSchema
 		body.Tools = append(body.Tools, ot)
 	}
+	// Cache the tool-schema block too (multi-KB, shared across sibling runs) —
+	// same breakpoint placement as the Anthropic path's last tool.
+	if useCache && p.cfg.OpenAICacheControl && len(body.Tools) > 0 {
+		body.Tools[len(body.Tools)-1].CacheControl = anthropicCacheControl(p.cfg.PromptCacheTTL)
+	}
 	return json.Marshal(body)
 }
 
+// stripOldOAReasoning elides reasoning_content only on assistant turns before
+// the last user message — i.e. from completed user turns. Inside an active
+// tool-call loop (the assistant/tool alternation after lastUser) the history
+// stays append-only, so automatic prefix caches (DeepSeek/OpenAI/vLLM) and
+// explicit cache_control breakpoints keep hitting across turns.
 func stripOldOAReasoning(msgs []oaMessage, thinking bool) {
-	lastAssistant := -1
 	lastUser := -1
 	for i, m := range msgs {
-		switch m.Role {
-		case "assistant":
-			lastAssistant = i
-		case "user":
+		if m.Role == "user" {
 			lastUser = i
 		}
 	}
-	if lastAssistant < 0 {
+	if lastUser <= 0 {
 		return
 	}
-	cutoff := lastAssistant
-	if lastUser > lastAssistant {
-		cutoff = len(msgs)
-	}
-	for i := 0; i < cutoff; i++ {
+	for i := 0; i < lastUser; i++ {
 		if msgs[i].Role == "assistant" && msgs[i].ReasoningContent != "" {
 			if thinking && len(msgs[i].ToolCalls) > 0 {
 				msgs[i].ReasoningContent = reasoningElidedPlaceholder
@@ -359,7 +375,10 @@ func stripOldOAReasoning(msgs []oaMessage, thinking bool) {
 	}
 }
 
-func toOAWireMessages(msgs []oaMessage, cc map[string]any) []oaWireMessage {
+// toOAWireMessages renders the wire messages with cache_control breakpoints:
+// on the system message (sysParts, when DynamicBoundary split it into
+// static+dynamic parts) and on the last user/tool content block.
+func toOAWireMessages(msgs []oaMessage, cc map[string]any, sysParts []oaContentPart) []oaWireMessage {
 	lastCacheIdx := -1
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if (msgs[i].Role == "user" || msgs[i].Role == "tool") && msgs[i].Content != "" {
@@ -370,12 +389,13 @@ func toOAWireMessages(msgs []oaMessage, cc map[string]any) []oaWireMessage {
 	out := make([]oaWireMessage, len(msgs))
 	for i, m := range msgs {
 		var content any
-		if m.Content != "" {
-			if cc != nil && ((m.Role == "system") || i == lastCacheIdx) {
-				content = []oaContentPart{{Type: "text", Text: m.Content, CacheControl: cc}}
-			} else {
-				content = m.Content
-			}
+		switch {
+		case i == 0 && m.Role == "system" && len(sysParts) > 0:
+			content = sysParts
+		case m.Content != "" && cc != nil && (m.Role == "system" || i == lastCacheIdx):
+			content = []oaContentPart{{Type: "text", Text: m.Content, CacheControl: cc}}
+		case m.Content != "":
+			content = m.Content
 		}
 		out[i] = oaWireMessage{
 			Role:             m.Role,

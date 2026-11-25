@@ -22,7 +22,7 @@ func TestSpeculativePreCompactSplicesWithoutBlocking(t *testing.T) {
 	}
 
 	// ContextWindow=100000, MaxOutputTokens=4000 -> autoThreshold = 83000.
-	// 80% threshold = 66400; microThreshold = 57600.
+	// 90% threshold = 74700; microThreshold = 57600.
 	c := New(Config{
 		ContextWindow:         100000,
 		MaxOutputTokens:       4000,
@@ -39,10 +39,10 @@ func TestSpeculativePreCompactSplicesWithoutBlocking(t *testing.T) {
 		llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("recent a")}},
 	}
 
-	// Step 1: pass >= 80% of autoThreshold (67000) -> kicks speculative summary in background.
-	out1 := c.Pre(context.Background(), msgs, 67000)
+	// Step 1: pass >= 90% of autoThreshold (74700) -> kicks speculative summary in background.
+	out1 := c.Pre(context.Background(), msgs, 75000)
 	if len(out1) != len(msgs) {
-		t.Fatalf("did not expect boundary yet at 80%%, got len=%d", len(out1))
+		t.Fatalf("did not expect boundary yet at 90%%, got len=%d", len(out1))
 	}
 
 	done := make(chan struct{})
@@ -96,7 +96,7 @@ func TestSpeculativeCancelAbortsInFlightSummarizer(t *testing.T) {
 		llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("recent a")}},
 	}
 
-	c.Pre(context.Background(), msgs, 67000)
+	c.Pre(context.Background(), msgs, 75000)
 
 	select {
 	case <-started:

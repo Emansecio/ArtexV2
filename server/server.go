@@ -30,6 +30,7 @@ import (
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
+	"github.com/Autumn-27/artex/oauth"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
@@ -49,6 +50,7 @@ type Server struct {
 	m      *Manager
 	engine *Engine
 	ctx    context.Context
+	oauth  *oauth.Manager
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into keyDir/jwt.key
@@ -168,6 +170,7 @@ type Server struct {
 	side               *sideQuestionState
 	deltaHub           *DeltaHub
 	mcpPool            *mcpPool
+	scheduler          *Scheduler // event-driven wake target; nil without pg
 
 	txMu    sync.Mutex
 	txStore *transcript.Store
@@ -240,6 +243,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		agentCache: map[string]cachedAgentEntry{}}
 	s.engine.SetDeltaHub(s.deltaHub)
 	s.llmHealth, s.llmHealthSync = newLLMHealthRegistry(ctx, m.pg)
+	if m != nil && m.pg != nil {
+		s.oauth = oauth.NewManager(m.pg)
+	} else {
+		s.oauth = oauth.NewManager(nil)
+	}
 	for _, o := range opts {
 		o(s)
 	}
@@ -311,9 +319,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
 		})
-		wireAgentAugmentWithPool(s.mcpPool, m.pg, s.skillDir, s.hostTools, s.execPriv) // wire visible skills/MCP + traffic/orchestration host tools into the agent toolset
+		wireAgentAugmentWithPool(s.mcpPool, m.pg, s.skillDir, s.hostTools, s.execPriv, s.cachedAgentByKey) // wire visible skills/MCP + traffic/orchestration host tools into the agent toolset
 		domainReg := buildDomainReg(m.Assets())
-		wireTools(m.pg, domainReg)   // built-in tools table: filter per agent + override description/schema + inject defaults
+		wireTools(m.pg, domainReg, s.cachedAgentByKey) // built-in tools table: filter per agent + override description/schema + inject defaults
 		seedPrompts(m.pg)            // seed built-in agent default prompt bodies into agent_prompts (only when empty)
 		warnBrokenSkills(s.skillDir) // surface skills whose frontmatter silently failed to parse
 		s.seedOrchestrationTools()   // seed P2 cross-task orchestration tools into the tools table (bindable per agent)
@@ -322,7 +330,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // custom script tool: detect the python interpreter at boot and store it (only when empty)
-		go newScheduler(s).Run(s.ctx) // P3 trigger scheduling (scheduled/finding/goal events), custom agents only
+		s.scheduler = newScheduler(s)    // P3 trigger scheduling (scheduled/finding/goal events), custom agents only
+		m.schedWake = s.scheduler.Wake   // event producers (terminal status, findings, tool calls, creates) push a step
+		go s.scheduler.Run(s.ctx)
 		// Vulnerability IM push delivery engine. Sits beside the Scheduler but independent: push latency demands (3s)
 		// differ from the triggers' business cadence, and neither's failures drag the other down — a stuck push must not affect agent triggers.
 		go newNotifier(s).Run(s.ctx)
@@ -511,7 +521,10 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
-	// Ollama profiles run keyless (local server); the other formats need a key.
+	if !s.attachOAuth(&cfg) {
+		return cfg, false
+	}
+	// Ollama and OAuth profiles run without a static API key; other formats need one.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
 	}
@@ -693,6 +706,9 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
+	if !s.attachOAuth(&cfg) {
+		return cfg, false
+	}
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
 	}
@@ -846,6 +862,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
+	mux.HandleFunc("POST /api/auth/local", s.authLocal)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
 
 	mux.HandleFunc("GET /api/health", s.health)
@@ -1111,6 +1128,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/pool", s.pgLLMPoolStatus)
 	mux.HandleFunc("POST /api/llm/pool/reset", s.pgLLMPoolReset)
 	mux.HandleFunc("POST /api/llm/models", s.pgListModels)
+	mux.HandleFunc("GET /api/llm/oauth/status", s.oauthStatus)
+	mux.HandleFunc("POST /api/llm/oauth/start", s.oauthStart)
+	mux.HandleFunc("POST /api/llm/oauth/complete", s.oauthComplete)
+	mux.HandleFunc("POST /api/llm/oauth/logout", s.oauthLogout)
 
 	// interception rule management
 	mux.HandleFunc("GET /api/intercept/rules", s.interceptListRules)
@@ -1709,7 +1730,13 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.UserAgent = ua
-	// Keyless formats (Ollama) skip the key resolution entirely.
+	if cfg.OAuthProvider() != "" {
+		if !s.attachOAuth(&cfg) {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": "OAuth account is not signed in; click Sign in first"})
+			return
+		}
+	}
+	// Keyless formats (Ollama, OAuth) skip the static key resolution entirely.
 	if cfg.NeedsAPIKey() {
 		// API key resolution precedence: form input > the named profile's stored key > the global config's key.
 		// A stored profile's key is never sent back to the browser, so the form is empty when testing a stored profile and the key comes from the DB.
@@ -4473,6 +4500,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				emit(a)
 			})
 			gctx = intercept.WithTargetScope(gctx, t.targetScope(intercept.DefaultTargetWaitBound))
+			if s.deltaHub != nil {
+				gctx = agent.WithDeltaSink(gctx, func(ev agent.DeltaEvent) {
+					s.deltaHub.Publish("task:"+t.ID, DeltaMsg{
+						Event: "delta",
+						Data:  DeltaFrame{Worker: "mainagent", Kind: ev.Kind, Text: ev.Text},
+					})
+				})
+			}
 			s.engine.BeginLLMCall(t.ID)
 			_, err := ma.Chat(gctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, t.TargetGuard.Hooks(), emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
 			s.engine.EndLLMCall(t.ID)

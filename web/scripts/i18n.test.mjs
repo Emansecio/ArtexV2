@@ -7,6 +7,10 @@ import ts from "typescript";
 
 const sourceURL = new URL("../src/i18n/index.ts", import.meta.url);
 const require = createRequire(sourceURL);
+const runtimeDicts = {
+  tr: JSON.parse(readFileSync(new URL("../src/i18n/locales/tr.json", import.meta.url), "utf8")),
+  "zh-CN": JSON.parse(readFileSync(new URL("../src/i18n/locales/zh-CN.json", import.meta.url), "utf8")),
+};
 const code = ts.transpileModule(readFileSync(sourceURL, "utf8"), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, esModuleInterop: true },
 }).outputText;
@@ -18,6 +22,7 @@ function load({ saved = null, languages = ["en-US"], language = "en-US", blocked
   if (!server) {
     context.document = { documentElement: { lang: "en" } };
     context.window = {
+      __ARTEX_I18N__: runtimeDicts,
       localStorage: {
         getItem(key) {
           assert.equal(key, "artex.locale");

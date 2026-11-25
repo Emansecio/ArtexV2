@@ -493,7 +493,11 @@ ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, Set
 VALUES ($1, $2::jsonb, $3::jsonb, $4)`, changedBy, before, string(after), digest); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	d.cfgRef().drop("set:" + SettingTargetExemptHosts)
+	return nil
 }
 
 // TargetExemptionChange is one row of target_gate_exemption_log.

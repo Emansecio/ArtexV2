@@ -1,7 +1,6 @@
 package noaadapter
 
 import (
-	"sort"
 	"unicode/utf8"
 
 	"github.com/Autumn-27/norma/noa"
@@ -37,11 +36,12 @@ func boundToolCopies(view []noa.CoreMessage, target int, size func([]noa.CoreMes
 	if len(candidates) == 0 || size(view) <= target {
 		return view, 0
 	}
-	sort.SliceStable(candidates, func(a, b int) bool {
-		return utf8.RuneCountInString(view[candidates[a]].Text) > utf8.RuneCountInString(view[candidates[b]].Text)
-	})
 	out := append([]noa.CoreMessage(nil), view...)
 	trimmed := 0
+	// Oldest-first: an already-trimmed copy re-trims to identical bytes, so a
+	// later sweep only mutates the single next-oldest result — the early
+	// prefix stays byte-stable across turns (prompt cache). Largest-first
+	// would jump around the history and re-trim a different message each turn.
 	for _, i := range candidates {
 		r := []rune(out[i].Text)
 		out[i].Text = string(r[:boundKeepRunes]) + boundMarker + string(r[len(r)-boundKeepRunes:])

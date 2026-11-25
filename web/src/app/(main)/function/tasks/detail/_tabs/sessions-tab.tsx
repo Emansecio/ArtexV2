@@ -4,32 +4,19 @@ import * as React from "react";
 
 import {
   ArrowUpIcon,
-  BrainIcon,
-  ChevronDownIcon,
-  CircleCheckIcon,
-  CircleSlashIcon,
   CircleXIcon,
   ClockIcon,
-  HistoryIcon,
   Loader2Icon,
   PaperclipIcon,
-  PauseIcon,
-  PlusIcon,
-  RadioIcon,
-  RotateCwIcon,
-  ShieldAlertIcon,
   SquareIcon,
   Trash2Icon,
-  UserIcon,
-  WifiOffIcon,
   XIcon,
-  ZapOffIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
 import { MentionTextarea } from "@/components/mention-textarea";
-import { SideQuestionButton, SideQuestionWorkspace } from "@/components/side-question-workspace";
+import { SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
 import { type StreamingDeltaView, Transcript } from "@/components/transcript";
 import { mergeActivities } from "@/lib/activity-merge";
@@ -43,13 +30,10 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { InputGroup, InputGroupAddon, InputGroupButton } from "@/components/ui/input-group";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSideQuestions } from "@/hooks/use-side-questions";
 import { api } from "@/lib/api";
 import { appendStreamDeltas, clearAllStreamDeltas } from "@/lib/delta-store";
@@ -57,7 +41,6 @@ import { subscribeWS } from "@/lib/ws";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { MOCK } from "@/lib/mock/enabled";
 import { isBtwCommand } from "@/lib/side-questions";
-import { taskAssetSourceLabel, taskAssetTypeLabel } from "@/lib/task-assets";
 import type {
   Activity,
   ChatAttachment,
@@ -73,14 +56,10 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { setVisibleInterval } from "@/lib/polling";
-import { intlLocale, t } from "@/i18n";
+import { t } from "@/i18n";
 
-// resolutionLabel names the LLM a session runs on. The badge shows this alone and
-// keeps the model id in its tooltip. Env-backed configs can arrive without a name,
-// so fall back to the model id rather than rendering an empty badge.
-function resolutionLabel(r: TaskLLMResolution): string {
-  return r.name || r.model || t("Unnamed config");
-}
+import { AgentSidebar } from "../_components/agent-sidebar";
+import { AgentTranscriptHeader } from "../_components/agent-transcript-header";
 
 // fmtBytes renders a human file size for attachment chips (mirrors transcript.tsx).
 function fmtBytes(n: number): string {
@@ -172,67 +151,6 @@ function mergeBySeq(current: Activity[], incoming: Activity[]): Activity[] {
   return mergeActivities(current, incoming);
 }
 
-// statusIcon maps a session status to its icon. Worker terminal states are
-// distinct & color-coded: done (green check circle) / stopped (amber slash circle) / error (red X circle) /
-// steps exhausted (violet). running = blue spinner, pending (open) = gray clock.
-function statusIcon(status: SessionStatus) {
-  switch (status) {
-    case "running": // executing
-      return <Loader2Icon className="size-3.5 animate-spin text-blue-500" />;
-    case "paused":
-      return <PauseIcon className="size-3.5 text-amber-500" />;
-    case "pending": // open to claim (open intent)
-      return <ClockIcon className="size-3.5 text-muted-foreground" />;
-    case "done": // completed
-      return <CircleCheckIcon className="size-3.5 text-emerald-500" />;
-    case "stopped": // cancelled/stopped (terminated by the planner)
-      return <CircleSlashIcon className="size-3.5 text-amber-500" />;
-    case "blocked": // error
-      return <CircleXIcon className="size-3.5 text-red-500" />;
-    case "exhausted": // steps exhausted (hit max_turns)
-      return <ZapOffIcon className="size-3.5 text-violet-500" />;
-    case "deleted": // soft-deleted by the user
-      return <CircleSlashIcon className="size-3.5 text-muted-foreground" />;
-  }
-}
-
-// fmtTokens renders a compact token count (1234 → 1.2k, 2_000_000 → 2M).
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
-  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
-  return String(n);
-}
-
-const TokenMetrics = React.forwardRef<
-  HTMLSpanElement,
-  React.ComponentPropsWithoutRef<"span"> & {
-    input: number;
-    cache: number;
-    output: number;
-    labels?: "short" | "long";
-  }
->(({ input, cache, output, labels = "short", className, ...props }, ref) => {
-  const names = labels === "short" ? [t("In"), t("Cache"), t("Out")] : [t("input"), t("cache"), t("output")];
-  const values = [input, cache, output];
-  return (
-    <span
-      ref={ref}
-      className={cn("inline-flex min-w-0 flex-wrap items-center gap-1 text-muted-foreground", className)}
-      {...props}
-    >
-      {values.map((value, index) => (
-        <React.Fragment key={names[index]}>
-          <span>{names[index]}</span>
-          <Badge variant="secondary" className="h-5 px-1.5 font-mono tabular-nums">
-            {fmtTokens(value)}
-          </Badge>
-        </React.Fragment>
-      ))}
-    </span>
-  );
-});
-TokenMetrics.displayName = "TokenMetrics";
-
 // fmtDuration renders an elapsed milliseconds span compactly (90s → 1m30s).
 function fmtDuration(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -242,13 +160,6 @@ function fmtDuration(ms: number): string {
   const h = Math.floor(m / 60);
   return `${h}h${String(m % 60).padStart(2, "0")}m`;
 }
-
-const roleMeta = {
-  mainagent: { label: t("Main Agent"), icon: UserIcon },
-  planner: { label: t("Planner"), icon: BrainIcon },
-  worker: { label: t("Workers"), icon: RadioIcon },
-  system: { label: t("System audit"), icon: HistoryIcon },
-} as const;
 
 // The main-agent session is the interactive entry point of this tab and has no
 // dedicated backend "sessions" endpoint — it is a fixed UI affordance whose
@@ -346,148 +257,6 @@ function intentToSession(n: TaskNode): Session {
   };
 }
 
-function SessionItem({
-  s,
-  active,
-  displayTitle,
-  hasPending,
-  unread,
-  onClick,
-  onCancel,
-  controlling,
-  deleted,
-}: {
-  s: Session;
-  active: boolean;
-  displayTitle: string;
-  hasPending?: boolean;
-  unread?: number;
-  onClick: () => void;
-  onCancel?: () => void;
-  controlling?: boolean;
-  deleted?: boolean;
-}) {
-  const icon = deleted ? (
-    <Trash2Icon className="size-3.5 text-destructive" />
-  ) : s.role === "worker" ? (
-    statusIcon(s.status)
-  ) : s.live ? (
-    <Loader2Icon className="size-3.5 animate-spin text-blue-500" />
-  ) : null;
-
-  const cancellable =
-    s.role === "worker" &&
-    !s.inherited &&
-    !deleted &&
-    // pending = open (unclaimed) intent; running and paused ones are also deletable.
-    (s.status === "running" || s.status === "paused" || s.status === "pending");
-  return (
-    <div
-      className={cn(
-        "group/session flex w-full items-center rounded-md transition-colors",
-        active ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
-      )}
-    >
-      <button
-        type="button"
-        onClick={onClick}
-        className="flex min-w-0 flex-1 items-center gap-1 px-2 py-1.5 text-left text-sm"
-      >
-        {icon ?? <span className="size-3.5 shrink-0" />}
-        {s.intent_id && (
-          <span className="shrink-0 rounded bg-muted px-1 py-0.5 font-mono text-[10px] tabular-nums text-muted-foreground">
-            #{s.intent_id}
-          </span>
-        )}
-        {s.inherited && s.source_task_id && (
-          <Badge variant="outline" className="shrink-0">
-            {t("Source #{id}", { id: s.source_task_id })}
-          </Badge>
-        )}
-        <span
-          className={cn("min-w-0 flex-1 truncate text-sm font-medium", deleted && "text-muted-foreground line-through")}
-        >
-          {displayTitle}
-        </span>
-        {deleted && (
-          <Badge variant="outline" className="shrink-0 border-destructive/40 text-destructive">
-            {t("Deleted")}
-          </Badge>
-        )}
-        {hasPending && <ShieldAlertIcon className="size-3.5 shrink-0 text-amber-500" />}
-        {!active && unread ? (
-          <span className="inline-flex min-w-4 items-center justify-center rounded-full bg-blue-500/15 px-1 text-[10px] font-medium tabular-nums text-blue-600 dark:text-blue-400">
-            {unread > 99 ? "99+" : unread}
-          </span>
-        ) : null}
-        {s.live && (
-          <span className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
-            <span className="size-1 animate-pulse rounded-full bg-blue-500" />
-            {t("Live")}
-          </span>
-        )}
-      </button>
-      {cancellable && (
-        <div className="flex shrink-0 items-center gap-0.5 pr-1 opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover/session:opacity-100 sm:group-focus-within/session:opacity-100">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            onClick={onCancel}
-            disabled={controlling}
-            title={t("Delete this intent (reason required; soft or hard delete)")}
-            aria-label={t("Delete this intent (reason required; soft or hard delete)")}
-            className="text-destructive hover:text-destructive"
-          >
-            <Trash2Icon />
-          </Button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function truncateWorkerAssetLabel(value: string, maxChars = 30): string {
-  const chars = Array.from(value.trim());
-  if (chars.length <= maxChars) return chars.join("");
-  return `${chars.slice(0, Math.max(0, maxChars - 1)).join("")}…`;
-}
-
-function WorkerAssetBadge({ assets }: { assets: IntentAsset[] }) {
-  const displayAssets = assets.filter(
-    (asset) => asset.type === "root_domain" || asset.type === "subdomain" || asset.type === "ip",
-  );
-  if (displayAssets.length === 0) return null;
-
-  const first = displayAssets[0];
-  const firstRawLabel = first.label.trim() || `#${first.asset_id}`;
-  const firstLabel = truncateWorkerAssetLabel(firstRawLabel);
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Badge variant="outline" className="max-w-60 shrink-0 font-normal" title={firstRawLabel}>
-          <span className="truncate">{t("Current assets: {label}", { label: firstLabel })}</span>
-          {displayAssets.length > 1 && <span className="shrink-0 tabular-nums">+{displayAssets.length - 1}</span>}
-        </Badge>
-      </TooltipTrigger>
-      <TooltipContent side="right" align="start" className="max-w-sm">
-        <div className="flex flex-col gap-2">
-          {displayAssets.map((asset) => (
-            <div key={`${asset.intent_id}-${asset.asset_id}`} className="min-w-0">
-              <div className="break-all font-mono text-xs">{asset.label.trim() || `#${asset.asset_id}`}</div>
-              <div className="mt-0.5 text-xs text-muted-foreground">
-                {taskAssetTypeLabel(asset.type)} · {taskAssetSourceLabel(asset.source)}
-                {asset.inherited ? ` · ${t("from source task #{id}", { id: asset.source_task_id ?? "" })}` : ""}
-              </div>
-              <div className="mt-0.5 [overflow-wrap:anywhere] text-xs">{asset.source_summary}</div>
-            </div>
-          ))}
-        </div>
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
 const LiveRunDuration = React.memo(function LiveRunDuration({
   firstTs,
   lastTs,
@@ -559,6 +328,8 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   // would squeeze the transcript below down to just the header and input. Collapsed, the transcript gets nearly all the height;
   // tapping the title bar expands it to pick a session, collapsing again after choosing. Desktop is unaffected (always expanded from lg up).
   const [listOpen, setListOpen] = React.useState(false);
+  const [railCollapsed, setRailCollapsed] = React.useState(false);
+  const [rerunningIntentId, setRerunningIntentId] = React.useState<string | null>(null);
   // Per-session lazily-loaded caches, keyed by session_key (main | plan | intent:<id>).
   const [store, setStore] = React.useState<SessionStore>({});
   // Worker sessions derived from exploration intents (paged past the old 300 cap).
@@ -675,6 +446,23 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       }
     },
     [controllingIntent, patchIntentState, taskId],
+  );
+
+  const rerunWorker = React.useCallback(
+    async (session: Session) => {
+      if (!session.intent_id || session.inherited || rerunningIntentId) return;
+      setRerunningIntentId(session.intent_id);
+      try {
+        await api.rerunIntent(taskId, session.intent_id);
+        patchIntentState(session.intent_id, "open");
+        toast.success(t("Worker #{id} resumed, waiting to be re-claimed", { id: session.intent_id }));
+      } catch (error) {
+        toast.error(t("Worker operation failed: {error}", { error: (error as Error).message }));
+      } finally {
+        setRerunningIntentId(null);
+      }
+    },
+    [patchIntentState, rerunningIntentId, taskId],
   );
 
   // SSE connection state — surfaced so a dropped realtime link is visible, never
@@ -1523,17 +1311,19 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   );
 
   const activeTokens = tokenForSession(activeKey);
-  const tokenTotal = {
-    i: activeTokens.input_tokens,
-    o: activeTokens.output_tokens,
-    cr: activeTokens.cache_read_tokens,
-    any:
-      activeTokens.input_tokens +
-        activeTokens.output_tokens +
-        activeTokens.cache_read_tokens +
-        activeTokens.cache_write_tokens >
-      0,
-  };
+
+  const selectSession = React.useCallback(
+    (s: Session) => {
+      approvalFocus.close();
+      setActiveId(s.id);
+      setListOpen(false);
+      setWorkerMessage("");
+      setWorkerMessageRequestId("");
+    },
+    [approvalFocus],
+  );
+
+  const unreadFor = React.useCallback((s: Session) => store[keyForSession(s)]?.unread ?? 0, [store]);
 
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
   const contentRef = React.useRef<HTMLDivElement | null>(null);
@@ -1666,181 +1456,52 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   const activeAssets =
     active.role === "worker" && active.intent_id ? intentAssetsByID.get(active.intent_id) : undefined;
 
+  const plannerSession = grouped.planner[0] ?? { ...PLANNER_SESSION, live: plannerLive };
+  const systemSession = grouped.system[0] ?? SYSTEM_SESSION;
+  const activeWorkerMeta = active.role === "worker" ? sessionMeta.get(active.id) : undefined;
+
   return (
-    <TooltipProvider delayDuration={300}>
-      {/* Height reserve: page header (title row + goal + Tabs ≈ 7.5rem) + content padding. Mobile p-4,
+      /* Height reserve: page header (title row + goal + Tabs ≈ 7.5rem) + content padding. Mobile p-4,
         desktop lg:p-6, and desktop also needs scroll headroom, so the two tiers reserve 10rem / 13rem respectively — mobile
-        reusing 13rem would waste 3rem of transcript height. */}
+        reusing 13rem would waste 3rem of transcript height. */
       <div
         className={cn(
           "grid h-[calc(100svh-10rem)] min-h-0 grid-cols-1 gap-4",
-          listOpen ? "grid-rows-[minmax(0,40svh)_minmax(0,1fr)]" : "grid-rows-[auto_minmax(0,1fr)]",
-          "lg:h-[calc(100svh-13rem)] lg:grid-cols-[18rem_1fr] lg:grid-rows-[minmax(0,1fr)]",
+          listOpen ? "grid-rows-[minmax(0,44svh)_minmax(0,1fr)]" : "grid-rows-[auto_minmax(0,1fr)]",
+          railCollapsed
+            ? "lg:h-[calc(100svh-13rem)] lg:grid-cols-1 lg:grid-rows-[minmax(0,1fr)]"
+            : "lg:h-[calc(100svh-13rem)] lg:grid-cols-[20rem_1fr] lg:grid-rows-[minmax(0,1fr)]",
         )}
       >
-        {/* Left: session list */}
-        <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border bg-card">
-          <div className="border-b px-3 py-2">
-            <div className="flex items-center justify-between gap-2">
-              <button
-                type="button"
-                onClick={() => setListOpen((open) => !open)}
-                aria-expanded={listOpen}
-                aria-controls="session-list-panel"
-                className="flex min-w-0 flex-1 items-center gap-1 text-left text-xs font-medium text-muted-foreground lg:pointer-events-none"
-              >
-                <ChevronDownIcon
-                  className={cn("size-3.5 shrink-0 transition-transform lg:hidden", !listOpen && "-rotate-90")}
-                />
-                <span className="shrink-0">{t("Sessions")}</span>
-                {!listOpen && (
-                  <>
-                    <span className="min-w-0 truncate text-foreground lg:hidden" title={activeDisplayTitle}>
-                      · {activeDisplayTitle}
-                    </span>
-                    {hiddenUnread > 0 && (
-                      <span className="inline-flex min-w-4 shrink-0 items-center justify-center rounded-full bg-blue-500/15 px-1 text-[10px] font-medium tabular-nums text-blue-600 lg:hidden dark:text-blue-400">
-                        {hiddenUnread > 99 ? "99+" : hiddenUnread}
-                      </span>
-                    )}
-                  </>
-                )}
-              </button>
-              {!MOCK && (
-                <span
-                  className={cn(
-                    "inline-flex items-center gap-1 text-[10px]",
-                    sseLive ? "text-emerald-500" : "text-amber-500",
-                  )}
-                  title={
-                    sseLive
-                      ? t("Live connection healthy")
-                      : t("Live connection lost, reconnecting automatically (history still visible)")
-                  }
-                >
-                  {sseLive ? (
-                    <>
-                      <span className="size-1 animate-pulse rounded-full bg-emerald-500" />
-                      {t("Live")}
-                    </>
-                  ) : (
-                    <>
-                      <WifiOffIcon className="size-3" />
-                      {t("Reconnecting")}
-                    </>
-                  )}
-                </span>
-              )}
-            </div>
-            {taskTokens && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1 text-xs text-muted-foreground">
-                    <span>{t("Task total")}</span>
-                    <span>·</span>
-                    <TokenMetrics
-                      input={taskTokens.input_tokens}
-                      cache={taskTokens.cache_read_tokens}
-                      output={taskTokens.output_tokens}
-                    />
-                  </div>
-                </TooltipTrigger>
-                <TooltipContent>
-                  {t("Input {input} · Output {output} · Cache read {cacheRead} · Cache write {cacheWrite}", {
-                    input: taskTokens.input_tokens.toLocaleString(intlLocale),
-                    output: taskTokens.output_tokens.toLocaleString(intlLocale),
-                    cacheRead: taskTokens.cache_read_tokens.toLocaleString(intlLocale),
-                    cacheWrite: taskTokens.cache_write_tokens.toLocaleString(intlLocale),
-                  })}
-                </TooltipContent>
-              </Tooltip>
-            )}
-          </div>
-          <ScrollArea
-            id="session-list-panel"
-            type="auto"
-            className={cn(
-              "min-h-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!",
-              !listOpen && "max-lg:hidden",
-            )}
-          >
-            <div className="flex w-full flex-col gap-3 p-2">
-              {(["mainagent", "planner", "system", "worker"] as const).map((role) => {
-                const items = grouped[role];
-                if (!items.length) return null;
-                const Meta = roleMeta[role];
-                return (
-                  <div key={role} className="flex flex-col gap-0.5">
-                    <div className="flex items-center gap-1.5 px-2 py-1 text-xs font-medium text-muted-foreground">
-                      <Meta.icon className="size-3.5" />
-                      {Meta.label}
-                      {role === "mainagent" && (
-                        <button
-                          type="button"
-                          onClick={() => setConfirmNewMain(true)}
-                          disabled={creatingMain}
-                          title={t("New main agent session (clears context, task state preserved)")}
-                          aria-label={t("New main agent session")}
-                          className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent/60 hover:text-foreground disabled:opacity-50"
-                        >
-                          {creatingMain ? (
-                            <Loader2Icon className="size-3.5 animate-spin" />
-                          ) : (
-                            <PlusIcon className="size-3.5" />
-                          )}
-                          {t("New")}
-                        </button>
-                      )}
-                    </div>
-                    {items.map((s) => {
-                      const meta = s.role === "worker" ? sessionMeta.get(s.id) : undefined;
-                      return (
-                        <SessionItem
-                          key={s.id}
-                          s={s}
-                          active={s.id === activeId}
-                          displayTitle={meta?.title ?? s.title}
-                          hasPending={hasPendingForSession(s)}
-                          unread={store[keyForSession(s)]?.unread}
-                          onClick={() => {
-                            approvalFocus.close();
-                            setActiveId(s.id);
-                            setListOpen(false); // on mobile, collapse after picking to give the height back to the transcript
-                            setWorkerMessage("");
-                            setWorkerMessageRequestId("");
-                          }}
-                          controlling={controllingIntent === s.intent_id}
-                          deleted={meta?.deleted}
-                          onCancel={() => {
-                            setCancelIntent(s);
-                          }}
-                        />
-                      );
-                    })}
-                    {role === "worker" && intentsHasMore && (
-                      <button
-                        type="button"
-                        onClick={loadOlderIntents}
-                        disabled={loadingOlderIntents}
-                        className="mt-0.5 flex items-center justify-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent/50"
-                      >
-                        {loadingOlderIntents ? (
-                          <Loader2Icon className="size-3.5 animate-spin" />
-                        ) : (
-                          <RotateCwIcon className="size-3.5" />
-                        )}
-                        {t("Load earlier workers")}
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-              {mainLoaded && !workerSessions.length && (
-                <div className="px-2 py-1 text-xs text-muted-foreground">{t("No running worker sessions.")}</div>
-              )}
-            </div>
-          </ScrollArea>
-        </div>
+        {/* Left: hierarchical agent sidebar */}
+        <AgentSidebar
+          activeId={activeId}
+          activeDisplayTitle={activeDisplayTitle}
+          mainSessions={grouped.mainagent}
+          plannerSession={plannerSession}
+          systemSession={systemSession}
+          workerSessions={grouped.worker}
+          sessionMeta={sessionMeta}
+          intentAssetsByID={intentAssetsByID}
+          unreadFor={unreadFor}
+          hasPendingFor={hasPendingForSession}
+          sseLive={sseLive}
+          taskTokens={taskTokens}
+          listOpen={listOpen}
+          onToggleListOpen={() => setListOpen((open) => !open)}
+          railCollapsed={railCollapsed}
+          onCollapseRail={() => setRailCollapsed(true)}
+          hiddenUnread={hiddenUnread}
+          creatingMain={creatingMain}
+          onRequestNewMain={() => setConfirmNewMain(true)}
+          onSelectSession={selectSession}
+          onRequestCancelWorker={setCancelIntent}
+          controllingIntent={controllingIntent}
+          intentsHasMore={intentsHasMore}
+          loadingOlderIntents={loadingOlderIntents}
+          onLoadOlderIntents={loadOlderIntents}
+          mainLoaded={mainLoaded}
+        />
 
         {/* Right: transcript */}
         <SideQuestionWorkspace
@@ -1852,108 +1513,32 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
           }
         >
           <div className="flex min-h-0 flex-1 min-w-0 flex-col overflow-hidden rounded-lg border bg-card">
-            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 border-b px-3 py-2 sm:px-4 sm:py-2.5">
-              {(() => {
-                const isWorker = active.role === "worker";
-                const meta = isWorker ? sessionMeta.get(active.id) : undefined;
-                // Worker: the intent moved into the transcript as a message, so the
-                // header shows a stable generic label (intent JSON stays on hover).
-                const title = isWorker ? t("Worker execution session") : active.title;
-                const titleEl = <span className="min-w-0 truncate text-sm font-medium">{title}</span>;
-                return meta?.json ? (
-                  <Tooltip>
-                    <TooltipTrigger asChild>{titleEl}</TooltipTrigger>
-                    <TooltipContent side="bottom" align="start" className="max-h-80 max-w-sm overflow-auto p-0">
-                      <pre className="p-2 text-[10px] leading-relaxed">{JSON.stringify(meta.json, null, 2)}</pre>
-                    </TooltipContent>
-                  </Tooltip>
-                ) : (
-                  titleEl
-                );
-              })()}
-              <SideQuestionButton side={side} />
-              {activeResolution && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Badge
-                      variant="outline"
-                      className="max-w-28 shrink-0 font-normal"
-                      aria-label={
-                        activeResolution.available
-                          ? t("Current config: {name}", { name: resolutionLabel(activeResolution) })
-                          : t("Model unavailable")
-                      }
-                    >
-                      <span className="truncate">
-                        {activeResolution.available ? resolutionLabel(activeResolution) : t("Model unavailable")}
-                      </span>
-                    </Badge>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom" className="max-w-xs [overflow-wrap:anywhere]">
-                    {activeResolution.available
-                      ? [resolutionLabel(activeResolution), activeResolution.model].filter(Boolean).join(" / ")
-                      : activeResolution.reason || t("No available LLM config")}
-                  </TooltipContent>
-                </Tooltip>
-              )}
-              {activeAssets && activeAssets.length > 0 && <WorkerAssetBadge assets={activeAssets} />}
-              {active.inherited && active.source_task_id && (
-                <Badge variant="outline">
-                  {t("Source task #{id} · read-only history", { id: active.source_task_id })}
-                </Badge>
-              )}
-              {active.live && (
-                <span className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
-                  <span className="size-1 animate-pulse rounded-full bg-blue-500" />
-                  {t("Live")}
-                </span>
-              )}
-              {activeState?.hasMore && (
-                <span className="text-[10px] text-muted-foreground" title={t("Scroll up to load earlier history")}>
-                  ↑ {t("Earlier history")}
-                </span>
-              )}
-              <div className="ml-auto flex min-w-0 max-w-full items-center justify-end gap-x-3 gap-y-1 text-xs text-muted-foreground max-sm:w-full max-sm:flex-wrap">
-                {tokenTotal.any && (
-                  <Tooltip>
-                    {/* Mobile uses short labels (In/Cache/Out): long labels wrap this row onto two lines, further squeezing the transcript. */}
-                    <TooltipTrigger asChild>
-                      <span className="inline-flex min-w-0 items-center">
-                        <TokenMetrics
-                          input={tokenTotal.i}
-                          cache={tokenTotal.cr}
-                          output={tokenTotal.o}
-                          labels="short"
-                          className="sm:hidden"
-                        />
-                        <TokenMetrics
-                          input={tokenTotal.i}
-                          cache={tokenTotal.cr}
-                          output={tokenTotal.o}
-                          labels="long"
-                          className="max-sm:hidden"
-                        />
-                      </span>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      {t("Input {input} · Output {output} · Cache read {cacheRead} · Cache write {cacheWrite}", {
-                        input: activeTokens.input_tokens.toLocaleString(intlLocale),
-                        output: activeTokens.output_tokens.toLocaleString(intlLocale),
-                        cacheRead: activeTokens.cache_read_tokens.toLocaleString(intlLocale),
-                        cacheWrite: activeTokens.cache_write_tokens.toLocaleString(intlLocale),
-                      })}
-                    </TooltipContent>
-                  </Tooltip>
-                )}
+            <AgentTranscriptHeader
+              active={active}
+              displayTitle={activeDisplayTitle}
+              intentJson={activeWorkerMeta?.json}
+              deleted={activeWorkerMeta?.deleted}
+              railCollapsed={railCollapsed}
+              onExpandRail={() => setRailCollapsed(false)}
+              side={side}
+              activeResolution={activeResolution}
+              activeAssets={activeAssets}
+              hasMoreHistory={activeState?.hasMore}
+              tokens={activeTokens}
+              durationNode={
                 <LiveRunDuration
                   firstTs={activity.length ? activity[0].ts : ""}
                   lastTs={activity.length ? activity[activity.length - 1].ts : ""}
                   live={active.live}
                   taskPaused={taskPaused}
                 />
-                {isMain && <span>{t("Interactive")}</span>}
-              </div>
-            </div>
+              }
+              controllingIntent={controllingIntent}
+              rerunningIntent={rerunningIntentId === active.intent_id}
+              onControlWorker={(session, action) => controlWorker(session, action)}
+              onRerunWorker={rerunWorker}
+              onRequestCancelWorker={setCancelIntent}
+            />
             {(() => {
               const dm = active.role === "worker" ? sessionMeta.get(active.id) : undefined;
               if (!dm?.deleted) return null;
@@ -2216,7 +1801,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                           title={t("Send message")}
                           aria-label={t("Send message")}
                         >
-                          {workerMessageSending ? <Spinner /> : <ArrowUpIcon />}
+                          {workerMessageSending ? <Loader2Icon className="animate-spin" /> : <ArrowUpIcon />}
                         </InputGroupButton>
                       </>
                     )}
@@ -2336,6 +1921,5 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
           </AlertDialogContent>
         </AlertDialog>
       </div>
-    </TooltipProvider>
   );
 }

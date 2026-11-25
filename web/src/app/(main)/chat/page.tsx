@@ -10,6 +10,8 @@ import {
   ListChecksIcon,
   Loader2Icon,
   MoreHorizontalIcon,
+  PanelLeftCloseIcon,
+  PanelLeftOpenIcon,
   PaperclipIcon,
   PencilIcon,
   PinIcon,
@@ -138,7 +140,7 @@ function groupByAgent(conversations: Conversation[], agentByKey: Map<string, Age
 function LiveBadge() {
   return (
     <span className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
-      <span className="size-1 animate-pulse rounded-full bg-blue-500" />
+      <span className="size-1 motion-safe:animate-pulse rounded-full bg-blue-500" />
       {t("Live")}
     </span>
   );
@@ -494,6 +496,7 @@ function ChatView({
   initial,
   onTitleMaybeChanged,
   onConvUpdated,
+  leadingControl,
 }: {
   conv: Conversation;
   agents: Agent[];
@@ -503,6 +506,7 @@ function ChatView({
   initial?: { input?: string; attachments?: ChatAttachment[] };
   onTitleMaybeChanged: () => void;
   onConvUpdated: () => void;
+  leadingControl?: React.ReactNode;
 }) {
   const approvalFocus = useApprovalFocus({ conversationId: conv.id });
   const [messages, setMessages] = React.useState<Activity[]>([]);
@@ -850,6 +854,7 @@ function ChatView({
     <SideQuestionWorkspace side={side} label={agent?.name ?? conv.agent_key} composerLayout="inline">
       {/* header: which agent + live + token meta */}
       <div className="flex min-w-0 flex-wrap items-center gap-2 border-b px-4 py-2.5">
+        {leadingControl}
         <Bot className="text-muted-foreground size-4 shrink-0" />
         <span className="min-w-0 max-w-48 truncate text-sm font-medium">{agent?.name ?? conv.agent_key}</span>
         <span className="text-muted-foreground hidden shrink-0 font-mono text-xs sm:inline">{conv.agent_key}</span>
@@ -1147,6 +1152,7 @@ export default function ChatPage() {
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
   const [sourceRequested, setSourceRequested] = React.useState(false);
   const [convsLoaded, setConvsLoaded] = React.useState(false);
+  const [railCollapsed, setRailCollapsed] = React.useState(false);
   const selectConversation = React.useCallback((id: number | null) => {
     if (id !== selectedId) {
       const url = new URL(window.location.href);
@@ -1453,13 +1459,36 @@ export default function ChatPage() {
       data-content-padding="false"
       className="flex h-[calc(100svh-3rem)] min-w-0 flex-col overflow-hidden p-3 sm:p-4 md:h-[calc(100svh-4rem)] md:p-6"
     >
-      <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 grid-rows-[minmax(10rem,15rem)_minmax(0,1fr)] gap-3 md:grid-cols-[18rem_minmax(0,1fr)] md:grid-rows-[minmax(0,1fr)] md:gap-4">
+      <div
+        className={cn(
+          "grid min-h-0 min-w-0 flex-1 grid-cols-1 grid-rows-[minmax(10rem,15rem)_minmax(0,1fr)] gap-3 md:grid-rows-[minmax(0,1fr)] md:gap-4",
+          railCollapsed ? "md:grid-cols-1" : "md:grid-cols-[18rem_minmax(0,1fr)]",
+        )}
+      >
         {/* left: conversation list */}
-        <div className="bg-card flex flex-col overflow-hidden rounded-lg border">
+        <div
+          className={cn(
+            "bg-card flex flex-col overflow-hidden rounded-lg border",
+            railCollapsed && "md:hidden",
+          )}
+        >
           <div className="flex flex-col gap-2 border-b p-2">
-            <Button size="sm" className="w-full" onClick={() => selectConversation(null)}>
-              <PlusIcon /> {t("New conversation")}
-            </Button>
+            <div className="flex items-center gap-1.5">
+              <Button size="sm" className="min-w-0 flex-1" onClick={() => selectConversation(null)}>
+                <PlusIcon /> {t("New conversation")}
+              </Button>
+              <Button
+                type="button"
+                size="icon-sm"
+                variant="ghost"
+                className="hidden shrink-0 text-muted-foreground md:inline-flex"
+                onClick={() => setRailCollapsed(true)}
+                aria-label={t("Collapse")}
+                title={t("Collapse")}
+              >
+                <PanelLeftCloseIcon />
+              </Button>
+            </div>
             <Select
               value={agentFilter === null ? "all" : `agent:${agentFilter}`}
               onValueChange={(value) => changeAgentFilter(value === "all" ? null : value.slice(6))}
@@ -1609,7 +1638,20 @@ export default function ChatPage() {
         </div>
 
         {/* right: chat view */}
-        <div className="bg-card flex min-w-0 flex-col overflow-hidden rounded-lg border">
+        <div className="bg-card relative flex min-w-0 flex-col overflow-hidden rounded-lg border">
+          {railCollapsed && !selected && (
+            <Button
+              type="button"
+              size="icon-xs"
+              variant="outline"
+              className="absolute top-2 left-2 z-20 hidden bg-background/90 text-muted-foreground backdrop-blur md:inline-flex"
+              onClick={() => setRailCollapsed(false)}
+              aria-label={t("Expand")}
+              title={t("Expand")}
+            >
+              <PanelLeftOpenIcon />
+            </Button>
+          )}
           {selected ? (
             <ChatView
               key={selected.id}
@@ -1619,6 +1661,21 @@ export default function ChatPage() {
               initial={pendingByConv[selected.id]}
               onTitleMaybeChanged={reloadConvs}
               onConvUpdated={reloadConvs}
+              leadingControl={
+                railCollapsed ? (
+                  <Button
+                    type="button"
+                    size="icon-xs"
+                    variant="ghost"
+                    className="-ml-1 hidden shrink-0 text-muted-foreground md:inline-flex"
+                    onClick={() => setRailCollapsed(false)}
+                    aria-label={t("Expand")}
+                    title={t("Expand")}
+                  >
+                    <PanelLeftOpenIcon />
+                  </Button>
+                ) : undefined
+              }
             />
           ) : sourceRequested ? (
             <div role="status" className="p-6 text-sm text-muted-foreground">

@@ -47,13 +47,14 @@ type orReasoning struct {
 // function_call / function_call_output item. omitempty keeps each shape minimal
 // so the API sees exactly one well-formed variant per item.
 type orInputItem struct {
-	Type      string `json:"type,omitempty"`
-	Role      string `json:"role,omitempty"`
-	Content   string `json:"content,omitempty"`
-	CallID    string `json:"call_id,omitempty"`
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments,omitempty"`
-	Output    string `json:"output,omitempty"`
+	Type      string   `json:"type,omitempty"`
+	Role      string   `json:"role,omitempty"`
+	Content   string   `json:"content,omitempty"`
+	CallID    string   `json:"call_id,omitempty"`
+	Name      string   `json:"name,omitempty"`
+	Arguments string   `json:"arguments,omitempty"`
+	Output    string   `json:"output,omitempty"`
+	Tools     []orTool `json:"tools,omitempty"`
 }
 
 type orTool struct {
@@ -87,8 +88,16 @@ func (p *openaiResponsesProvider) buildBody(req CompletionRequest, stream bool) 
 	if req.Thinking != "disabled" && effort != "" && effort != "none" {
 		body.Reasoning = &orReasoning{Effort: effort}
 	}
+	var tools []orTool
 	for _, t := range req.Tools {
-		body.Tools = append(body.Tools, orTool{Type: "function", Name: t.Name, Description: t.Description, Parameters: t.InputSchema})
+		tools = append(tools, orTool{Type: "function", Name: t.Name, Description: t.Description, Parameters: t.InputSchema})
+	}
+	if len(tools) > 0 {
+		if p.cfg.ToolsAsInputItem {
+			body.Input = append(body.Input, orInputItem{Type: "additional_tools", Tools: tools})
+		} else {
+			body.Tools = tools
+		}
 	}
 	return json.Marshal(body)
 }

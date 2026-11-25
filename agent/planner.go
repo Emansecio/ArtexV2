@@ -355,24 +355,12 @@ func intentSummary(ts *db.ExplorationStore, id int64) string {
 // workerOutput returns the finished worker's conclusion for an intent — the last
 // 'result' (else 'text') activity's full detail, truncated. Same source get_worker_output uses.
 func workerOutput(ts *db.ExplorationStore, id int64) string {
-	acts, _, err := ts.ActivityList(&id, 0, 1000)
+	out, err := ts.WorkerOutputText(id)
 	if err != nil {
 		return "(failed to fetch output)"
 	}
-	var pick *db.Activity
-	for i := range acts {
-		if acts[i].Kind == "result" {
-			pick = &acts[i]
-		} else if acts[i].Kind == "text" && pick == nil {
-			pick = &acts[i]
-		}
-	}
-	if pick == nil {
-		return "(this work has no output yet)"
-	}
-	out, _ := ts.ActivityDetail(pick.ID)
 	if out == "" {
-		out = pick.Summary
+		return "(this work has no output yet)"
 	}
 	return truncOutput(out, 800)
 }
@@ -518,6 +506,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(WithToolQuery(ctx, plannerToolQuery(goal, triggers)), "planner", base)
 	defer cleanup()
+	def = deferBuiltinTools(tools, def, plannerDeferredBuiltins)
 	// The key situation (just-finished intents + the pre-fetched full graph) goes into
 	// [this round's user input] (see input below); the system prompt keeps only the
 	// static planning body. Moving it out keeps the system prompt stable across rounds,
@@ -685,4 +674,21 @@ func overviewHasFacts(overview map[string]any) bool {
 		return len(rf) > 0
 	}
 	return false
+}
+
+// plannerDeferredBuiltins — domain tools a planner round rarely invokes; they
+// stay discoverable via SearchExtraTools instead of shipping ~200-400-token
+// schemas on every round. graph_overview is already pre-fetched into the
+// round's user message, so its schema is pure overhead.
+var plannerDeferredBuiltins = []string{
+	"graph_overview",
+	"list_companies",
+	"add_company_scope",
+	"add_task_scope",
+	"list_untested_assets",
+	"expand_digest",
+	"get_worker_trace",
+	"search_all_worker_traces",
+	"list_goals",
+	"report_finding",
 }

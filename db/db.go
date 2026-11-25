@@ -21,9 +21,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/config"
@@ -42,7 +45,54 @@ const schemaMigrationLockKey int64 = 7337741001
 // application's own nested checkout depth (the startup schema advisory lock
 // lets seedBuiltins check out another connection while holding one), so it
 // never deadlocks itself.
-const maxOpenConns = 32
+const (
+	maxOpenConns       = 32
+	localMaxOpenConns  = 16
+	localMaxIdleConns  = 4
+	remoteMaxIdleConns = 8
+)
+
+func isLoopbackPGHost(dsn string) bool {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func envPositiveInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+		return n
+	}
+	return fallback
+}
+
+func poolLimits(dsn string) (maxOpen, maxIdle int, idleTime time.Duration) {
+	if isLoopbackPGHost(dsn) {
+		maxOpen = localMaxOpenConns
+		maxIdle = localMaxIdleConns
+		idleTime = 90 * time.Second
+	} else {
+		maxOpen = maxOpenConns
+		maxIdle = remoteMaxIdleConns
+		idleTime = 3 * time.Minute
+	}
+	maxOpen = envPositiveInt("ARTEX_PG_MAX_OPEN_CONNS", maxOpen)
+	maxIdle = envPositiveInt("ARTEX_PG_MAX_IDLE_CONNS", maxIdle)
+	if maxIdle > maxOpen {
+		maxIdle = maxOpen
+	}
+	return maxOpen, maxIdle, idleTime
+}
 
 var schemaDeadlockRetryDelays = [...]time.Duration{
 	100 * time.Millisecond,
@@ -132,7 +182,11 @@ func SuffixTestDatabase(suffix string) {
 
 // DB wraps the shared *sql.DB. PG handles its own connection pool + concurrency
 // (MVCC), so unlike the old SQLite store there is no process-wide write mutex.
-type DB struct{ *sql.DB }
+type DB struct {
+	*sql.DB
+	cfgOnce sync.Once
+	cfg     *configCache
+}
 
 // ensureDatabase connects to the postgres system database and creates the target
 // database if it does not exist. dsn must be a postgres:// URL.
@@ -199,15 +253,16 @@ func openWithMigrations(dsn string, migrations fs.FS) (*DB, error) {
 	// and callers no longer have to distinguish "cannot read" from "not there".
 	// maxOpenConns must leave headroom for psql / reset-password.sh and any
 	// coexisting instances; if max_connections is lowered, lower this too.
-	sqlDB.SetMaxOpenConns(maxOpenConns)
-	sqlDB.SetMaxIdleConns(maxOpenConns)
+	openCap, idleCap, idleTime := poolLimits(dsn)
+	sqlDB.SetMaxOpenConns(openCap)
+	sqlDB.SetMaxIdleConns(idleCap)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
-	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
+	sqlDB.SetConnMaxIdleTime(idleTime)
 	if err := sqlDB.Ping(); err != nil {
 		sqlDB.Close()
 		return nil, fmt.Errorf("ping postgres (%s): %w", config.Redact(dsn), err)
 	}
-	d := &DB{sqlDB}
+	d := &DB{DB: sqlDB}
 	// pgx runs multi-statement Exec via the simple protocol when there are no args.
 	// Keep the dedicated lock connection checked out until both DDL and seeding
 	// finish so concurrent application instances cannot initialize out of order.

@@ -4,9 +4,34 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/Autumn-27/norma/llm"
 )
+
+// summaryProv memoizes the resolved provider (keyed by the env tuple that
+// determines it) so every side-question / task-agent build / goal
+// decomposition shares one warm HTTP/2 connection pool instead of paying cold
+// TCP+TLS+HTTP2 handshakes per call — while an env change still rebuilds it.
+var summaryProvMu sync.Mutex
+var summaryProv struct {
+	key   string
+	p     llm.Provider
+	model string
+	ok    bool
+}
+
+func summaryEnvKey() string {
+	parts := make([]string, 0, 9)
+	for _, k := range []string{
+		"ARTEX_SUMMARY_LLM_MODEL", "ARTEX_SUMMARY_LLM_PROVIDER", "ARTEX_LLM_PROVIDER",
+		"ARTEX_SUMMARY_LLM_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+		"ARTEX_SUMMARY_LLM_BASE_URL", "ARTEX_SUMMARY_LLM_PROXY", "ARTEX_LLM_PROXY",
+	} {
+		parts = append(parts, os.Getenv(k))
+	}
+	return strings.Join(parts, "\x00")
+}
 
 // SummaryProviderFromEnv resolves an optional dedicated (typically cheaper/faster)
 // LLM provider used exclusively for AutoCompact summarization and cold-digest
@@ -20,6 +45,23 @@ import (
 //	ARTEX_SUMMARY_LLM_API_KEY  (optional; falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY)
 //	ARTEX_SUMMARY_LLM_PROXY    (optional; falls back to ARTEX_LLM_PROXY)
 func SummaryProviderFromEnv() (llm.Provider, string, bool) {
+	key := summaryEnvKey()
+	summaryProvMu.Lock()
+	defer summaryProvMu.Unlock()
+	if summaryProv.key == key {
+		return summaryProv.p, summaryProv.model, summaryProv.ok
+	}
+	p, model, ok := resolveSummaryProvider()
+	summaryProv = struct {
+		key   string
+		p     llm.Provider
+		model string
+		ok    bool
+	}{key, p, model, ok}
+	return p, model, ok
+}
+
+func resolveSummaryProvider() (llm.Provider, string, bool) {
 	model := strings.TrimSpace(os.Getenv("ARTEX_SUMMARY_LLM_MODEL"))
 	if model == "" {
 		return nil, "", false

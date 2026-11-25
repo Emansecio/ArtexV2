@@ -497,7 +497,17 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	if t.ts != nil {
 		if sfp, ferr := t.ts.OverviewFingerprint(); ferr == nil && sfp != "" {
 			fp = sfp
-			cacheKey = fmt.Sprintf("%d:%d:%v", t.ts.ID(), t.taskID, t.coverageDisabled)
+			// The snapshot folds related-task overviews, so it must be keyed on
+			// the sources' fingerprints too — a source's writes have to bust it.
+			var kb strings.Builder
+			fmt.Fprintf(&kb, "%d:%d:%v", t.ts.ID(), t.taskID, t.coverageDisabled)
+			if srcs, serr := t.ts.DirectSourceStores(); serr == nil {
+				for _, src := range srcs {
+					sfp2, _ := src.Store.OverviewFingerprint()
+					fmt.Fprintf(&kb, "|%d:%s", src.Task.TaskID, sfp2)
+				}
+			}
+			cacheKey = kb.String()
 			overviewCache.mu.Lock()
 			if ent, ok := overviewCache.m[cacheKey]; ok && ent.fp == fp && time.Since(ent.createdAt) < 15*time.Second {
 				cp := maps.Clone(ent.data)
@@ -560,6 +570,15 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			} else {
 				edges = rawEdges
 			}
+			// Digest member ids from the same edge read — coldDigestsRecent
+			// would otherwise issue one DigestMembers query per active digest.
+			memberOf := map[int64][]int64{}
+			for _, e := range rawEdges {
+				if e.Rel == db.RelCovers {
+					memberOf[e.From] = append(memberOf[e.From], e.To)
+				}
+			}
+			cds, cdMore = coldDigestsRecent(t.ts, coldDigestsCap, memberOf)
 			for _, n := range rawNodes {
 				switch n.Kind {
 				case db.KindGoal:
@@ -598,7 +617,6 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			openTotal, hasOpenTot = fo, true
 		}
 	})
-	run(func() { cds, cdMore = coldDigestsRecent(t.ts, coldDigestsCap) })
 	run(func() {
 		if d, g, err := t.ts.Root(); err == nil {
 			rootDesc, rootGoal, hasRoot = d, g, true
@@ -632,11 +650,12 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	out["goals"] = gsum
 
 	hsum := make([]map[string]any, 0, len(hints))
+	trafficBinding := findingTrafficBindingEnabled()
 	for _, h := range hints {
 		var p map[string]any
 		_ = json.Unmarshal(h.Payload, &p)
 		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"], "origin": h.Origin}
-		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
+		if trafficBinding && p["traffic_refs"] != nil {
 			hint["traffic_refs"] = p["traffic_refs"]
 		}
 		hsum = append(hsum, hint)
@@ -938,6 +957,7 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		parentsOf := map[int64][]int64{}
 		yieldsOf := map[int64][]int64{}
 		factFrom := map[int64]int64{}
+		coversOf := map[int64][]int64{}
 		for _, edge := range edges {
 			switch edge.Rel {
 			case db.RelDerivedFrom, db.RelSpawns:
@@ -945,6 +965,8 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 			case db.RelYields:
 				yieldsOf[edge.From] = append(yieldsOf[edge.From], edge.To)
 				factFrom[edge.To] = edge.From
+			case db.RelCovers:
+				coversOf[edge.From] = append(coversOf[edge.From], edge.To)
 			}
 		}
 
@@ -1027,25 +1049,14 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 			intent.SourceTaskID = source.Task.TaskID
 		}
 		intentResults := compactIntents(recentDone, parentsOf, yieldsOf)
+		doneIDs := make([]int64, len(recentDone))
+		for i, intent := range recentDone {
+			doneIDs[i] = intent.ID
+		}
+		resultSummaries, _ := ts.TerminalIntentResultSummaries(doneIDs)
 		for i, intent := range recentDone {
 			intentResults[i]["summary"] = budget.take(intentResults[i]["summary"], 400)
-			acts, _, err := ts.ActivityPageForTerminalIntent(intent.ID, 0, 20)
-			if err != nil {
-				continue
-			}
-			var resultSummary, textFallback string
-			for _, activity := range acts {
-				switch activity.Kind {
-				case "result":
-					resultSummary = activity.Summary
-				case "text":
-					textFallback = activity.Summary
-				}
-			}
-			if resultSummary == "" {
-				resultSummary = textFallback
-			}
-			if resultSummary != "" {
+			if resultSummary := resultSummaries[intent.ID]; resultSummary != "" {
 				intentResults[i]["result_summary"] = budget.take(resultSummary, 800)
 			}
 		}
@@ -1053,7 +1064,7 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		// §2 cross-task: the source task's folded cold region, read-only, newest-member
 		// first & capped like the current task's. Members (and overflow digests) are
 		// resolvable via expand_digest(id)/node_detail(id), which search source tasks.
-		if cds, more := coldDigestsRecent(ts, relatedOverviewMaxDigestsPerSource); len(cds) > 0 {
+		if cds, more := coldDigestsRecent(ts, relatedOverviewMaxDigestsPerSource, coversOf); len(cds) > 0 {
 			for _, cd := range cds {
 				cd["inherited"] = true
 				cd["source_task_id"] = source.Task.TaskID

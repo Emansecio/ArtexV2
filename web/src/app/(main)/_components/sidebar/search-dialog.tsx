@@ -4,8 +4,9 @@ import * as React from "react";
 
 import { useRouter } from "next/navigation";
 
-import { Search } from "lucide-react";
+import { MessageSquare, Plus, Search, ShieldAlert, Target } from "lucide-react";
 
+import { StatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -18,6 +19,8 @@ import {
   CommandSeparator,
 } from "@/components/ui/command";
 import { t } from "@/i18n";
+import { api } from "@/lib/api";
+import type { Task } from "@/lib/types";
 import type { NavMainItem } from "@/navigation/sidebar/sidebar-items";
 import { sidebarItems } from "@/navigation/sidebar/sidebar-items";
 
@@ -78,9 +81,11 @@ function groupBy(items: SearchItem[]) {
   }));
 }
 
-export function SearchDialog() {
+export function SearchDialog({ showTrigger = true }: { showTrigger?: boolean }) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
+  const [recentTasks, setRecentTasks] = React.useState<Task[]>([]);
+  const lastTasksFetchRef = React.useRef(0);
   const router = useRouter();
 
   React.useEffect(() => {
@@ -94,19 +99,45 @@ export function SearchDialog() {
     return () => document.removeEventListener("keydown", down);
   }, []);
 
+  React.useEffect(() => {
+    if (!open) return;
+    if (Date.now() - lastTasksFetchRef.current < 15_000) return;
+    let alive = true;
+    api
+      .tasks()
+      .then((res) => {
+        if (!alive) return;
+        lastTasksFetchRef.current = Date.now();
+        const sorted = [...res.tasks]
+          .sort((a, b) => (b.last_activity_unix ?? b.created_unix ?? 0) - (a.last_activity_unix ?? a.created_unix ?? 0))
+          .slice(0, 5);
+        setRecentTasks(sorted);
+      })
+      .catch(() => {
+        /* ignore transient errors */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [open]);
+
   const handleOpenChange = (value: boolean) => {
     setOpen(value);
     if (!value) setQuery("");
   };
 
+  const navigate = (url: string, newTab?: boolean) => {
+    handleOpenChange(false);
+    if (newTab) {
+      window.open(url, "_blank", "noopener,noreferrer");
+    } else {
+      router.push(url);
+    }
+  };
+
   const handleSelect = (item: SearchItem) => {
     if (item.disabled) return;
-    handleOpenChange(false);
-    if (item.newTab) {
-      window.open(item.url, "_blank", "noopener,noreferrer");
-    } else {
-      router.push(item.url);
-    }
+    navigate(item.url, item.newTab);
   };
 
   const renderGroups = (items: SearchItem[]) =>
@@ -133,22 +164,64 @@ export function SearchDialog() {
 
   return (
     <>
-      <Button
-        onClick={() => handleOpenChange(true)}
-        variant="link"
-        className="px-0! font-normal text-muted-foreground hover:no-underline"
-      >
-        <Search data-icon="inline-start" />
-        {t("Search")}
-        <kbd className="inline-flex h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-medium text-[10px]">
-          <span className="text-xs">⌘</span>K
-        </kbd>
-      </Button>
+      {showTrigger && (
+        <Button
+          onClick={() => handleOpenChange(true)}
+          variant="outline"
+          size="sm"
+          className="h-7 w-40 justify-between gap-2 px-2.5 font-normal text-muted-foreground sm:w-52"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Search className="size-3.5 shrink-0" />
+            <span className="truncate text-xs">{t("Search")}</span>
+          </span>
+          <kbd className="inline-flex h-4.5 select-none items-center gap-0.5 rounded border bg-muted px-1 font-medium text-[10px]">
+            <span className="text-[11px]">⌘</span>K
+          </kbd>
+        </Button>
+      )}
       <CommandDialog open={open} onOpenChange={handleOpenChange}>
         <Command>
-          <CommandInput placeholder={t("Search dashboards, users, and more…")} value={query} onValueChange={setQuery} />
+          <CommandInput placeholder={t("Search pages, tasks, and actions…")} value={query} onValueChange={setQuery} />
           <CommandList>
             <CommandEmpty>{t("No results found.")}</CommandEmpty>
+            <CommandGroup heading={t("Quick actions")}>
+              <CommandItem value={`quick ${t("New task")}`} onSelect={() => navigate("/function/tasks")}>
+                <Plus />
+                <span>{t("New task")}</span>
+              </CommandItem>
+              <CommandItem value={`quick ${t("Chat")}`} onSelect={() => navigate("/chat")}>
+                <MessageSquare />
+                <span>{t("Chat")}</span>
+              </CommandItem>
+              <CommandItem
+                value={`quick ${t("Pending approvals")}`}
+                onSelect={() => navigate("/system/intercept/approvals")}
+              >
+                <ShieldAlert />
+                <span>{t("Pending approvals")}</span>
+              </CommandItem>
+            </CommandGroup>
+            {recentTasks.length > 0 && (
+              <>
+                <CommandSeparator />
+                <CommandGroup heading={t("Recent tasks")}>
+                  {recentTasks.map((task) => (
+                    <CommandItem
+                      key={`task-${task.id}`}
+                      value={`task ${task.id} ${task.name ?? ""} ${task.description}`}
+                      onSelect={() => navigate(`/function/tasks/detail?id=${encodeURIComponent(task.id)}`)}
+                    >
+                      <Target className="shrink-0" />
+                      <span className="min-w-0 flex-1 truncate">{task.name || task.description}</span>
+                      <span className="font-mono text-[10px] text-muted-foreground">#{task.id}</span>
+                      <StatusBadge domain="task" value={task.status} className="px-1.5 py-0 text-[10px]" />
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              </>
+            )}
+            <CommandSeparator />
             {query ? renderGroups(searchItems) : renderGroups(recommendations)}
           </CommandList>
         </Command>

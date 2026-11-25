@@ -173,6 +173,9 @@ type remoteTool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema"`
+	Annotations *struct {
+		ReadOnlyHint bool `json:"readOnlyHint"`
+	} `json:"annotations,omitempty"`
 }
 
 // initialize performs the MCP handshake.
@@ -213,7 +216,10 @@ func (c *Client) wrap(rt remoteTool) tool.CoreTool {
 		schema = map[string]any{"type": "object"}
 	}
 	full := ToolName(c.server, rt.Name)
-	return tool.Build(tool.Spec{
+	// The stdio transport multiplexes concurrent JSON-RPC IDs, so a tool
+	// declaring readOnlyHint may run in parallel like the HTTP/SSE clients do.
+	readOnly := rt.Annotations != nil && rt.Annotations.ReadOnlyHint
+	spec := tool.Spec{
 		Name:        full,
 		Description: rt.Description,
 		Schema:      schema,
@@ -245,7 +251,12 @@ func (c *Client) wrap(rt remoteTool) tool.CoreTool {
 			}
 			return tool.Result{Content: []llm.ContentBlock{llm.TextBlock(tool.Capture(tc, text))}, IsError: res.IsError}, nil
 		},
-	})
+	}
+	if readOnly {
+		spec.ReadOnly = func(json.RawMessage) bool { return true }
+		spec.Concurrent = func(json.RawMessage) bool { return true }
+	}
+	return tool.Build(spec)
 }
 
 // Close shuts down the client's transport.

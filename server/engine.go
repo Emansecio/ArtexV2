@@ -161,6 +161,20 @@ type Engine struct {
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
 	deltaHub  *DeltaHub
+
+	// Bounded async writer for "usage" activity rows: every LLM turn emits one,
+	// and they carry no pairing/ordering constraints (unlike tool_use↔tool_result),
+	// so persisting them synchronously would put a PostgreSQL insert on the
+	// critical path of every turn. Lazily started, drained by one goroutine for
+	// the process lifetime (Engine has no global shutdown).
+	usageOnce sync.Once
+	usageQ    chan usageActivityWrite
+}
+
+// usageActivityWrite is one queued "usage" activity row bound to its task.
+type usageActivityWrite struct {
+	t *Task
+	r db.Activity
 }
 
 func (e *Engine) SetDeltaHub(h *DeltaHub) { e.deltaHub = h }
@@ -473,7 +487,11 @@ func (e *Engine) ActiveLLMCalls(taskID string) int64 {
 func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
 
 func plannerDebounceDuration() time.Duration {
-	const defaultDebounce = 2000 * time.Millisecond
+	// Burst-coalescing window for routine worker-done wakes: long enough to fold
+	// simultaneous worker completions into one round, short enough not to stall
+	// a live multi-worker pipeline. Urgent wakes (finding/hint/goal/cancel)
+	// bypass the debounce entirely — see runRound.
+	const defaultDebounce = 200 * time.Millisecond
 	raw := strings.TrimSpace(os.Getenv("ARTEX_PLANNER_DEBOUNCE_MS"))
 	if raw == "" {
 		return defaultDebounce
@@ -749,9 +767,84 @@ func (e *Engine) KillWork(intentID int64) error {
 // Broadcaster exposes the engine's live activity pub/sub (used by the SSE handler).
 func (e *Engine) Broadcaster() *Broadcaster { return e.bc }
 
+// usageWriteQueue lazily starts the usage writer and returns its queue.
+func (e *Engine) usageWriteQueue() chan usageActivityWrite {
+	e.usageOnce.Do(func() {
+		e.usageQ = make(chan usageActivityWrite, 256)
+		go func() {
+			for w := range e.usageQ {
+				e.emitActivity(w.t, w.r)
+			}
+		}()
+	})
+	return e.usageQ
+}
+
+// actEmitter is a per-run FIFO between the run's emit calls and the synchronous
+// persist+broadcast path, so a Postgres write never stalls tool dispatch or the
+// SSE reader during streaming. One goroutine drains in order; flush() must run
+// before the run ends so callers reading activities afterwards see every row
+// committed. Emits racing a completed flush fall back to writing inline.
+type actEmitter struct {
+	write  func(db.Activity)
+	ch     chan db.Activity
+	done   chan struct{}
+	mu     sync.Mutex
+	closed bool
+}
+
+func newActEmitter(write func(db.Activity)) *actEmitter {
+	e := &actEmitter{write: write, ch: make(chan db.Activity, 128), done: make(chan struct{})}
+	go func() {
+		defer close(e.done)
+		for r := range e.ch {
+			write(r)
+		}
+	}()
+	return e
+}
+
+func (e *actEmitter) emit(r db.Activity) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		e.write(r)
+		return
+	}
+	e.ch <- r
+}
+
+// flush closes the queue and waits for the drainer to commit every queued
+// record. Idempotent: callers may also flush early to restore ordering before
+// a subsequent direct write (e.g. the post-run error record).
+func (e *actEmitter) flush() {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		<-e.done
+		return
+	}
+	e.closed = true
+	e.mu.Unlock()
+	close(e.ch)
+	<-e.done
+}
+
 // emitActivity persists one captured step AND fans it out to live subscribers,
 // from a single point so storage and the SSE stream never diverge.
 func (e *Engine) emitActivity(t *Task, r db.Activity) db.Activity {
+	// Usage metering rows block every LLM turn on a synchronous insert but
+	// participate in no command↔result pairing — persist them on the bounded
+	// background writer (publish happens there too, so ordering vs. subsequent
+	// rows degrades gracefully instead of stalling the turn).
+	if r.Kind == "usage" {
+		select {
+		case e.usageWriteQueue() <- usageActivityWrite{t, r}:
+		default:
+			log.Printf("[activity] task %s usage write queue full; dropping usage row", t.ID)
+		}
+		return r
+	}
 	id, err := e.appendActivity(t, r)
 	if err != nil {
 		// NO LONGER SILENT: dropping a record breaks command↔result pairing in the
@@ -801,6 +894,12 @@ func (e *Engine) emitActivity(t *Task, r db.Activity) db.Activity {
 	}
 	e.bc.Publish(t.ID, r)
 	e.touch(t.ID)
+	// A persisted tool_result is the scheduler's event surface: report_finding,
+	// prove_goal/goal_met and every on_tool_call trigger read through it. Nudge
+	// an immediate step instead of waiting out the 30s tick.
+	if r.Kind == "tool_result" {
+		e.m.wakeScheduler()
+	}
 	return r
 }
 
@@ -998,10 +1097,13 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 
 	// runRound runs one planning round (with adaptive debounce coalescing + the guards). src is only used to tell the trigger source apart in logs.
 	runRound := func(src string) {
-		// Adaptive debounce: when workers are active, coalesce bursts into one round;
-		// when no worker is running (initial kick or all workers idle waiting on intents),
-		// run immediately with 0ms debounce.
-		if e.debounce > 0 && e.activeWorkCount(t.ID) > 0 {
+		// Adaptive debounce: when workers are active, coalesce routine bursts into
+		// one round; when no worker is running (initial kick or all workers idle
+		// waiting on intents), run immediately with 0ms debounce. An urgent wake
+		// (finding / hint / goal add-edit-delete / cancelled) skips the wait both
+		// on entry and mid-burst — coalescing must never delay a finding that
+		// could prove the goal and cancel the remaining workers.
+		if e.debounce > 0 && e.activeWorkCount(t.ID) > 0 && !t.hasUrgentTrigger() {
 			timer := time.NewTimer(e.debounce)
 		drain:
 			for {
@@ -1010,6 +1112,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 					timer.Stop()
 					return
 				case <-t.notify:
+					if t.hasUrgentTrigger() {
+						timer.Stop()
+						break drain
+					}
 				case <-timer.C:
 					break drain
 				}
@@ -1035,6 +1141,18 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// worker settlement write-backs nor Resume's Notify trigger regular planning rounds; the final round is driven directly by the coordinator (settleTask), not here.
 		if e.isSettling(t.ID) {
 			return
+		}
+		// Goal-decomposition gate (bootstrap with a seeded intent): workers are
+		// already executing while round-0 goals are still being decomposed —
+		// hold only the planner here. Without it, HasOpenGoal()==false below
+		// would take the goalless branch and settle the task "done" mid-start.
+		if t.goalsGate != nil {
+			select {
+			case <-t.goalsGate:
+				t.goalsGate = nil
+			case <-ctx.Done():
+				return
+			}
 		}
 		// goalless (human direct-inject) branch: when the task has no open goals the
 		// planner does not run — running it would re-judge met→cancelExec and kill intents
@@ -1065,7 +1183,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// they do not accumulate and let the heartbeat supervise; the next edge
 		// after a goal opens or closes, or once the frontier drains and all
 		// workers are idle, plans for real.
-		if src == "edge" && t.PlanQuietMode && e.quietSkipEdge(t) {
+		// Exception: an urgent pending trigger (finding/hint/goal/cancelled)
+		// always forces a real round — skipping here would silently drop it.
+		if src == "edge" && t.PlanQuietMode && !t.hasUrgentTrigger() && e.quietSkipEdge(t) {
 			t.drainTriggers()
 			log.Printf("[planner] task %s quiet: work in flight, goals unchanged, edge round skipped", t.ID)
 			return
@@ -1076,7 +1196,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		defer e.decInflight(t.ID)
 		e.stampFirstRun(t) // first real planning round → stamp first_run_at + compute the deadline (only for tasks with a timeout)
 		e.touch(t.ID)
-		emit := func(r db.Activity) { e.emitActivity(t, r) }
+		em := newActEmitter(func(r db.Activity) { e.emitActivity(t, r) })
+		defer em.flush()
+		emit := em.emit
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; carries the task deadline
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
@@ -1296,7 +1418,7 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 // #376). Attaching the pin after execContextFor ensures a cached e.execCtx
 // does not drop it; attaching it after the paused/deleting check ensures a
 // rolled-back claim never advances the rotation counter.
-func (e *Engine) intentWorkContext(ctx context.Context, t *Task) (ectx, workCtx context.Context, workCancel context.CancelCauseFunc, ok bool) {
+func (e *Engine) intentWorkContext(ctx context.Context, t *Task, intentID int64) (ectx, workCtx context.Context, workCancel context.CancelCauseFunc, ok bool) {
 	ectx = e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; carries the task deadline
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
 		return ectx, nil, nil, false
@@ -1306,7 +1428,7 @@ func (e *Engine) intentWorkContext(ctx context.Context, t *Task) (ectx, workCtx 
 	// Per-intent LLM rotation (#85): each claimed worker intent runs on the
 	// next chain head. The pin travels through the run context into the
 	// provider resolver; non-worker roles and failover keep the active head.
-	if head, pinned := t.nextRotatedProfile(); pinned {
+	if head, pinned := t.nextRotatedProfile(intentID); pinned {
 		workCtx = withLLMProfilePin(workCtx, head)
 	}
 	return ectx, workCtx, workCancel, true
@@ -1327,8 +1449,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // first real execution → stamp first_run_at + compute the deadline (only for tasks with a timeout)
 	e.touch(t.ID)
-	emit := func(r db.Activity) { e.emitActivity(t, r) }
-	ectx, workCtx, workCancel, ok := e.intentWorkContext(ctx, t)
+	em := newActEmitter(func(r db.Activity) { e.emitActivity(t, r) })
+	defer em.flush()
+	emit := em.emit
+	ectx, workCtx, workCancel, ok := e.intentWorkContext(ctx, t, intent.ID)
 	if !ok {
 		if err := t.Store.SettleIntentClaim(intent.ID, token, "open"); err != nil {
 			log.Printf("[worker %s] task %s intent #%d claim rollback failed: %v", name, t.ID, intent.ID, err)

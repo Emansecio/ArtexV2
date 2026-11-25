@@ -337,7 +337,7 @@ export default function AssetsPage() {
       </div>
 
       <Tabs value={tab} onValueChange={setTab} className="flex min-h-0 flex-1 flex-col gap-4">
-        <div className="overflow-x-auto overflow-y-hidden">
+        <div className="scroll-fade-x overflow-y-hidden">
           <TabsList variant="default">
             {TABS.map((t) => (
               <TabsTrigger key={t.key} value={t.key}>

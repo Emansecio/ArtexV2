@@ -54,4 +54,15 @@ var artexCompactableTools = []string{
 	"list_companies",
 	"TaskOutput",
 	"shell_read",
+	"shell_send",
+	// Orchestration read tools (Auto/Planner/Reporter) — re-queryable payloads.
+	"get_task_graph",
+	"list_task_findings",
+	"get_task_worker_trace",
+	"list_task_worker_traces",
+	"search_task_worker_traces",
+	"get_task_node_detail",
+	"get_finding_traffic",
+	"get_finding_retest_context",
+	"list_tasks",
 }

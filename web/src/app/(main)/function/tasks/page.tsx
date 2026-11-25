@@ -3,6 +3,7 @@
 import * as React from "react";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 import {
   DndContext,
@@ -22,10 +23,11 @@ import {
   ArrowUpDownIcon,
   ArrowUpIcon,
   ChevronRightIcon,
-  EyeIcon,
+  ExternalLinkIcon,
   FolderInputIcon,
   GripVerticalIcon,
   Loader2Icon,
+  MoreHorizontalIcon,
   PaperclipIcon,
   PauseIcon,
   PencilIcon,
@@ -87,6 +89,13 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import {
   Field,
@@ -307,6 +316,7 @@ function compareTasks(left: Task, right: Task, field: TaskSortField, direction: 
 }
 
 export default function TasksPage() {
+  const router = useRouter();
   const [activeTab, setActiveTab] = React.useState("current");
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [categories, setCategories] = React.useState<TaskCategory[]>([]);
@@ -315,6 +325,8 @@ export default function TasksPage() {
   const [statusFilter, setStatusFilter] = React.useState<TaskStatus | "all">("all");
   const [categoryFilter, setCategoryFilter] = React.useState("all");
   const [filtersHydrated, setFiltersHydrated] = React.useState(false);
+  const [deleteTarget, setDeleteTarget] = React.useState<Task | null>(null);
+  const [archiveTarget, setArchiveTarget] = React.useState<Task | null>(null);
   const [sortPreference, setSortPreference] = useStoredSortPreference(
     TASK_SORT_PREFERENCE_KEY,
     TASK_SORT_FIELDS,
@@ -821,15 +833,62 @@ export default function TasksPage() {
     [movingCategory, refreshCategoriesAndTasks, selectedIds],
   );
 
+  const statusCounts = React.useMemo(() => {
+    const counts: Record<TaskStatus | "all", number> = {
+      all: tasks.length,
+      created: 0,
+      queued: 0,
+      running: 0,
+      paused: 0,
+      done: 0,
+      failed: 0,
+      timeout: 0,
+    };
+    for (const item of tasks) {
+      counts[item.status] = (counts[item.status] ?? 0) + 1;
+    }
+    return counts;
+  }, [tasks]);
+
+  const statusPills = React.useMemo(() => {
+    const base: { value: TaskStatus | "all"; label: string; count: number }[] = [
+      { value: "all", label: t("All"), count: statusCounts.all },
+      { value: "running", label: t("Running"), count: statusCounts.running },
+      { value: "paused", label: t("Paused"), count: statusCounts.paused },
+      { value: "done", label: t("Completed"), count: statusCounts.done },
+      { value: "failed", label: t("Failed"), count: statusCounts.failed },
+    ];
+    if (statusCounts.queued > 0 || statusFilter === "queued") {
+      base.splice(2, 0, { value: "queued", label: t("Queued"), count: statusCounts.queued });
+    }
+    if (statusCounts.timeout > 0 || statusFilter === "timeout") {
+      base.push({ value: "timeout", label: t("Timed out"), count: statusCounts.timeout });
+    }
+    if (statusCounts.created > 0 || statusFilter === "created") {
+      base.push({ value: "created", label: t("Created"), count: statusCounts.created });
+    }
+    return base;
+  }, [statusCounts, statusFilter]);
+
+  const openTaskDetail = React.useCallback(
+    (id: string) => {
+      router.push(`/function/tasks/detail?id=${encodeURIComponent(id)}`);
+    },
+    [router],
+  );
+
   return (
     <Tabs value={activeTab} onValueChange={setActiveTab} className="gap-4">
-      <TabsList className="mx-4 lg:mx-6">
-        <TabsTrigger value="current">{t("Current tasks")}</TabsTrigger>
-        <TabsTrigger value="archived">{t("Archived")}</TabsTrigger>
-      </TabsList>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h1 className="text-xl font-semibold tracking-tight">{t("Tasks")}</h1>
+        <TabsList>
+          <TabsTrigger value="current">{t("Current tasks")}</TabsTrigger>
+          <TabsTrigger value="archived">{t("Archived")}</TabsTrigger>
+        </TabsList>
+      </div>
       <TabsContent value="current">
         <Card>
-          <CardContent className="flex flex-col gap-4 px-0 pt-6">
+          <CardContent className="flex flex-col gap-3 px-0 pt-5">
             <div className="flex flex-wrap items-center gap-2 px-4 lg:px-6">
               <div className="relative w-full sm:max-w-xs">
                 <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
@@ -850,21 +909,6 @@ export default function TasksPage() {
                   </button>
                 )}
               </div>
-              <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as TaskStatus | "all")}>
-                <SelectTrigger className="w-36">
-                  <SelectValue placeholder={t("Status")} />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectItem value="all">{t("All statuses")}</SelectItem>
-                    {STATUS_OPTIONS.map((s) => (
-                      <SelectItem key={s.value} value={s.value}>
-                        {s.label}
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
               <Select value={categoryFilter} onValueChange={setCategoryFilter}>
                 <SelectTrigger className="w-40">
                   <SelectValue placeholder={t("Task category")} />
@@ -881,15 +925,64 @@ export default function TasksPage() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
+              <ConcurrencySettingsDialog />
+              <CategoryManagementSheet
+                categories={categories}
+                tasks={tasks}
+                onChanged={refreshCategoriesAndTasks}
+                onTaskMoved={applyTaskCategoryMove}
+              />
+              <CreateTaskSheet
+                tasks={tasks}
+                categories={categories}
+                onCreated={refreshCategoriesAndTasks}
+                onCategoriesChanged={refreshCategoriesAndTasks}
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 px-4 lg:px-6">
+              <div className="flex flex-wrap items-center gap-1" role="tablist" aria-label={t("Status")}>
+                {statusPills.map((pill) => {
+                  const active = statusFilter === pill.value;
+                  return (
+                    <button
+                      key={pill.value}
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      onClick={() => setStatusFilter(pill.value)}
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+                        active
+                          ? "bg-primary text-primary-foreground shadow-2xs"
+                          : "bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground",
+                      )}
+                    >
+                      <span>{pill.label}</span>
+                      <span
+                        className={cn(
+                          "rounded-full px-1.5 py-0.2 text-[10px] tabular-nums",
+                          active ? "bg-primary-foreground/20 text-primary-foreground" : "bg-background/80 text-muted-foreground",
+                        )}
+                      >
+                        {pill.count}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
               <span className="text-muted-foreground text-xs tabular-nums">
                 {t("{shown}/{total} tasks", { shown: filtered.length, total: tasks.length })}
               </span>
-              {selectedIds.size > 0 && (
-                <>
-                  <span className="text-xs tabular-nums">{t("{count} selected", { count: selectedIds.size })}</span>
-                  <Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())}>
-                    {t("Clear selection")}
-                  </Button>
+            </div>
+
+            {selectedIds.size > 0 && (
+              <div className="mx-4 flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 px-3 py-2 lg:mx-6">
+                <span className="text-xs font-medium tabular-nums">{t("{count} selected", { count: selectedIds.size })}</span>
+                <Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())}>
+                  {t("Clear selection")}
+                </Button>
+                <div className="ml-auto flex flex-wrap items-center gap-2">
                   {pausableTaskIDs.length > 0 && (
                     <Button
                       size="sm"
@@ -939,22 +1032,9 @@ export default function TasksPage() {
                     onMove={moveSelectedTasksCategory}
                   />
                   <BulkDeleteTasksDialog ids={[...selectedIds]} onDelete={deleteTasks} />
-                </>
-              )}
-              <ConcurrencySettingsDialog />
-              <CategoryManagementSheet
-                categories={categories}
-                tasks={tasks}
-                onChanged={refreshCategoriesAndTasks}
-                onTaskMoved={applyTaskCategoryMove}
-              />
-              <CreateTaskSheet
-                tasks={tasks}
-                categories={categories}
-                onCreated={refreshCategoriesAndTasks}
-                onCategoriesChanged={refreshCategoriesAndTasks}
-              />
-            </div>
+                </div>
+              </div>
+            )}
 
             {tasks.length === 0 ? (
               <div className="text-muted-foreground mx-4 flex items-center justify-center rounded-lg border border-dashed py-20 text-sm lg:mx-6">
@@ -977,47 +1057,33 @@ export default function TasksPage() {
                     </TableHead>
                     <SortableTaskHead
                       field="id"
-                      label="ID"
+                      label={t("Task")}
                       activeField={sortField}
                       direction={sortDirection}
-                      className="font-mono"
                       onSort={sortTasksBy}
                     />
-                    <TableHead>{t("Name")}</TableHead>
-                    <TableHead>{t("Description")}</TableHead>
-                    <TableHead>{t("Goal")}</TableHead>
                     <SortableTaskHead
                       field="status"
                       label={t("Status")}
                       activeField={sortField}
                       direction={sortDirection}
+                      className="w-40"
                       onSort={sortTasksBy}
                     />
-                    <TableHead className="text-center">{t("Goal progress")}</TableHead>
-                    <TableHead className="text-center" title={t("Critical / High / Medium / Low")}>
-                      {t("Findings")} <span className="text-muted-foreground font-normal">{t("C/H/M/L")}</span>
+                    <TableHead className="w-28">{t("Progress")}</TableHead>
+                    <TableHead className="w-32" title={t("Critical / High / Medium / Low")}>
+                      {t("Findings")}
                     </TableHead>
-                    <TableHead className="text-center">{t("Running workers")}</TableHead>
-                    <SortableTaskHead
-                      field="created"
-                      label={t("Created at")}
-                      activeField={sortField}
-                      direction={sortDirection}
-                      align="right"
-                      onSort={sortTasksBy}
-                    />
                     <SortableTaskHead
                       field="duration"
-                      label={t("Duration")}
+                      label={t("Runtime")}
                       activeField={sortField}
                       direction={sortDirection}
                       align="right"
+                      className="w-36"
                       onSort={sortTasksBy}
                     />
-                    <TableHead className="text-right">{t("Token")}</TableHead>
-                    <TableHead className="sticky right-0 z-10 bg-card text-right shadow-[-1px_0_0_0_hsl(var(--border))]">
-                      {t("Actions")}
-                    </TableHead>
+                    <TableHead className="w-24 text-right">{t("Actions")}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -1026,11 +1092,12 @@ export default function TasksPage() {
                       key={task.id}
                       task={task}
                       nowSec={sortField === "duration" && task.status === "running" ? nowSec : 0}
-                      onDelete={deleteTask}
+                      onOpen={openTaskDetail}
+                      onRequestDelete={setDeleteTarget}
+                      onRequestArchive={setArchiveTarget}
                       onControl={controlTask}
                       onRename={renameTask}
                       onTogglePinned={toggleTaskPinned}
-                      onArchive={queueTaskArchive}
                       selected={selectedIds.has(task.id)}
                       onSelectedChange={toggleSelected}
                     />
@@ -1050,6 +1117,20 @@ export default function TasksPage() {
             />
           </CardContent>
         </Card>
+        <DeleteTaskDialog
+          task={deleteTarget}
+          onOpenChange={(open) => {
+            if (!open) setDeleteTarget(null);
+          }}
+          onDelete={deleteTask}
+        />
+        <ControlledArchiveConfirmDialog
+          task={archiveTarget}
+          onOpenChange={(open) => {
+            if (!open) setArchiveTarget(null);
+          }}
+          onConfirm={queueTaskArchive}
+        />
       </TabsContent>
       <TabsContent value="archived">
         <TaskArchivesPanel onChanged={load} />
@@ -1236,26 +1317,48 @@ const LiveTaskDuration = React.memo(function LiveTaskDuration({
 const TaskRow = React.memo(function TaskRow({
   task,
   nowSec,
-  onDelete,
+  onOpen,
+  onRequestDelete,
+  onRequestArchive,
   onControl,
   onRename,
   onTogglePinned,
-  onArchive,
   selected,
   onSelectedChange,
 }: {
   task: Task;
   nowSec: number;
-  onDelete: (id: string, options: DeleteTaskOptions) => Promise<void>;
+  onOpen: (id: string) => void;
+  onRequestDelete: (task: Task) => void;
+  onRequestArchive: (task: Task) => void;
   onControl: (id: string, action: "pause" | "resume") => Promise<void>;
   onRename: (task: Task, name: string) => Promise<void>;
   onTogglePinned: (task: Task) => Promise<void>;
-  onArchive: (task: Task) => Promise<void>;
   selected: boolean;
   onSelectedChange: (id: string, checked: boolean) => void;
 }) {
+  const pinned = taskIsPinned(task);
+  const archiveReason = archiveBlockReason(task);
+  const subtitle = (task.goal || task.description || "").trim();
+  const goalsTotal = typeof task.goals_total === "number" ? task.goals_total : 0;
+  const goalsMet = task.goals_met ?? 0;
+  const goalsPct = goalsTotal > 0 ? Math.min(100, Math.round((goalsMet / goalsTotal) * 100)) : 0;
+  const totalTokens = task.tokens
+    ? task.tokens.input_tokens + task.tokens.output_tokens
+    : 0;
+
+  const handleRowClick = (event: React.MouseEvent<HTMLTableRowElement>) => {
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("a, button, input, [role='checkbox'], [role='menuitem']")) return;
+    onOpen(task.id);
+  };
+
   return (
-    <TableRow className="group border-border/60" data-state={selected ? "selected" : undefined}>
+    <TableRow
+      className="group cursor-pointer border-border/60"
+      data-state={selected ? "selected" : undefined}
+      onClick={handleRowClick}
+    >
       <TableCell>
         <Checkbox
           checked={selected}
@@ -1263,108 +1366,135 @@ const TaskRow = React.memo(function TaskRow({
           aria-label={t("Select task {id}", { id: task.id })}
         />
       </TableCell>
-      <TableCell>
-        <code className="bg-muted rounded px-1.5 py-0.5 font-mono text-xs">{task.id}</code>
-      </TableCell>
-      <TableCell className="font-medium">
-        <div className="flex max-w-xs items-center gap-2">
-          <TaskNameEditor task={task} onRename={onRename} />
-          {task.active && <StarIcon className="size-4 shrink-0 fill-amber-400 text-amber-400" />}
-          {taskIsPinned(task) && <PinIcon className="text-primary size-4 shrink-0" aria-label={t("Pinned")} />}
+      <TableCell className="max-w-md py-3">
+        <div className="flex min-w-0 flex-col gap-1">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <TaskNameEditor task={task} onRename={onRename} />
+            <code className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px]">
+              #{task.id}
+            </code>
+            {task.category_name && (
+              <Badge variant="outline" className="h-5 max-w-28 shrink-0 truncate px-1.5 text-[10px] font-normal">
+                {task.category_name}
+              </Badge>
+            )}
+            {task.active && <StarIcon className="size-3.5 shrink-0 fill-amber-400 text-amber-400" />}
+            {pinned && <PinIcon className="text-primary size-3.5 shrink-0" aria-label={t("Pinned")} />}
+          </div>
+          {subtitle && (
+            <p className="text-muted-foreground line-clamp-1 text-xs" title={subtitle}>
+              {subtitle}
+            </p>
+          )}
         </div>
       </TableCell>
-      <TableCell className="text-muted-foreground max-w-40">
-        <Link
-          href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}
-          className="block truncate rounded-sm hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          title={task.description}
-        >
-          {task.description}
-        </Link>
-      </TableCell>
-      <TableCell className="text-muted-foreground max-w-40 truncate" title={task.goal}>
-        {task.goal}
+      <TableCell>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <StatusBadge domain="task" value={task.status} dot />
+          {task.in_flight && task.in_flight > 0 ? (
+            <span
+              className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 dark:text-blue-400"
+              title={t("Running workers")}
+            >
+              <span className="size-1.5 motion-safe:animate-pulse rounded-full bg-blue-500" />
+              {task.in_flight}
+            </span>
+          ) : null}
+        </div>
       </TableCell>
       <TableCell>
-        <StatusBadge domain="task" value={task.status} dot />
-      </TableCell>
-      <TableCell className="text-muted-foreground text-center text-xs tabular-nums">
-        {typeof task.goals_total === "number" && task.goals_total > 0 ? (
-          `${task.goals_met}/${task.goals_total}`
+        {goalsTotal > 0 ? (
+          <div className="flex items-center gap-2">
+            <Progress value={goalsPct} className="h-1.5 w-14" />
+            <span className="text-muted-foreground text-xs tabular-nums">
+              {goalsMet}/{goalsTotal}
+            </span>
+          </div>
         ) : (
-          <span className="text-muted-foreground">—</span>
+          <span className="text-muted-foreground text-xs">—</span>
         )}
       </TableCell>
-      <TableCell className="text-center text-xs tabular-nums">
+      <TableCell>
         {(() => {
           const f = task.findings;
           const total = f ? f.critical + f.high + f.medium + f.low : 0;
-          if (!f || total === 0) return <span className="text-muted-foreground">0</span>;
-          const seg = (n: number, cls: string) => (
-            <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>
-          );
+          if (!f || total === 0) return <span className="text-muted-foreground text-xs">—</span>;
+          const pills = [
+            { n: f.critical, code: "C", cls: "bg-rose-500/15 text-rose-600 dark:text-rose-400" },
+            { n: f.high, code: "H", cls: "bg-red-500/15 text-red-600 dark:text-red-400" },
+            { n: f.medium, code: "M", cls: "bg-amber-500/15 text-amber-600 dark:text-amber-400" },
+            { n: f.low, code: "L", cls: "bg-slate-500/15 text-slate-600 dark:text-slate-400" },
+          ].filter((p) => p.n > 0);
           return (
-            <span className="font-medium whitespace-nowrap" title={t("Critical / High / Medium / Low")}>
-              {seg(f.critical, "text-rose-600 dark:text-rose-400")}
-              <span className="text-muted-foreground">/</span>
-              {seg(f.high, "text-red-600 dark:text-red-400")}
-              <span className="text-muted-foreground">/</span>
-              {seg(f.medium, "text-amber-600 dark:text-amber-400")}
-              <span className="text-muted-foreground">/</span>
-              {seg(f.low, "text-slate-600 dark:text-slate-400")}
-            </span>
+            <div className="flex flex-wrap items-center gap-1" title={t("Critical / High / Medium / Low")}>
+              {pills.map((p) => (
+                <span
+                  key={p.code}
+                  className={cn("inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium tabular-nums", p.cls)}
+                >
+                  {p.n}
+                  {p.code}
+                </span>
+              ))}
+            </div>
           );
         })()}
       </TableCell>
-      <TableCell className="text-center text-xs tabular-nums">
-        {task.in_flight && task.in_flight > 0 ? (
-          <span className="text-foreground font-medium">{task.in_flight}</span>
-        ) : (
-          <span className="text-muted-foreground">0</span>
-        )}
+      <TableCell className="text-right whitespace-nowrap">
+        <div className="flex flex-col items-end gap-0.5">
+          <div className="flex items-center gap-1.5 text-xs tabular-nums">
+            <LiveTaskDuration task={task} forcedNowSec={nowSec} />
+            {task.tokens && totalTokens > 0 && (
+              <span
+                className="text-muted-foreground rounded bg-muted/70 px-1 py-0.2 text-[10px]"
+                title={t("Input {input} · Cache {cache} · Output {output}", {
+                  input: task.tokens.input_tokens,
+                  cache: task.tokens.cache_read_tokens,
+                  output: task.tokens.output_tokens,
+                })}
+              >
+                {fmtTokens(totalTokens)}
+              </span>
+            )}
+          </div>
+          <span className="text-muted-foreground text-[11px] tabular-nums">{fmtDateTime(task.created_unix)}</span>
+        </div>
       </TableCell>
-      <TableCell className="text-muted-foreground text-right text-xs whitespace-nowrap tabular-nums">
-        {fmtDateTime(task.created_unix)}
-      </TableCell>
-      <TableCell className="text-right text-xs whitespace-nowrap tabular-nums">
-        <LiveTaskDuration task={task} forcedNowSec={nowSec} />
-      </TableCell>
-      <TableCell
-        className="text-right text-xs whitespace-nowrap tabular-nums"
-        title={
-          task.tokens
-            ? t("Input {input} · Cache {cache} · Output {output}", {
-                input: task.tokens.input_tokens,
-                cache: task.tokens.cache_read_tokens,
-                output: task.tokens.output_tokens,
-              })
-            : undefined
-        }
-      >
-        {task.tokens ? (
-          <span className="text-muted-foreground">
-            {t("In")} <span className="text-foreground">{fmtTokens(task.tokens.input_tokens)}</span>
-            {" · "}
-            {t("Cache")} <span className="text-foreground">{fmtTokens(task.tokens.cache_read_tokens)}</span>
-            {" · "}
-            {t("Out")}{" "}
-            <span className="text-foreground">{fmtTokens(task.tokens.output_tokens)}</span>
-          </span>
-        ) : (
-          "—"
-        )}
-      </TableCell>
-      <TableCell className="sticky right-0 z-10 bg-card text-right shadow-[-1px_0_0_0_hsl(var(--border))] group-hover:bg-muted/50">
+      <TableCell className="text-right">
         <div className="flex items-center justify-end gap-0.5">
-          <Button size="icon" variant="ghost" asChild aria-label={t("View task details")} title={t("View task details")}>
-            <Link href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}>
-              <EyeIcon />
-            </Link>
-          </Button>
           <TaskControlButton task={task} onControl={onControl} />
-          <TaskPinAction task={task} onTogglePinned={onTogglePinned} />
-          <TaskArchiveAction task={task} onArchive={onArchive} />
-          <DeleteTaskDialog task={task} onDelete={onDelete} />
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button size="icon" variant="ghost" aria-label={t("Actions")} title={t("Actions")}>
+                <MoreHorizontalIcon />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-44">
+              <DropdownMenuItem onSelect={() => onOpen(task.id)}>
+                <ExternalLinkIcon />
+                {t("Open task")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => void onTogglePinned(task)}>
+                {pinned ? <PinOffIcon /> : <PinIcon />}
+                {pinned ? t("Unpin") : t("Pin")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={Boolean(archiveReason)}
+                title={archiveReason || undefined}
+                onSelect={() => {
+                  if (!archiveReason) onRequestArchive(task);
+                }}
+              >
+                <ArchiveIcon />
+                {t("Archive")}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem variant="destructive" onSelect={() => onRequestDelete(task)}>
+                <Trash2Icon />
+                {t("Delete")}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </TableCell>
     </TableRow>
@@ -1462,38 +1592,6 @@ function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task,
         <PencilIcon />
       </Button>
     </div>
-  );
-}
-
-function taskPinIcon(pinning: boolean, pinned: boolean) {
-  if (pinning) return <Spinner />;
-  if (pinned) return <PinOffIcon />;
-  return <PinIcon />;
-}
-
-function TaskPinAction({ task, onTogglePinned }: { task: Task; onTogglePinned: (task: Task) => Promise<void> }) {
-  const [pinning, setPinning] = React.useState(false);
-  const pinned = taskIsPinned(task);
-
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon"
-      disabled={pinning}
-      aria-label={pinned ? t("Unpin task #{id}", { id: task.id }) : t("Pin task #{id}", { id: task.id })}
-      title={pinned ? t("Unpin") : t("Pin")}
-      onClick={async () => {
-        setPinning(true);
-        try {
-          await onTogglePinned(task);
-        } finally {
-          setPinning(false);
-        }
-      }}
-    >
-      {taskPinIcon(pinning, pinned)}
-    </Button>
   );
 }
 
@@ -1596,24 +1694,50 @@ function ArchiveConfirmDialog({
   );
 }
 
-function TaskArchiveAction({ task, onArchive }: { task: Task; onArchive: (task: Task) => Promise<void> }) {
-  const reason = archiveBlockReason(task);
-  const trigger = (
-    <Button size="icon" variant="ghost" disabled={Boolean(reason)} aria-label={t("Archive task #{id}", { id: task.id })}>
-      <ArchiveIcon />
-    </Button>
+function ControlledArchiveConfirmDialog({
+  task,
+  onOpenChange,
+  onConfirm,
+}: {
+  task: Task | null;
+  onOpenChange: (open: boolean) => void;
+  onConfirm: (task: Task) => Promise<void>;
+}) {
+  const [pending, setPending] = React.useState(false);
+  return (
+    <AlertDialog open={Boolean(task)} onOpenChange={(next) => !pending && onOpenChange(next)}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{task ? t("Archive task #{id}?", { id: task.id }) : t("Archive task")}</AlertDialogTitle>
+          <AlertDialogDescription className="[overflow-wrap:anywhere]">
+            {t(
+              "Archiving stops task scheduling and compresses the graph, LLM history, files, and exclusive assets and traffic into local cold storage. Once archived, a task can be restored from \"Archived\".",
+            )}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={pending}>{t("Cancel")}</AlertDialogCancel>
+          <AlertDialogAction
+            disabled={pending || !task}
+            onClick={async (event) => {
+              event.preventDefault();
+              if (!task) return;
+              setPending(true);
+              try {
+                await onConfirm(task);
+                onOpenChange(false);
+              } finally {
+                setPending(false);
+              }
+            }}
+          >
+            {pending && <Spinner data-icon="inline-start" />}
+            {t("Confirm archive")}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
-  if (reason) {
-    return (
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="inline-flex">{trigger}</span>
-        </TooltipTrigger>
-        <TooltipContent>{reason}</TooltipContent>
-      </Tooltip>
-    );
-  }
-  return <ArchiveConfirmDialog count={1} trigger={trigger} onConfirm={() => onArchive(task)} />;
 }
 
 const ARCHIVE_PROCESSING_STATES = new Set<TaskArchiveState>([
@@ -2221,55 +2345,57 @@ function DeleteOptionFields({
 
 function DeleteTaskDialog({
   task,
+  onOpenChange,
   onDelete,
 }: {
-  task: Task;
+  task: Task | null;
+  onOpenChange: (open: boolean) => void;
   onDelete: (id: string, options: DeleteTaskOptions) => Promise<void>;
 }) {
-  const [open, setOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
   const [options, setOptions] = React.useState<DeleteTaskOptions>(emptyDeleteOptions);
 
+  React.useEffect(() => {
+    if (task) setOptions(emptyDeleteOptions());
+  }, [task]);
+
   const handleOpenChange = (next: boolean) => {
     if (deleting) return;
-    setOpen(next);
-    if (next) setOptions(emptyDeleteOptions());
+    onOpenChange(next);
   };
 
   const handleDelete = async () => {
+    if (!task) return;
     setDeleting(true);
     try {
       await onDelete(task.id, options);
-      setOpen(false);
+      onOpenChange(false);
     } finally {
       setDeleting(false);
     }
   };
 
   return (
-    <AlertDialog open={open} onOpenChange={handleOpenChange}>
-      <AlertDialogTrigger asChild>
-        <Button size="icon" variant="outline" aria-label={t("Delete task")}>
-          <Trash2Icon className="text-destructive" />
-        </Button>
-      </AlertDialogTrigger>
+    <AlertDialog open={Boolean(task)} onOpenChange={handleOpenChange}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>{t("Delete task #{id}?", { id: task.id })}</AlertDialogTitle>
+          <AlertDialogTitle>{task ? t("Delete task #{id}?", { id: task.id }) : t("Delete task")}</AlertDialogTitle>
           <AlertDialogDescription className="[overflow-wrap:anywhere]">
-            {task.description
+            {task?.description
               ? t("“{description}” will be permanently deleted together with its execution records and exploration graph.", {
                   description: task.description.length > 80 ? `${task.description.slice(0, 80)}…` : task.description,
                 })
               : t("This task will be permanently deleted together with its execution records and exploration graph.")}
           </AlertDialogDescription>
         </AlertDialogHeader>
-        <DeleteOptionFields idPrefix={task.id} options={options} onOptionsChange={setOptions} disabled={deleting} />
+        {task && (
+          <DeleteOptionFields idPrefix={task.id} options={options} onOptionsChange={setOptions} disabled={deleting} />
+        )}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={deleting}>{t("Cancel")}</AlertDialogCancel>
           <AlertDialogAction
             variant="destructive"
-            disabled={deleting}
+            disabled={deleting || !task}
             onClick={(event) => {
               event.preventDefault();
               void handleDelete();
@@ -3392,6 +3518,20 @@ function CreateTaskSheet({
                 onChange={(e) => setGoal(e.target.value)}
               />
             </div>
+            <Collapsible>
+              <CollapsibleTrigger className="group flex w-full items-center gap-2 border-t pt-4 text-sm font-medium">
+                <ChevronRightIcon className="text-muted-foreground size-4 transition-transform group-data-[state=open]:rotate-90" />
+                {t("Context & scope")}
+                {sourceTaskIDs.length + companyIDs.length + interceptRules.length + llmProfileIDs.length + credentials.length > 0 && (
+                  <Badge variant="secondary" className="px-1.5 py-0 text-[10px] tabular-nums">
+                    {sourceTaskIDs.length + companyIDs.length + interceptRules.length + llmProfileIDs.length + credentials.length}
+                  </Badge>
+                )}
+                <span className="text-muted-foreground ml-auto text-xs font-normal">
+                  {t("Linked tasks")} · {t("LLM")} · {t("Credentials")}
+                </span>
+              </CollapsibleTrigger>
+              <CollapsibleContent className="grid gap-5 pt-5">
             <Field>
               <FieldLabel htmlFor="source-tasks">{t("Linked tasks")}</FieldLabel>
               <SourceTaskPicker
@@ -3498,6 +3638,8 @@ function CreateTaskSheet({
                 )}
               </FieldDescription>
             </Field>
+              </CollapsibleContent>
+            </Collapsible>
 
             {/* Advanced parameters are collapsed by default: timeout/heartbeat/first intent; they take space only when expanded, keeping the common path clean. */}
             <Collapsible>

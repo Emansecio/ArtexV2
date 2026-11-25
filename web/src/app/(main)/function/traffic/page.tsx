@@ -14,6 +14,7 @@ import {
   Loader2Icon,
   RadioTowerIcon,
   SearchIcon,
+  SlidersHorizontalIcon,
   Trash2Icon,
   UploadIcon,
   XIcon,
@@ -146,6 +147,7 @@ export default function TrafficPage() {
   const [respMinQ, setRespMinQ] = React.useState("");
   const [respMax, setRespMax] = React.useState("");
   const [respMaxQ, setRespMaxQ] = React.useState("");
+  const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const [sort, setSort] = useStoredSortPreference<SortField>(SORT_STORAGE_KEY, SORT_FIELDS, "ts", "desc");
 
   const [traffic, setTraffic] = React.useState<TrafficResp | null>(null);
@@ -198,8 +200,13 @@ export default function TrafficPage() {
     return () => clearTimeout(t);
   }, [respMax]);
 
-  const hasAdvancedFilter =
-    Boolean(bodyQ || pathQ || respMinQ || respMaxQ) || statusFilter !== "all" || rewrittenFilter !== "all";
+  const advancedFilterCount =
+    (bodyQ ? 1 : 0) +
+    (pathQ ? 1 : 0) +
+    (respMinQ || respMaxQ ? 1 : 0) +
+    (statusFilter !== "all" ? 1 : 0) +
+    (rewrittenFilter !== "all" ? 1 : 0);
+  const hasAdvancedFilter = advancedFilterCount > 0;
   const resetAdvancedFilters = () => {
     setBody("");
     setBodyQ("");
@@ -733,6 +740,21 @@ export default function TrafficPage() {
             ))}
           </SelectContent>
         </Select>
+        <Button
+          variant={advancedOpen || hasAdvancedFilter ? "secondary" : "outline"}
+          size="sm"
+          className="h-8 gap-1.5"
+          aria-expanded={advancedOpen}
+          onClick={() => setAdvancedOpen((v) => !v)}
+        >
+          <SlidersHorizontalIcon className="size-3.5" />
+          {t("Advanced filters")}
+          {advancedFilterCount > 0 && (
+            <Badge variant="default" className="px-1.5 py-0 text-[10px] tabular-nums">
+              {advancedFilterCount}
+            </Badge>
+          )}
+        </Button>
 
         <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
           <span className="tabular-nums">
@@ -762,7 +784,8 @@ export default function TrafficPage() {
         </div>
       </div>
 
-      {/* Advanced filters (issue #177): narrow 660k+ exchanges down to the one packet. */}
+      {/* Advanced filters (issue #177): collapsed by default, toggled independently of active filter count. */}
+      {advancedOpen && (
       <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/30 px-2 py-1.5">
         <span className="pl-1 text-xs font-medium text-muted-foreground">{t("Advanced filters")}</span>
         <div className="relative w-56">
@@ -831,20 +854,21 @@ export default function TrafficPage() {
           </Button>
         ) : null}
       </div>
+      )}
 
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm text-muted-foreground">
-          {t("{count} flows selected", { count: selectedFlows.size })}
-        </span>
-        <Button variant="outline" size="sm" disabled={selectedFlows.size === 0} onClick={() => setLinking(true)}>
-          {t("Link to finding")}
-        </Button>
-        {selectedFlows.size > 0 ? (
+      {selectedFlows.size > 0 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 px-3 py-1.5">
+          <span className="text-xs font-medium tabular-nums">
+            {t("{count} flows selected", { count: selectedFlows.size })}
+          </span>
+          <Button variant="outline" size="sm" onClick={() => setLinking(true)}>
+            {t("Link to finding")}
+          </Button>
           <Button variant="ghost" size="sm" onClick={() => setSelectedFlows(new Set())}>
             {t("Clear selection")}
           </Button>
-        ) : null}
-      </div>
+        </div>
+      )}
       {/* History table */}
       <div className="flex h-[calc(100vh-15rem)] min-h-0 flex-col">
         <Card className="flex min-h-0 flex-1 flex-col overflow-hidden py-0">
@@ -876,7 +900,7 @@ export default function TrafficPage() {
                     onSort={toggleSort}
                     className="w-36"
                   />
-                  <TableHead className="w-44">host</TableHead>
+                  <TableHead className="w-44">Host</TableHead>
                   <TableHead className="w-20">{t("Method")}</TableHead>
                   <TableHead>URL</TableHead>
                   <SortableHead
@@ -887,7 +911,7 @@ export default function TrafficPage() {
                     onSort={toggleSort}
                     className="w-20"
                   />
-                  <TableHead className="w-36">content-type</TableHead>
+                  <TableHead className="w-36">Content-Type</TableHead>
                   <SortableHead
                     field="resp_len"
                     label={t("Response size")}
@@ -903,7 +927,7 @@ export default function TrafficPage() {
                 {exchanges.map((e) => (
                   <TableRow
                     key={e.id}
-                    className={cn("cursor-pointer", selected?.id === e.id && "bg-accent hover:bg-accent")}
+                    className={cn("cv-row cursor-pointer", selected?.id === e.id && "bg-accent hover:bg-accent")}
                     onClick={() => setSelected(e)}
                   >
                     <TableCell>

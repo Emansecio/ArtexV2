@@ -237,7 +237,11 @@ func (s *Server) seedFindingRetester() error {
 	if _, err = tx.Exec(`INSERT INTO settings(key,value) VALUES ($1,'true') ON CONFLICT(key) DO UPDATE SET value='true'`, flag); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.m.pg.InvalidateSettingCache(flag)
+	return nil
 }
 
 func (s *Server) finishRetest(id int64, status, reason string) {

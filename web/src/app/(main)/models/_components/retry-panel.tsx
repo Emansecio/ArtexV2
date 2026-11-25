@@ -35,19 +35,13 @@ const ZERO_POLICY: LLMRetryPolicy = {
 
 type LayerMeta = {
   title: string;
-  /** Where this retry layer happens and who runs it */
   where: string;
-  /** Which errors reach this layer — down to status codes, no guessing */
   trigger: string;
-  /** Errors that look similar but do [not] go through this layer, so nobody thinks it is a bug after seeing no effect */
   skips?: string;
   desc: string;
   attemptsLabel: string;
-  /** Default attempts when left empty, used for the placeholder */
   defAttempts: number;
-  /** Default interval strategy when left empty, used for the placeholder */
   defInterval: string;
-  /** Meaning of entering -1 for attempts */
   offHint: string;
 };
 
@@ -111,7 +105,6 @@ export const RETRY_LAYERS = {
 
 type LayerKey = keyof typeof RETRY_LAYERS;
 
-/** Milliseconds in human terms, only echoed next to the input so nobody counts zeros. */
 function humanMs(ms: number) {
   if (!Number.isFinite(ms) || ms <= 0) return "";
   if (ms < 1000) return t("{n}ms", { n: ms });
@@ -119,7 +112,6 @@ function humanMs(ms: number) {
   return t("{n}min", { n: Number((ms / 60_000).toFixed(2)) });
 }
 
-/** Controlled numeric input: empty string ↔ 0; intermediate states ("-", "1e") stay local and never bother the parent. */
 function NumField({
   id,
   value,
@@ -134,8 +126,6 @@ function NumField({
   min: number;
 }) {
   const [text, setText] = React.useState(value === 0 ? "" : String(value));
-  // Keeps up when the parent swaps in a whole new set of values (policy loaded, profile switched); typing never reaches this,
-  // because by then value already equals the parsed result of the local text.
   React.useEffect(() => {
     const incoming = value === 0 ? "" : String(value);
     setText((cur) => (Number(cur || 0) === value ? cur : incoming));
@@ -157,7 +147,6 @@ function NumField({
   );
 }
 
-/** The two knobs of one retry layer. idPrefix keeps the label's htmlFor unique when it appears multiple times on one page. */
 export function RetryRuleFields({
   layer,
   idPrefix,
@@ -169,28 +158,26 @@ export function RetryRuleFields({
   idPrefix: string;
   value: LLMRetryRule;
   onChange: (r: LLMRetryRule) => void;
-  /** true = compact version inside the profile drawer: skips the expanded explanations, keeping only the "which errors reach this layer" line */
   compact?: boolean;
 }) {
   const meta = RETRY_LAYERS[layer];
   const human = humanMs(value.interval_ms);
   return (
-    <div className={compact ? "grid gap-2" : "grid gap-3 rounded-lg border p-3"}>
-      <div className="grid gap-0.5">
+    <div className={compact ? "grid gap-2" : "grid gap-3 rounded-xl border bg-card p-4 transition-colors hover:border-foreground/20"}>
+      <div className="grid gap-1">
         <div className="flex flex-wrap items-baseline gap-2">
-          <Label className="text-sm">{meta.title}</Label>
+          <Label className="text-sm font-medium">{meta.title}</Label>
           <span className="text-muted-foreground text-xs">{meta.where}</span>
         </div>
-        {/* Which errors reach this layer, down to status codes — if the knobs seem to have no effect, the error most likely does not land on this layer at all. */}
-        <p className="text-muted-foreground text-xs">
+        <p className="text-muted-foreground text-xs leading-relaxed">
           <span className="font-medium text-foreground">{t("Triggers")}</span>: {meta.trigger}
         </p>
         {!compact && meta.skips && (
-          <p className="text-muted-foreground text-xs">
+          <p className="text-muted-foreground text-xs leading-relaxed">
             <span className="font-medium text-foreground">{t("Skipped here")}</span>: {meta.skips}
           </p>
         )}
-        {!compact && <p className="text-muted-foreground text-xs">{meta.desc}</p>}
+        {!compact && <p className="text-muted-foreground text-xs leading-relaxed">{meta.desc}</p>}
       </div>
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <div className="flex items-center gap-2">
@@ -228,7 +215,6 @@ export function RetryRuleFields({
   );
 }
 
-/** The three-layer override in the model profile drawer (the three layers that travel with the endpoint). */
 export function ProfileRetryFields({
   value,
   onChange,
@@ -261,7 +247,6 @@ export function ProfileRetryFields({
   );
 }
 
-/** The "Retry & backoff" tab: global defaults for the five layers. */
 export function RetryPolicyPanel() {
   const [policy, setPolicy] = React.useState<LLMRetryPolicy>(ZERO_POLICY);
   const [loading, setLoading] = React.useState(true);
@@ -287,7 +272,6 @@ export function RetryPolicyPanel() {
     if (saving) return;
     setSaving(true);
     try {
-      // The backend clamps out-of-range values back into the interval and returns them; refresh straight from the reply so what you see is what is stored.
       const saved = await api.saveLLMRetryPolicy(policy);
       setPolicy({ ...ZERO_POLICY, ...saved });
       toast.success(t("Saved; takes effect immediately (calls already in flight still use the old parameters)"));
@@ -302,15 +286,15 @@ export function RetryPolicyPanel() {
 
   if (loading) {
     return (
-      <div className="flex items-center gap-2 rounded-lg border border-dashed p-10 text-muted-foreground text-sm">
+      <div className="flex items-center gap-2 rounded-xl border border-dashed p-10 text-muted-foreground text-sm">
         <Loader2Icon className="size-4 animate-spin" /> {t("Loading retry policy…")}
       </div>
     );
   }
 
   return (
-    <div className="grid gap-4">
-      <div className="rounded-lg border bg-muted/30 p-3 text-muted-foreground text-xs leading-relaxed">
+    <div className="grid gap-4 animate-in fade-in-0 slide-in-from-bottom-1 duration-200">
+      <div className="rounded-xl border bg-muted/30 p-3.5 text-muted-foreground text-xs leading-relaxed">
         {t(
           "A failed model call passes through five retry layers in turn, innermost to outermost: <b>connect → empty response → same-provider safe window → pool breaker → intent rerun</b>. An outer layer only gets what the inner ones exhausted, so the attempt counts <b>multiply</b> — max out every layer and a single hiccup can burn dozens of requests. Leaving everything empty keeps the current defaults, identical to the behavior before this page existed. The first three layers can be overridden per model profile.",
         )
@@ -318,7 +302,7 @@ export function RetryPolicyPanel() {
           .map((part, i) =>
             i % 2 === 1 ? (
               // biome-ignore lint/suspicious/noArrayIndexKey: static split of one translated sentence
-              <span key={i} className="text-foreground">
+              <span key={i} className="font-medium text-foreground">
                 {part}
               </span>
             ) : (

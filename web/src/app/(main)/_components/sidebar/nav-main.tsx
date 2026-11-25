@@ -5,7 +5,6 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 import { ChevronRight } from "lucide-react";
-import { api } from "@/lib/api";
 
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
@@ -37,7 +36,7 @@ import type {
   NavMainLinkItem,
   NavMainParentItem,
 } from "@/navigation/sidebar/sidebar-items";
-import { setVisibleInterval } from "@/lib/polling";
+import { useInterceptPendingCount } from "@/lib/intercept-pending";
 
 const SIDEBAR_OPEN_KEY = "artex.sidebar.open";
 
@@ -95,28 +94,6 @@ function hasSubItems(item: NavMainItem): item is NavMainParentItem {
 
 function matchPath(path: string, url: string): boolean {
   return path === url || path.startsWith(`${url}/`);
-}
-
-function useInterceptPendingCount(): number {
-  const [count, setCount] = React.useState(0);
-  React.useEffect(() => {
-    let live = true;
-    async function poll() {
-      try {
-        const list = await api.interceptPending();
-        if (live) setCount(list.length);
-      } catch {
-        /* ignore */
-      }
-    }
-    void poll();
-    const stopPolling = setVisibleInterval(poll, 5000);
-    return () => {
-      live = false;
-      stopPolling();
-    };
-  }, []);
-  return count;
 }
 
 export function NavMain({ items }: NavMainProps) {

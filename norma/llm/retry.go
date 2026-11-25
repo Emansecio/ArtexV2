@@ -43,12 +43,26 @@ func doStream(ctx context.Context, cfg Config, url string, body []byte, setHeade
 	if n, ok := maxRetriesFromContext(ctx); ok {
 		retries = max(n, 0)
 	}
+	authRefreshed := false
 	for attempt := 0; ; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		setHeaders(req)
+		if cfg.TokenFunc != nil {
+			tok, terr := cfg.TokenFunc(ctx, authRefreshed)
+			if terr != nil {
+				return nil, terr
+			}
+			req.Header.Del("x-api-key")
+			req.Header.Set("authorization", "Bearer "+tok)
+		}
+		for k, v := range cfg.ExtraHeaders {
+			if k != "" && v != "" {
+				req.Header.Set(k, v)
+			}
+		}
 
 		client := cfg.HTTPClient
 		if client == nil {
@@ -57,6 +71,14 @@ func doStream(ctx context.Context, cfg Config, url string, body []byte, setHeade
 		resp, err := client.Do(req)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			return resp, nil
+		}
+		// One automatic force-refresh retry on HTTP 401 when using OAuth TokenFunc.
+		if err == nil && resp.StatusCode == http.StatusUnauthorized && cfg.TokenFunc != nil && !authRefreshed {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			authRefreshed = true
+			attempt--
+			continue
 		}
 
 		retryable := false

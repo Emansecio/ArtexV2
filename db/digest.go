@@ -62,24 +62,36 @@ type StampOp struct {
 }
 
 // ApplyStampOps writes a batch of cold_since_round changes in one transaction.
+// Ops are grouped into one bulk UPDATE per (round) plus one for the clears — a
+// 200-op round runs 2-3 statements instead of 200 sequential UPDATEs.
 func (s *ExplorationStore) ApplyStampOps(ops []StampOp) error {
 	if len(ops) == 0 {
 		return nil
+	}
+	setByRound := map[int64][]int64{}
+	var clears []int64
+	for _, o := range ops {
+		if o.Set {
+			setByRound[o.Round] = append(setByRound[o.Round], o.ID)
+		} else {
+			clears = append(clears, o.ID)
+		}
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	for _, o := range ops {
-		if o.Set {
-			if _, err := tx.Exec(`UPDATE exploration_nodes SET cold_since_round=$1 WHERE id=$2 AND exploration_id=$3`, o.Round, o.ID, s.expID); err != nil {
-				return err
-			}
-		} else {
-			if _, err := tx.Exec(`UPDATE exploration_nodes SET cold_since_round=NULL WHERE id=$1 AND exploration_id=$2`, o.ID, s.expID); err != nil {
-				return err
-			}
+	for round, ids := range setByRound {
+		if _, err := tx.Exec(`UPDATE exploration_nodes SET cold_since_round=$1
+WHERE exploration_id=$2 AND id = ANY($3::bigint[])`, round, s.expID, ids); err != nil {
+			return err
+		}
+	}
+	if len(clears) > 0 {
+		if _, err := tx.Exec(`UPDATE exploration_nodes SET cold_since_round=NULL
+WHERE exploration_id=$1 AND id = ANY($2::bigint[])`, s.expID, clears); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()

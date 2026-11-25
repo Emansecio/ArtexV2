@@ -418,7 +418,7 @@ export default function LLMRecordsPage() {
                     <TableRow
                       key={rec.id}
                       className={cn(
-                        "cursor-pointer",
+                        "cv-row cursor-pointer",
                         selected?.id === rec.id && "bg-accent hover:bg-accent",
                       )}
                       onClick={() => setSelected(rec)}

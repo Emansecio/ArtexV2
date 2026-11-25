@@ -3,9 +3,10 @@
   "version": "2.2.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "build:static": "NEXT_EXPORT=1 next build",
+    "sync:locales": "node -e \"const fs=require('fs');fs.mkdirSync('public/locales',{recursive:true});for(const f of fs.readdirSync('src/i18n/locales'))if(f.endsWith('.json'))fs.copyFileSync('src/i18n/locales/'+f,'public/locales/'+f)\"",
+    "dev": "npm run sync:locales && next dev",
+    "build": "npm run sync:locales && next build",
+    "build:static": "npm run sync:locales && NEXT_EXPORT=1 next build",
     "start": "next start",
     "lint": "biome lint",
     "format": "biome format --write",

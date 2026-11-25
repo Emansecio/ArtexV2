@@ -230,23 +230,7 @@ func ParseArgvPattern(pattern string) ([]string, error) {
 // argvRuleMatches reports whether a Bash call's command derives exactly the
 // prefix tokens. Flags after the prefix are not constrained.
 func argvRuleMatches(tokens []string, toolName string, input []byte) bool {
-	if toolName != "Bash" || len(tokens) == 0 {
-		return false
-	}
-	var in struct {
-		Command string `json:"command"`
-	}
-	if json.Unmarshal(input, &in) != nil {
-		return false
-	}
-	prefix, err := ArgvPrefix(in.Command)
-	if err != nil || len(prefix) != len(tokens) {
-		return false
-	}
-	for i := range prefix {
-		if prefix[i] != tokens[i] {
-			return false
-		}
-	}
-	return true
+	var st matchState
+	st.load(toolName, input)
+	return st.cmd != "" && st.prefixMatches(tokens)
 }

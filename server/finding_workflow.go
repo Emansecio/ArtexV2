@@ -114,6 +114,7 @@ func (s *Server) seedFindingWorkflowTools() {
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
+	s.m.pg.InvalidateToolCache()
 }
 
 func objectProperty(parent map[string]any, key string) map[string]any {

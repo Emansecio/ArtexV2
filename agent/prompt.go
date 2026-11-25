@@ -43,7 +43,9 @@ type GoalsVars struct{ EngagementDescription, DataDir, Now string }
 // prompt variable. renderSystem runs on every agent turn/round, so this is fresh
 // each run — a prompt can subtract it from a fixed start stamp to reason about
 // elapsed time (e.g. a timed benchmark's "last N hours" window).
-func nowStr() string { return time.Now().Format("2006-01-02 15:04:05 MST") }
+// Minute precision: second-granularity {{.Now}} would bust the static system
+// prefix cache on every render (all callsites put it in System[0]).
+func nowStr() string { return time.Now().Format("2006-01-02 15:04 MST") }
 
 // renderSystem returns the rendered system-prompt BODY (section [A]) for agentKey.
 // Precedence: the DB-stored template (if any) over the built-in default template

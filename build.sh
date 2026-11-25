@@ -125,6 +125,27 @@ else
   info "Syncing frontend assets to server/webui/dist"
   mkdir -p server/webui/dist
   rsync -a --delete web/out/ server/webui/dist/
+  info "Pre-compressing embedded frontend assets (Brotli + Gzip)"
+  has_brotli=0
+  if command -v brotli >/dev/null 2>&1; then has_brotli=1; fi
+  while IFS= read -r -d '' asset; do
+    raw_sz=$(wc -c < "$asset" | tr -d ' ')
+    [ "$raw_sz" -ge 1024 ] || continue
+    gzip -9 -k -f -- "$asset"
+    gz_sz=$(wc -c < "${asset}.gz" | tr -d ' ')
+    if [ "$gz_sz" -ge "$raw_sz" ]; then
+      rm -f "${asset}.gz"
+      continue
+    fi
+    if [ "$has_brotli" = "1" ]; then
+      brotli -q 11 -k -f -- "$asset"
+      br_sz=$(wc -c < "${asset}.br" | tr -d ' ')
+      if [ "$br_sz" -ge "$raw_sz" ]; then
+        rm -f "${asset}.br"
+      fi
+    fi
+    rm -f "$asset"
+  done < <(find server/webui/dist -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.svg' -o -name '*.json' -o -name '*.txt' -o -name '*.xml' \) -print0)
 fi
 
 compress_binary() {

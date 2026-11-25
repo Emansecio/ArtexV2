@@ -252,9 +252,33 @@ CREATE INDEX IF NOT EXISTS idx_expnodes_part_id_desc  ON exploration_nodes(explo
 CREATE INDEX IF NOT EXISTS idx_expnodes_frontier      ON exploration_nodes(exploration_id, priority DESC)
     WHERE kind='intent' AND state='open';
 CREATE INDEX IF NOT EXISTS idx_exp_nodes_updated        ON exploration_nodes(exploration_id, updated_at DESC);
+-- exploration_nodes gets its own updated_at trigger: bookkeeping-only writes
+-- (cold_since_round stamp maintenance, claim-lease heartbeat/token) must NOT
+-- bump updated_at — it backs OverviewFingerprint and graph-overview caches,
+-- so every heartbeat + planner stamp round otherwise invalidated them without
+-- changing anything those views render. Only real content changes bump it.
+CREATE OR REPLACE FUNCTION set_expnodes_updated_at() RETURNS trigger AS $$
+BEGIN
+    IF NEW.payload          IS NOT DISTINCT FROM OLD.payload
+       AND NEW.state        IS NOT DISTINCT FROM OLD.state
+       AND NEW.kind         IS NOT DISTINCT FROM OLD.kind
+       AND NEW.priority     IS NOT DISTINCT FROM OLD.priority
+       AND NEW.origin       IS NOT DISTINCT FROM OLD.origin
+       AND NEW.owner        IS NOT DISTINCT FROM OLD.owner
+       AND NEW.blocked_reason IS NOT DISTINCT FROM OLD.blocked_reason
+       AND NEW.delete_reason   IS NOT DISTINCT FROM OLD.delete_reason
+       AND NEW.completed_at    IS NOT DISTINCT FROM OLD.completed_at
+       AND NEW.content_version IS NOT DISTINCT FROM OLD.content_version THEN
+        NEW.updated_at = OLD.updated_at;
+    ELSE
+        NEW.updated_at = now();
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_expnodes_upd ON exploration_nodes;
 CREATE TRIGGER trg_expnodes_upd BEFORE UPDATE ON exploration_nodes
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE FUNCTION set_expnodes_updated_at();
 
 CREATE TABLE IF NOT EXISTS exploration_edges (
     exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
@@ -373,7 +397,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS llm_profiles (
     id               BIGSERIAL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
-    format           TEXT NOT NULL CHECK (format IN ('openai','anthropic','openai-responses','ollama')),
+    format           TEXT NOT NULL CHECK (format IN ('openai','anthropic','openai-responses','ollama','chatgpt','anthropic-oauth','opencode-zen','opencode-go')),
     base_url         TEXT,
     proxy            TEXT,
     model            TEXT NOT NULL,
@@ -433,7 +457,7 @@ ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS streaming    BOOLEAN NOT NULL 
 -- Runs at every startup, idempotent: drop the old CHECK first, then create the new four-value CHECK.
 ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_format_check;
 ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_format_check
-    CHECK (format IN ('openai','anthropic','openai-responses','ollama'));
+    CHECK (format IN ('openai','anthropic','openai-responses','ollama','chatgpt','anthropic-oauth','opencode-zen','opencode-go'));
 
 -- Output cap and its field name; backfills old databases. Defaults 0 / '' = send no cap and keep the max_tokens field name;
 -- old configs behave exactly as before.

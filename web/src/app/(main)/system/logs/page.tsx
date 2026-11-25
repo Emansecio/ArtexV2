@@ -242,7 +242,7 @@ export default function LogsPage() {
           {filtered.length === 0 ? (
             <p className="py-10 text-center text-muted-foreground">{t("No logs yet.")}</p>
           ) : (
-            filtered.map((l) => {
+            filtered.map((l, index) => {
               const body =
                 l.tag && l.text.startsWith("[" + l.tag + "]")
                   ? l.text.slice(l.tag.length + 2).trimStart()
@@ -250,8 +250,10 @@ export default function LogsPage() {
               return (
                 <div
                   key={l.seq}
-                  className="flex items-start gap-2 px-1 py-0.5 hover:bg-muted/40"
-                  style={{ contentVisibility: "auto", containIntrinsicSize: "0 24px" }}
+                  className={cn(
+                    "flex items-start gap-2 px-1 py-0.5 hover:bg-muted/40",
+                    index >= 30 && "defer-render",
+                  )}
                 >
                   <span className={cn("mt-1.5 size-1.5 shrink-0 rounded-full", levelDot[l.level])} />
                   <span className="shrink-0 tabular-nums text-muted-foreground">{fmtTime(l.ts)}</span>

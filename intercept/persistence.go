@@ -1,7 +1,6 @@
 package intercept
 
 import (
-	"encoding/json"
 	"strings"
 )
 
@@ -41,9 +40,10 @@ func (i *Interceptor) MatchPersistence(toolName string, input []byte) (Decision,
 		return Decision{}, false
 	}
 	var ask *compiledRule
+	var st matchState
 	for idx := range rules {
 		r := rules[idx]
-		if !ruleMatches(r, toolName, input) {
+		if !ruleMatches(r, toolName, input, &st) {
 			continue
 		}
 		if r.Action == "deny" {
@@ -64,9 +64,8 @@ func persistenceDecision(r compiledRule) Decision {
 	if msg == "" {
 		msg = defaultMessage(r.Action, r.Name)
 	}
-	configJSON, _ := json.Marshal(r.InterceptRule)
 	return Decision{
-		RuleName: r.Name, ConfigDigest: digestInput(configJSON),
+		RuleName: r.Name, ConfigDigest: r.configDigest,
 		Action:         r.Action,
 		Message:        msg,
 		RuleID:         r.ID,
