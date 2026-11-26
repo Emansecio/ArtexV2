@@ -26,8 +26,10 @@ import { cn } from "@/lib/utils";
 
 import { FallbackStudio } from "./_components/fallback-studio";
 import {
+  formatContextK,
+  formatTokensShort,
+  getProviders,
   healthOf,
-  PROVIDERS,
   type ProfileFormat,
   providerConnectionState,
   providerMeta,
@@ -303,7 +305,7 @@ export default function ModelsPage() {
               >
                 {t("All")} ({profiles.length})
               </button>
-              {PROVIDERS.map((prov) => {
+              {getProviders().map((prov) => {
                 const count = profiles.filter((p) => p.format === prov.id).length;
                 if (count === 0) return null;
                 const active = providerFilter === prov.id;
@@ -386,7 +388,12 @@ export default function ModelsPage() {
                       )}
                       {(p.context_window_k ?? 0) > 0 && (
                         <Badge variant="outline" className="font-mono font-normal text-[11px]">
-                          {(p.context_window_k ?? 0) >= 1000 ? "1M" : `${p.context_window_k}K`}
+                          {formatContextK(p.context_window_k)}
+                        </Badge>
+                      )}
+                      {(p.max_tokens ?? 0) > 0 && (
+                        <Badge variant="outline" className="font-mono font-normal text-[11px]">
+                          {t("{n} out", { n: formatTokensShort(p.max_tokens ?? 0) })}
                         </Badge>
                       )}
                       {poolOn &&

@@ -80,6 +80,10 @@ type agyProcess struct {
 	advertisedModels  []string
 	configuredModel   string
 	configuredEffort  string
+	// pendingSystem is injected once as the first <system-reminder> block of the
+	// session's opening session/prompt (sending it via session/new
+	// _meta.antigravity.systemPrompt.append triggers HTTP 429 on agy 1.5.17).
+	pendingSystem     string
 	activePromptID    uint64
 	parked            map[string]chan agyMCPToolOutput
 	deliveredMessages int
@@ -460,13 +464,15 @@ func (p *antigravityProvider) Stream(ctx context.Context, req CompletionRequest)
 			}
 			proc.nextID++
 			promptID := proc.nextID
+			promptBlocks := agyBuildPromptBlocks(proc.pendingSystem, promptText)
+			proc.pendingSystem = ""
 			if err := proc.sendRaw(map[string]any{
 				"jsonrpc": "2.0",
 				"id":      promptID,
 				"method":  "session/prompt",
 				"params": map[string]any{
 					"sessionId": proc.sessionID,
-					"prompt":    []map[string]any{{"type": "text", "text": promptText}},
+					"prompt":    promptBlocks,
 				},
 			}); err != nil {
 				proc.Kill()
@@ -583,6 +589,7 @@ func spawnAgyProcess(
 		toolsKey:          toolsKey,
 		systemHash:        systemHash,
 		credentialVersion: credVersion,
+		pendingSystem:     strings.TrimSpace(systemPrompt),
 		parked:            map[string]chan agyMCPToolOutput{},
 		lastUsed:          time.Now(),
 	}
@@ -596,16 +603,9 @@ func spawnAgyProcess(
 		return nil, err
 	}
 
-	meta := map[string]any{}
-	if strings.TrimSpace(systemPrompt) != "" {
-		meta["antigravity"] = map[string]any{
-			"systemPrompt": map[string]any{"append": systemPrompt},
-		}
-	}
 	createdRaw, err := proc.rpc(ctx, "session/new", map[string]any{
 		"cwd":        cwd,
 		"mcpServers": []any{},
-		"_meta":      meta,
 	})
 	if err != nil {
 		proc.Kill()
@@ -943,6 +943,21 @@ func agyDeliverParkedToolResults(proc *agyProcess, messages []Message) {
 		delete(proc.parked, k)
 		ch <- agyMCPToolOutput{Text: "Tool call skipped by host.", IsError: true}
 	}
+}
+
+func agyBuildPromptBlocks(pendingSystem, promptText string) []map[string]any {
+	blocks := make([]map[string]any, 0, 2)
+	if strings.TrimSpace(pendingSystem) != "" {
+		blocks = append(blocks, map[string]any{
+			"type": "text",
+			"text": "<system-reminder>\n" + pendingSystem + "\n</system-reminder>",
+		})
+	}
+	blocks = append(blocks, map[string]any{
+		"type": "text",
+		"text": promptText,
+	})
+	return blocks
 }
 
 func agyFormatTranscript(messages []Message) string {

@@ -14,7 +14,8 @@ func TestContextWindowTokensDoesNotApplyCompactionFloor(t *testing.T) {
 		{32, 32_000, 32_000},
 		{200, 200_000, 200_000},
 		{1000, 1_000_000, 1_000_000},
-		{2000, 1_000_000, 1_000_000},
+		{2000, 2_000_000, 2_000_000},
+		{3000, 2_000_000, 2_000_000},
 	}
 	for _, tc := range cases {
 		cfg := Config{ContextWindowK: tc.k}

@@ -2186,6 +2186,14 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if p.ContextWindowK < 0 {
+		p.ContextWindowK = 0
+	} else if p.ContextWindowK >= 8192 {
+		p.ContextWindowK = (p.ContextWindowK + 500) / 1000
+	}
+	if p.ContextWindowK > 2000 {
+		p.ContextWindowK = 2000
+	}
 	// Output cap: negative values are meaningless, clamp to zero (= do not send the
 	// field). The field-name switch only matters for Chat Completions — anthropic and
 	// openai-responses hard-code their field names; storing it would only mislead later readers, so it is cleared for any non-openai format. Unknown values are cleared too, to avoid throwing DB CHECK errors at the user.
@@ -2207,6 +2215,26 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		strings.TrimSpace(p.BaseURL) != "" && !sameLLMEndpoint(p.Format, p.BaseURL, p.Format, "") {
 		writeErr(w, 400, "OAuth credentials are only sent to the canonical provider endpoint; custom base_url is not allowed")
 		return
+	}
+	// Preserve custom prices when keeping the same model, or auto-populate from
+	// models.dev when no custom pricing is set. Load `stored` even when the user
+	// also rotated api_key so custom prices are never accidentally clobbered.
+	if p.PriceInputPerM == 0 && p.PriceOutputPerM == 0 && p.PriceCacheReadPerM == 0 && p.PriceCacheWritePerM == 0 {
+		if p.ID != 0 && stored == nil {
+			stored, _ = pg.ProfileByID(p.ID)
+		}
+		if stored != nil && strings.EqualFold(stored.Model, p.Model) &&
+			(stored.PriceInputPerM > 0 || stored.PriceOutputPerM > 0 || stored.PriceCacheReadPerM > 0 || stored.PriceCacheWritePerM > 0) {
+			p.PriceInputPerM = stored.PriceInputPerM
+			p.PriceOutputPerM = stored.PriceOutputPerM
+			p.PriceCacheReadPerM = stored.PriceCacheReadPerM
+			p.PriceCacheWritePerM = stored.PriceCacheWritePerM
+		} else if det, ok := s.lookupBestModelDetail(p.Format, p.Model); ok && (det.PriceInputPerM > 0 || det.PriceOutputPerM > 0) {
+			p.PriceInputPerM = det.PriceInputPerM
+			p.PriceOutputPerM = det.PriceOutputPerM
+			p.PriceCacheReadPerM = det.PriceCacheReadPerM
+			p.PriceCacheWritePerM = det.PriceCacheWritePerM
+		}
 	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
@@ -2580,14 +2608,6 @@ func (g *modelURLGuard) validateURL(ctx context.Context, rawURL, role string) (*
 	return u, nil
 }
 
-type modelDetail struct {
-	ID              string   `json:"id"`
-	Label           string   `json:"label,omitempty"`
-	ContextWindowK  int      `json:"context_window_k,omitempty"`
-	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
-	ReasoningLevels []string `json:"reasoning_levels,omitempty"`
-}
-
 type cachedModelCatalog struct {
 	models    []string
 	details   []modelDetail
@@ -2630,23 +2650,77 @@ func (s *Server) invalidateModelCatalogCache(provider string) {
 	}
 }
 
-func (s *Server) pgListDevinOrAgyModels(w http.ResponseWriter, r *http.Request, provider, rawBaseURL, rawProxy string) {
+func (s *Server) tryBeginCatalogRefresh(provider string) bool {
+	s.modelCatalogMu.Lock()
+	defer s.modelCatalogMu.Unlock()
+	if s.modelCatalogRefreshing == nil {
+		s.modelCatalogRefreshing = map[string]bool{}
+	}
+	if s.modelCatalogRefreshing[provider] {
+		return false
+	}
+	s.modelCatalogRefreshing[provider] = true
+	return true
+}
+
+func (s *Server) endCatalogRefresh(provider string) {
+	s.modelCatalogMu.Lock()
+	defer s.modelCatalogMu.Unlock()
+	delete(s.modelCatalogRefreshing, provider)
+}
+
+func (s *Server) pgListDevinOrAgyModels(w http.ResponseWriter, r *http.Request, provider, rawBaseURL, rawProxy string, force bool) {
 	if strings.TrimSpace(rawBaseURL) != "" && !sameLLMEndpoint(provider, rawBaseURL, provider, "") {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "OAuth credentials are only sent to the canonical provider endpoint; custom base_url is not allowed"})
 		return
 	}
-	if models, details, ok := s.getCachedModelCatalog(provider); ok {
-		writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details})
-		return
+	reg := s.ensureModelRegistry()
+	if reg != nil {
+		reg.TriggerBackgroundRefresh(s.ctx)
+	}
+	if !force {
+		if models, details, ok := s.getCachedModelCatalog(provider); ok {
+			writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details, "cache_source": "memory"})
+			return
+		}
+		if models, details, updatedAt, ok := s.readDiskProviderCatalog(provider); ok {
+			s.putCachedModelCatalog(provider, models, details)
+			if time.Since(updatedAt) > diskCatalogStaleAfter && s.tryBeginCatalogRefresh(provider) {
+				go func() {
+					defer s.endCatalogRefresh(provider)
+					bgCtx := s.ctx
+					if bgCtx == nil {
+						bgCtx = context.Background()
+					}
+					ctx, cancel := context.WithTimeout(bgCtx, 30*time.Second)
+					defer cancel()
+					_, _, _, _ = s.fetchDevinOrAgyLive(ctx, provider, rawProxy, reg)
+				}()
+			}
+			writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details, "cache_source": "disk"})
+			return
+		}
 	}
 
+	models, details, liveOK, errMsg := s.fetchDevinOrAgyLive(r.Context(), provider, rawProxy, reg)
+	if errMsg != "" {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": errMsg})
+		return
+	}
+	src := "fallback"
+	if liveOK {
+		src = "live"
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details, "cache_source": src})
+}
+
+func (s *Server) fetchDevinOrAgyLive(ctx context.Context, provider, rawProxy string, reg *modelRegistry) ([]string, []modelDetail, bool, string) {
 	var client *http.Client
 	if p := strings.TrimSpace(rawProxy); p != "" {
 		guard := newModelURLGuard(s)
-		proxyURL, err := guard.validateURL(r.Context(), p, "proxy")
+		proxyURL, err := guard.validateURL(ctx, p, "proxy")
 		if err != nil {
-			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
-			return
+			return nil, nil, false, err.Error()
 		}
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.Proxy = http.ProxyURL(proxyURL)
@@ -2656,44 +2730,53 @@ func (s *Server) pgListDevinOrAgyModels(w http.ResponseWriter, r *http.Request, 
 	}
 
 	if provider == "devin" {
-		tok, err := s.ensureOAuth().AccessToken(r.Context(), oauth.ProviderDevin, false)
+		tok, err := s.ensureOAuth().AccessToken(ctx, oauth.ProviderDevin, false)
 		if err != nil {
-			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
-			return
+			return nil, nil, false, err.Error()
 		}
-		entries, err := llm.FetchDevinModelConfigs(r.Context(), client, llm.DevinDefaultBaseURL, tok)
+		entries, err := llm.FetchDevinModelConfigs(ctx, client, llm.DevinDefaultBaseURL, tok)
 		if err != nil {
 			var hse *llm.HTTPStatusError
 			if errors.As(err, &hse) && (hse.StatusCode == http.StatusUnauthorized || hse.StatusCode == http.StatusForbidden) {
-				writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
-				return
+				return nil, nil, false, err.Error()
 			}
 			entries = llm.DevinFallbackCatalog()
 		}
 		models := make([]string, 0, len(entries))
 		details := make([]modelDetail, 0, len(entries))
 		for _, e := range entries {
-			models = append(models, e.ID)
-			details = append(details, modelDetail{
+			src := "api"
+			if err != nil {
+				src = "known"
+			}
+			d := modelDetail{
 				ID:              e.ID,
 				Label:           e.Name,
-				ContextWindowK:  e.ContextWindow / 1000,
+				ContextWindow:   e.ContextWindow,
+				ContextWindowK:  tokensToK(e.ContextWindow),
 				MaxOutputTokens: e.MaxOutputTokens,
-				ReasoningLevels: e.ReasoningLevels,
-			})
+				ReasoningLevels: append([]string(nil), e.ReasoningLevels...),
+				Source:          src,
+			}
+			if reg != nil {
+				if md, ok := reg.Lookup(provider, e.ID); ok {
+					mergeModelDetailFallback(&d, md)
+				}
+			}
+			models = append(models, e.ID)
+			details = append(details, d)
 		}
-		if err == nil {
+		if err == nil && len(models) > 0 {
 			s.putCachedModelCatalog(provider, models, details)
+			s.writeDiskProviderCatalog(provider, models, details)
 		}
-		writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details})
-		return
+		return models, details, err == nil, ""
 	}
 
 	// antigravity-cli
-	cred, err := s.ensureOAuth().Credential(r.Context(), oauth.ProviderAntigravity, false)
+	cred, err := s.ensureOAuth().Credential(ctx, oauth.ProviderAntigravity, false)
 	if err != nil {
-		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
-		return
+		return nil, nil, false, err.Error()
 	}
 	agyCred := llm.AgyCredential{
 		Access:    cred.AccessToken,
@@ -2702,40 +2785,54 @@ func (s *Server) pgListDevinOrAgyModels(w http.ResponseWriter, r *http.Request, 
 		Email:     cred.AccountHint,
 		AccountID: cred.IDToken,
 	}
-	entries, probeErr := llm.ProbeAntigravityModels(r.Context(), client, agyCred)
+	entries, probeErr := llm.ProbeAntigravityModels(ctx, client, agyCred)
 	if probeErr != nil || len(entries) == 0 {
 		entries = llm.AntigravityFallbackCatalog()
 	}
 	models := make([]string, 0, len(entries))
 	details := make([]modelDetail, 0, len(entries))
 	for _, e := range entries {
-		models = append(models, e.ID)
-		details = append(details, modelDetail{
+		src := "api"
+		if probeErr != nil {
+			src = "known"
+		}
+		d := modelDetail{
 			ID:              e.ID,
 			Label:           e.DisplayName,
-			ContextWindowK:  e.ContextWindow / 1000,
+			ContextWindow:   e.ContextWindow,
+			ContextWindowK:  tokensToK(e.ContextWindow),
 			MaxOutputTokens: e.MaxOutputTokens,
-			ReasoningLevels: e.ReasoningLevels,
-		})
+			ReasoningLevels: append([]string(nil), e.ReasoningLevels...),
+			Source:          src,
+		}
+		if reg != nil {
+			if md, ok := reg.Lookup(provider, e.ID); ok {
+				mergeModelDetailFallback(&d, md)
+			}
+		}
+		models = append(models, e.ID)
+		details = append(details, d)
 	}
-	if probeErr == nil && len(entries) > 0 {
+	if probeErr == nil && len(models) > 0 {
 		s.putCachedModelCatalog(provider, models, details)
+		s.writeDiskProviderCatalog(provider, models, details)
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details})
+	return models, details, probeErr == nil, ""
 }
 
 // pgListModels fetches available models from the provider's API endpoint.
-// Supports OpenAI-format (GET /models), Anthropic-format (GET /v1/models) and
-// Ollama (keyless OpenAI-compatible GET /v1/models on the local server); for
-// Anthropic-compatible third parties (e.g. DeepSeek) whose model list lives only on
-// the OpenAI path, it falls back to the OpenAI endpoint at the stripped root.
+// Supports OpenAI-format (GET /models), Anthropic-format (paginated GET /v1/models),
+// OpenCode rich console/inference catalogs, Devin/Antigravity (with disk cache),
+// and Ollama (keyless /v1/models + /api/show context probing).
 func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider  string `json:"provider"` // "openai" | "anthropic" | "ollama"
-		BaseURL   string `json:"base_url"`
-		APIKey    string `json:"api_key"`
-		Proxy     string `json:"proxy"`
-		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
+		Provider   string `json:"provider"` // "openai" | "anthropic" | "ollama" | ...
+		BaseURL    string `json:"base_url"`
+		APIKey     string `json:"api_key"`
+		Proxy      string `json:"proxy"`
+		ProfileID  *int64 `json:"profile_id"` // fallback: use stored key from this profile
+		Force      bool   `json:"force"`      // bypass RAM/disk caches and refresh live
+		IncludeAll bool   `json:"include_all"` // include non-chat models (whisper, tts, embedding, etc.)
 	}
 	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -2764,7 +2861,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	}
 	provider := strings.TrimSpace(req.Provider)
 	if provider == "devin" || provider == "antigravity-cli" {
-		s.pgListDevinOrAgyModels(w, r, provider, req.BaseURL, req.Proxy)
+		s.pgListDevinOrAgyModels(w, r, provider, req.BaseURL, req.Proxy, req.Force)
 		return
 	}
 	// Resolve live OAuth access tokens for subscription-backed providers.
@@ -2794,6 +2891,43 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Keep models.dev warm without adding serial latency: when force=true,
+	// overlap its refresh on the server background context so slow responses
+	// still populate the disk cache while the HTTP handler waits at most 2.5s.
+	reg := s.ensureModelRegistry()
+	var regWait <-chan struct{}
+	if reg != nil {
+		if req.Force {
+			done := make(chan struct{})
+			regWait = done
+			go func() {
+				defer close(done)
+				bgCtx := s.ctx
+				if bgCtx == nil {
+					bgCtx = context.Background()
+				}
+				rCtx, rCancel := context.WithTimeout(bgCtx, 10*time.Second)
+				defer rCancel()
+				reg.Refresh(rCtx, true)
+			}()
+		} else {
+			reg.TriggerBackgroundRefresh(s.ctx)
+		}
+	}
+	waitReg := func() {
+		if regWait == nil {
+			return
+		}
+		t := time.NewTimer(2500 * time.Millisecond)
+		defer t.Stop()
+		select {
+		case <-regWait:
+		case <-t.C:
+		case <-r.Context().Done():
+		}
+		regWait = nil
+	}
+
 	rawBaseURL := strings.TrimSpace(req.BaseURL)
 	baseURL := strings.TrimRight(rawBaseURL, "/")
 	defaultOllama := provider == "ollama" && rawBaseURL == ""
@@ -2803,8 +2937,9 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	// the model list only on their OpenAI-format path — so for anthropic we fall
 	// back to the OpenAI endpoint at the stripped root.
 	type candidate struct {
-		url string
-		hdr http.Header
+		url      string
+		hdr      http.Header
+		paginate bool // Anthropic-style has_more + last_id cursor pagination
 	}
 	bearerHdr := func() http.Header {
 		h := http.Header{}
@@ -2826,7 +2961,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 			baseURL = "https://api.openai.com/v1"
 		}
 		b := strings.TrimRight(strings.TrimSuffix(strings.TrimSuffix(baseURL, "/chat/completions"), "/responses"), "/")
-		candidates = append(candidates, candidate{b + "/models", bearerHdr()})
+		candidates = append(candidates, candidate{url: b + "/models", hdr: bearerHdr()})
 	case "opencode-zen", "opencode-go":
 		if baseURL == "" {
 			if provider == "opencode-go" {
@@ -2840,7 +2975,22 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		if apiKey != "" {
 			hdr.Set("Authorization", "Bearer "+apiKey)
 		}
-		candidates = append(candidates, candidate{b + "/models", hdr})
+		// Canonical OpenCode Go: prefer rich Console catalog (when authenticated) and Go inference endpoint
+		// (with a keyless fallback in case a stale/invalid key was entered while browsing models).
+		if provider == "opencode-go" && rawBaseURL == "" {
+			if apiKey != "" {
+				candidates = append(candidates,
+					candidate{url: "https://opencode.ai/console/api/v1/models", hdr: hdr},
+					candidate{url: "https://opencode.ai/inference/go/v1/models", hdr: hdr},
+				)
+			}
+			candidates = append(candidates,
+				candidate{url: "https://opencode.ai/inference/go/v1/models", hdr: http.Header{}},
+				candidate{url: b + "/models", hdr: hdr},
+			)
+		} else {
+			candidates = append(candidates, candidate{url: b + "/models", hdr: hdr})
+		}
 	case "anthropic-oauth":
 		if baseURL == "" {
 			baseURL = "https://api.anthropic.com"
@@ -2850,7 +3000,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		hdr.Set("Authorization", "Bearer "+apiKey)
 		hdr.Set("anthropic-version", "2023-06-01")
 		hdr.Set("anthropic-beta", "oauth-2025-04-20")
-		candidates = append(candidates, candidate{b + "/v1/models", hdr})
+		candidates = append(candidates, candidate{url: b + "/v1/models?limit=100", hdr: hdr, paginate: true})
 	case "ollama":
 		// OpenAI-compatible list at {base}/v1/models. Tolerate base URLs with or
 		// without the /v1 suffix (and a full endpoint URL). No auth needed; when a
@@ -2866,19 +3016,19 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		if apiKey != "" {
 			hdr.Set("Authorization", "Bearer "+apiKey)
 		}
-		candidates = append(candidates, candidate{b + "/models", hdr})
+		candidates = append(candidates, candidate{url: b + "/models", hdr: hdr})
 	default: // anthropic
 		if baseURL == "" {
 			baseURL = "https://api.anthropic.com"
 		}
 		b := strings.TrimRight(strings.TrimSuffix(baseURL, "/v1/messages"), "/")
-		candidates = append(candidates, candidate{b + "/v1/models", anthropicHdr()})
+		candidates = append(candidates, candidate{url: b + "/v1/models?limit=100", hdr: anthropicHdr(), paginate: true})
 		// Fallback for Anthropic-compatible third parties whose model list lives on
 		// the OpenAI path: strip a trailing /anthropic and try the OpenAI endpoint.
 		if root := strings.TrimRight(strings.TrimSuffix(b, "/anthropic"), "/"); root != b {
 			candidates = append(candidates,
-				candidate{root + "/models", bearerHdr()},
-				candidate{root + "/v1/models", bearerHdr()},
+				candidate{url: root + "/models", hdr: bearerHdr()},
+				candidate{url: root + "/v1/models", hdr: bearerHdr()},
 			)
 		}
 	}
@@ -2975,46 +3125,133 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, c.url, nil)
-		if err != nil {
-			lastErr = "failed to build request: " + err.Error()
-			continue
-		}
-		httpReq.Header = c.hdr
-		resp, err := client.Do(httpReq)
-		if err != nil {
-			var refusal *modelURLRefusalError
-			if errors.As(err, &refusal) {
-				writeJSON(w, 200, map[string]any{"ok": false, "error": refusal.Error()})
-				return
+		var details []modelDetail
+		seenIDs := map[string]struct{}{}
+		nextURL := c.url
+		prevLastID := ""
+		const maxPages = 10
+		candidateFailed := false
+		for page := 0; page < maxPages; page++ {
+			if page > 0 && !defaultOllama {
+				if _, err := guard.validateURL(r.Context(), nextURL, "endpoint"); err != nil {
+					writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+					return
+				}
 			}
-			lastErr = "request failed: " + err.Error()
-			continue
-		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(body[:min(len(body), 512)]))
-			continue
-		}
-		// Both OpenAI and Anthropic return {"data": [{"id": "..."},...]}.
-		var parsed struct {
-			Data []struct {
-				ID string `json:"id"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(body, &parsed); err != nil {
-			lastErr = "failed to parse response: " + err.Error()
-			continue
-		}
-		models := make([]string, 0, len(parsed.Data))
-		for _, m := range parsed.Data {
-			if m.ID != "" {
-				models = append(models, m.ID)
+			httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, nextURL, nil)
+			if err != nil {
+				lastErr = "failed to build request: " + err.Error()
+				candidateFailed = true
+				break
 			}
+			httpReq.Header = c.hdr.Clone()
+			resp, err := client.Do(httpReq)
+			if err != nil {
+				var refusal *modelURLRefusalError
+				if errors.As(err, &refusal) {
+					writeJSON(w, 200, map[string]any{"ok": false, "error": refusal.Error()})
+					return
+				}
+				lastErr = "request failed: " + err.Error()
+				candidateFailed = true
+				break
+			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				lastErr = fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(body[:min(len(body), 512)]))
+				candidateFailed = true
+				break
+			}
+
+			// Overlap complete: ensure any concurrent forced models.dev refresh finished before enriching.
+			waitReg()
+
+			// OpenCode Console may return {"opencode-go":{"models":{...}}} instead of {"data":[...]}.
+			if (provider == "opencode-go" || provider == "opencode-zen") && page == 0 {
+				if rich, ok := parseOpenCodeCatalogBody(provider, body, reg); ok {
+					for _, d := range rich {
+						if _, dup := seenIDs[d.ID]; !dup {
+							seenIDs[d.ID] = struct{}{}
+							details = append(details, d)
+						}
+					}
+					break
+				}
+			}
+
+			// Both OpenAI and Anthropic return {"data": [{"id": "..."},...]};
+			// Anthropic adds {"has_more": true, "last_id": "..."} for pagination.
+			var parsed struct {
+				Data    []rawModelEntry `json:"data"`
+				HasMore bool            `json:"has_more"`
+				LastID  string          `json:"last_id"`
+			}
+			if err := json.Unmarshal(body, &parsed); err != nil {
+				lastErr = "failed to parse response: " + err.Error()
+				candidateFailed = true
+				break
+			}
+			for _, m := range parsed.Data {
+				if m.ID == "" {
+					continue
+				}
+				if _, dup := seenIDs[m.ID]; dup {
+					continue
+				}
+				seenIDs[m.ID] = struct{}{}
+				details = append(details, buildModelDetailFromAPI(provider, m, reg))
+			}
+			nextCursor := strings.TrimSpace(parsed.LastID)
+			if !c.paginate || !parsed.HasMore || nextCursor == "" || nextCursor == prevLastID {
+				break
+			}
+			prevLastID = nextCursor
+			baseParsed, err := url.Parse(c.url)
+			if err != nil {
+				break
+			}
+			q := baseParsed.Query()
+			q.Set("after_id", nextCursor)
+			baseParsed.RawQuery = q.Encode()
+			nextURL = baseParsed.String()
 		}
-		if len(models) > 0 {
-			writeJSON(w, 200, map[string]any{"ok": true, "models": models})
+		if candidateFailed && len(details) == 0 {
+			continue
+		}
+		if len(details) > 0 {
+			if provider == "ollama" {
+				ollamaRoot := strings.TrimSuffix(strings.TrimSuffix(c.url, "/models"), "/v1")
+				enrichOllamaDetails(r.Context(), client, ollamaRoot, c.hdr, details)
+			}
+			filteredCount := 0
+			shouldFilter := !req.IncludeAll && (provider == "openai" || provider == "openai-responses" || provider == "chatgpt")
+			if shouldFilter {
+				kept := make([]modelDetail, 0, len(details))
+				for _, d := range details {
+					if d.NonChat {
+						filteredCount++
+						continue
+					}
+					kept = append(kept, d)
+				}
+				// Never return an empty list if every returned model happened to be flagged non-chat.
+				if len(kept) > 0 {
+					details = kept
+				} else {
+					filteredCount = 0
+				}
+			}
+			sortModelDetails(details)
+			models := make([]string, 0, len(details))
+			for _, d := range details {
+				models = append(models, d.ID)
+			}
+			respObj := map[string]any{"ok": true, "models": models, "model_details": details}
+			if filteredCount > 0 {
+				respObj["filtered_count"] = filteredCount
+			}
+			writeJSON(w, 200, respObj)
 			return
 		}
 		emptyOK = true // 200 but no model ids — keep trying other candidates

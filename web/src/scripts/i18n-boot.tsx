@@ -13,8 +13,16 @@ export function I18nBootScript() {
       try {
         var SUPPORTED = ["pt-BR", "en", "tr", "zh-CN"];
         var locale = "en";
+        function readCookie(name) {
+          try {
+            var match = document.cookie.split("; ").find(function(c) { return c.indexOf(name + "=") === 0; });
+            return match ? decodeURIComponent(match.slice(name.length + 1)) : null;
+          } catch (e) { return null; }
+        }
         try {
-          var saved = window.localStorage.getItem("artex.locale");
+          var saved = null;
+          try { saved = window.localStorage.getItem("artex.locale"); } catch (e) {}
+          if (!saved) saved = readCookie("artex.locale");
           if (saved && SUPPORTED.indexOf(saved) !== -1) {
             locale = saved;
           } else {

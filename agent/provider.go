@@ -139,7 +139,7 @@ type RetryConfig struct {
 const (
 	defaultWindowK = 200  // unset → assume a 200K window (Claude default)
 	minWindowK     = 32   // floor so effectiveWindow stays comfortably positive
-	maxWindowK     = 1000 // cap at 1M tokens (user request)
+	maxWindowK     = 2000 // cap at 2M tokens (Gemini 1.5 Pro, Grok 4 Fast, etc.)
 )
 
 // FormatOllama marks a LOCAL Ollama server profile. Ollama exposes an

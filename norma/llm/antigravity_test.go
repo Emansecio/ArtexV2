@@ -59,6 +59,43 @@ func TestAgyCredentialsStageExportRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAgyKeychainCredentialsAndPromptBlocks(t *testing.T) {
+	rawJSON := `{"auth_method":"consumer","id_token_email":"dev@example.com","token":{"access_token":"ya29.access","refresh_token":"1//refresh","expiry":"2030-01-02T00:04:05.500-03:00"}}`
+	encoded := "eyJhdXRoX21ldGhvZCI6ImNvbnN1bWVyIiwiaWRfdG9rZW5fZW1haWwiOiJkZXZAZXhhbXBsZS5jb20iLCJ0b2tlbiI6eyJhY2Nlc3NfdG9rZW4iOiJ5YTI5LmFjY2VzcyIsInJlZnJlc2hfdG9rZW4iOiIxLy9yZWZyZXNoIiwiZXhwaXJ5IjoiMjAzMC0wMS0wMlQwMDowNDowNS41MDAtMDM6MDAifX0="
+	_ = rawJSON
+
+	prefixed, err := ParseAgyKeychainCredentials("go-keyring-base64:" + encoded + "\n")
+	if err != nil {
+		t.Fatalf("ParseAgyKeychainCredentials prefixed: %v", err)
+	}
+	unprefixed, err := ParseAgyKeychainCredentials(encoded)
+	if err != nil {
+		t.Fatalf("ParseAgyKeychainCredentials unprefixed: %v", err)
+	}
+	if prefixed != unprefixed {
+		t.Fatalf("mismatch prefixed vs unprefixed: %+v vs %+v", prefixed, unprefixed)
+	}
+	wantExp := time.Date(2030, 1, 2, 3, 4, 5, 500_000_000, time.UTC).UnixMilli()
+	if prefixed.ExpiresMS != wantExp || prefixed.Access != "ya29.access" || prefixed.Refresh != "1//refresh" || prefixed.Email != "dev@example.com" {
+		t.Fatalf("unexpected keychain credential: %+v", prefixed)
+	}
+	if _, err := ParseAgyKeychainCredentials("not a keyring payload"); err == nil {
+		t.Fatalf("expected error on invalid payload")
+	}
+	if _, err := ParseAgyKeychainCredentials("   "); err == nil {
+		t.Fatalf("expected error on blank payload")
+	}
+
+	first := agyBuildPromptBlocks("You are Artex.", "hello")
+	if len(first) != 2 || first[0]["text"] != "<system-reminder>\nYou are Artex.\n</system-reminder>" || first[1]["text"] != "hello" {
+		t.Fatalf("unexpected opening prompt blocks: %#v", first)
+	}
+	second := agyBuildPromptBlocks("", "again")
+	if len(second) != 1 || second[0]["text"] != "again" {
+		t.Fatalf("unexpected follow-up prompt blocks: %#v", second)
+	}
+}
+
 func TestAgyModelCollapseAndQuotaError(t *testing.T) {
 	collapsed := CollapseAdvertisedAgyModels([]string{
 		"gemini-4-carbon",

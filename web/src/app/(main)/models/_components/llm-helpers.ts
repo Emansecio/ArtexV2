@@ -35,105 +35,108 @@ export interface ProviderMeta {
   keyPageUrl?: string;
 }
 
-export const PROVIDERS: ProviderMeta[] = [
-  {
-    id: "chatgpt",
-    label: t("Codex / ChatGPT (OAuth)"),
-    shortLabel: "Codex / ChatGPT",
-    desc: t("Sign in with ChatGPT Plus or Pro subscription"),
-    modelPlaceholder: "gpt-5.4",
-    baseUrlPlaceholder: "https://api.openai.com/v1",
-    oauthProvider: "chatgpt",
-  },
-  {
-    id: "anthropic-oauth",
-    label: t("Claude Code (OAuth)"),
-    shortLabel: "Claude Code",
-    desc: t("Sign in with Claude Pro or Max subscription"),
-    modelPlaceholder: "claude-opus-4-8",
-    baseUrlPlaceholder: "https://api.anthropic.com",
-    oauthProvider: "anthropic",
-  },
-  {
-    id: "antigravity-cli",
-    label: t("Antigravity CLI (OAuth)"),
-    shortLabel: "Antigravity CLI",
-    desc: t("Google Antigravity CLI (Gemini 4 & Claude via ACP)"),
-    modelPlaceholder: "gemini-4-carbon",
-    baseUrlPlaceholder: "acp://antigravity-cli",
-    oauthProvider: "antigravity-cli",
-  },
-  {
-    id: "devin",
-    label: t("Devin (OAuth)"),
-    shortLabel: "Devin",
-    desc: t("Cognition Devin Cascade API (SWE-1.6, Claude, Gemini)"),
-    modelPlaceholder: "swe-1-6",
-    baseUrlPlaceholder: "https://server.codeium.com",
-    oauthProvider: "devin",
-  },
-  {
-    id: "opencode-zen",
-    label: "OpenCode Zen",
-    shortLabel: "OpenCode Zen",
-    desc: t("Pay-as-you-go OpenCode gateway (Claude, GPT, Grok, open models)"),
-    modelPlaceholder: "claude-sonnet-4-6",
-    baseUrlPlaceholder: OPENCODE_ZEN_BASE_URL,
-    keyPageUrl: "https://opencode.ai/auth",
-  },
-  {
-    id: "opencode-go",
-    label: "OpenCode Go",
-    shortLabel: "OpenCode Go",
-    desc: t("OpenCode Go subscription (GLM, Kimi, DeepSeek, Qwen)"),
-    modelPlaceholder: "deepseek-v3.2",
-    baseUrlPlaceholder: OPENCODE_GO_BASE_URL,
-    keyPageUrl: "https://opencode.ai/auth",
-  },
-  {
-    id: "anthropic",
-    label: "Anthropic (API Key)",
-    shortLabel: "Anthropic",
-    desc: t("Claude Messages API with native thinking"),
-    modelPlaceholder: "claude-opus-4-8",
-    baseUrlPlaceholder: "https://api.anthropic.com",
-    keyPageUrl: "https://console.anthropic.com/settings/keys",
-  },
-  {
-    id: "openai",
-    label: "OpenAI (Chat Completions)",
-    shortLabel: "OpenAI Chat",
-    desc: t("OpenAI & compatible gateways (/chat/completions)"),
-    modelPlaceholder: "gpt-5.4",
-    baseUrlPlaceholder: "https://api.openai.com/v1",
-    keyPageUrl: "https://platform.openai.com/api-keys",
-  },
-  {
-    id: "openai-responses",
-    label: "OpenAI (Responses API)",
-    shortLabel: "Responses API",
-    desc: t("OpenAI Responses API (/responses)"),
-    modelPlaceholder: "o3",
-    baseUrlPlaceholder: "https://api.openai.com/v1",
-    keyPageUrl: "https://platform.openai.com/api-keys",
-  },
-  {
-    id: "ollama",
-    label: t("Ollama (local, no key needed)"),
-    shortLabel: "Ollama",
-    desc: t("Local self-hosted models, no API key required"),
-    modelPlaceholder: "llama3.2",
-    baseUrlPlaceholder: OLLAMA_DEFAULT_BASE_URL,
-    keyless: true,
-  },
-];
+export function getProviders(): ProviderMeta[] {
+  return [
+    {
+      id: "chatgpt",
+      label: t("Codex / ChatGPT (OAuth)"),
+      shortLabel: "Codex / ChatGPT",
+      desc: t("Sign in with ChatGPT Plus or Pro subscription"),
+      modelPlaceholder: "gpt-5.4",
+      baseUrlPlaceholder: "https://api.openai.com/v1",
+      oauthProvider: "chatgpt",
+    },
+    {
+      id: "anthropic-oauth",
+      label: t("Claude Code (OAuth)"),
+      shortLabel: "Claude Code",
+      desc: t("Sign in with Claude Pro or Max subscription"),
+      modelPlaceholder: "claude-opus-4-8",
+      baseUrlPlaceholder: "https://api.anthropic.com",
+      oauthProvider: "anthropic",
+    },
+    {
+      id: "antigravity-cli",
+      label: t("Antigravity CLI (OAuth)"),
+      shortLabel: "Antigravity CLI",
+      desc: t("Google Antigravity CLI (Gemini 4 & Claude via ACP)"),
+      modelPlaceholder: "gemini-4-carbon",
+      baseUrlPlaceholder: "acp://antigravity-cli",
+      oauthProvider: "antigravity-cli",
+    },
+    {
+      id: "devin",
+      label: t("Devin (OAuth)"),
+      shortLabel: "Devin",
+      desc: t("Cognition Devin Cascade API (SWE-1.6, Claude, Gemini)"),
+      modelPlaceholder: "swe-1-6",
+      baseUrlPlaceholder: "https://server.codeium.com",
+      oauthProvider: "devin",
+    },
+    {
+      id: "opencode-zen",
+      label: "OpenCode Zen",
+      shortLabel: "OpenCode Zen",
+      desc: t("Pay-as-you-go OpenCode gateway (Claude, GPT, Grok, open models)"),
+      modelPlaceholder: "claude-sonnet-4-6",
+      baseUrlPlaceholder: OPENCODE_ZEN_BASE_URL,
+      keyPageUrl: "https://opencode.ai/auth",
+    },
+    {
+      id: "opencode-go",
+      label: "OpenCode Go",
+      shortLabel: "OpenCode Go",
+      desc: t("OpenCode Go subscription (GLM, Kimi, DeepSeek, Qwen)"),
+      modelPlaceholder: "deepseek-v3.2",
+      baseUrlPlaceholder: OPENCODE_GO_BASE_URL,
+      keyPageUrl: "https://opencode.ai/auth",
+    },
+    {
+      id: "anthropic",
+      label: "Anthropic (API Key)",
+      shortLabel: "Anthropic",
+      desc: t("Claude Messages API with native thinking"),
+      modelPlaceholder: "claude-opus-4-8",
+      baseUrlPlaceholder: "https://api.anthropic.com",
+      keyPageUrl: "https://console.anthropic.com/settings/keys",
+    },
+    {
+      id: "openai",
+      label: "OpenAI (Chat Completions)",
+      shortLabel: "OpenAI Chat",
+      desc: t("OpenAI & compatible gateways (/chat/completions)"),
+      modelPlaceholder: "gpt-5.4",
+      baseUrlPlaceholder: "https://api.openai.com/v1",
+      keyPageUrl: "https://platform.openai.com/api-keys",
+    },
+    {
+      id: "openai-responses",
+      label: "OpenAI (Responses API)",
+      shortLabel: "Responses API",
+      desc: t("OpenAI Responses API (/responses)"),
+      modelPlaceholder: "o3",
+      baseUrlPlaceholder: "https://api.openai.com/v1",
+      keyPageUrl: "https://platform.openai.com/api-keys",
+    },
+    {
+      id: "ollama",
+      label: t("Ollama (local, no key needed)"),
+      shortLabel: "Ollama",
+      desc: t("Local self-hosted models, no API key required"),
+      modelPlaceholder: "llama3.2",
+      baseUrlPlaceholder: OLLAMA_DEFAULT_BASE_URL,
+      keyless: true,
+    },
+  ];
+}
 
 export function providerMeta(format?: string): ProviderMeta {
-  return PROVIDERS.find((p) => p.id === format) ?? PROVIDERS.find((p) => p.id === "anthropic")!;
+  const list = getProviders();
+  return list.find((p) => p.id === format) ?? list.find((p) => p.id === "anthropic")!;
 }
 
 export function normalizeFormat(format?: string): ProfileFormat {
-  const found = PROVIDERS.find((p) => p.id === format);
+  const found = getProviders().find((p) => p.id === format);
   return found ? found.id : "anthropic";
 }
 
@@ -141,36 +144,70 @@ export function oauthProviderOf(format?: string): OAuthProviderId | null {
   return providerMeta(format).oauthProvider ?? null;
 }
 
-export const THINKING_TYPES: { value: string; label: string }[] = [
-  { value: NONE, label: t("Not sent (default)") },
-  { value: "disabled", label: t("Disabled") },
-  { value: "enabled", label: t("Enabled") },
-];
+export function getThinkingTypes(): { value: string; label: string }[] {
+  return [
+    { value: NONE, label: t("Not sent (default)") },
+    { value: "disabled", label: t("Disabled") },
+    { value: "enabled", label: t("Enabled") },
+  ];
+}
 
-export const EFFORT_LEVELS: { value: string; label: string }[] = [
-  { value: NONE, label: t("Default") },
-  { value: "low", label: "low" },
-  { value: "medium", label: "medium" },
-  { value: "high", label: "high" },
-  { value: "xhigh", label: "xhigh" },
-  { value: "max", label: "max" },
-];
+export function getEffortLevels(): { value: string; label: string }[] {
+  return [
+    { value: NONE, label: t("Default") },
+    { value: "low", label: "low" },
+    { value: "medium", label: "medium" },
+    { value: "high", label: "high" },
+    { value: "xhigh", label: "xhigh" },
+    { value: "max", label: "max" },
+  ];
+}
 
-export const CONTEXT_PRESETS = [128, 200, 400, 1000] as const;
+export const CONTEXT_TOKEN_PRESETS = [128_000, 200_000, 256_000, 400_000, 1_000_000, 2_000_000] as const;
+export const OUTPUT_TOKEN_PRESETS = [0, 8_192, 16_384, 32_768, 64_000, 128_000] as const;
 
-export const MAX_TOKENS_FIELDS: { value: string; label: string }[] = [
-  { value: NONE, label: t("max_tokens (default)") },
-  { value: "max_completion_tokens", label: "max_completion_tokens" },
-];
+export function formatTokensShort(tokens: number): string {
+  if (!Number.isFinite(tokens) || tokens <= 0) return t("Auto");
+  if (tokens >= 1_000_000) {
+    return `${Number((tokens / 1_000_000).toFixed(2))}M`;
+  }
+  if (tokens >= 1_000) {
+    return `${Number((tokens / 1_000).toFixed(1))}K`;
+  }
+  return String(Math.round(tokens));
+}
 
-export const MAX_TOKENS_FIELD_HINTS: Record<string, string> = {
-  openai: t(
-    "Which key carries the cap. max_tokens is the default and the vast majority of compatible gateways only accept it; OpenAI's official reasoning models (the o series / GPT-5) conversely only accept max_completion_tokens and fail outright with unsupported_parameter when they receive max_tokens.",
-  ),
-  anthropic: t("Only selectable for the openai format. Anthropic's field name is fixed as max_tokens."),
-  "openai-responses": t("Only selectable for the openai format. The Responses API's field name is fixed as max_output_tokens."),
-  ollama: t("Only selectable for the openai format. Ollama's field name is fixed as max_tokens."),
-};
+export function formatContextK(k?: number): string {
+  if (!k || k <= 0) return "";
+  if (k >= 1000) {
+    return `${Number((k / 1000).toFixed(2))}M`;
+  }
+  return `${k}K`;
+}
+
+export function getMaxTokensFields(): { value: string; label: string }[] {
+  return [
+    { value: NONE, label: t("max_tokens (default)") },
+    { value: "max_completion_tokens", label: "max_completion_tokens" },
+  ];
+}
+
+export function getMaxTokensFieldHint(format: string): string {
+  switch (format) {
+    case "openai":
+      return t(
+        "Which key carries the cap. max_tokens is the default and the vast majority of compatible gateways only accept it; OpenAI's official reasoning models (the o series / GPT-5) conversely only accept max_completion_tokens and fail outright with unsupported_parameter when they receive max_tokens.",
+      );
+    case "anthropic":
+      return t("Only selectable for the openai format. Anthropic's field name is fixed as max_tokens.");
+    case "openai-responses":
+      return t("Only selectable for the openai format. The Responses API's field name is fixed as max_output_tokens.");
+    case "ollama":
+      return t("Only selectable for the openai format. Ollama's field name is fixed as max_tokens.");
+    default:
+      return "";
+  }
+}
 
 /** Renders a translated string, turning <b>…</b> spans into bold elements. */
 export function rich(s: string): React.ReactNode[] {

@@ -1188,9 +1188,17 @@ export const api = {
     streaming = true, // test with the profile's real streaming mode so "streaming works, non-streaming does not" never leaks into conversations
     session_header_key = "", // non-empty = the test request also carries this custom session header (value is a one-off session id)
     user_agent = "", // non-empty = the test overrides the User-Agent header with this value
+    max_tokens_field = "", // ""=max_tokens | "max_completion_tokens" (openai format only)
   ) =>
     // reply = the model's actual reply (truncated); the backend marks a profile that replies with nothing as failed
-    post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
+    post<{
+      ok: boolean;
+      error?: string;
+      latency_ms?: number;
+      model?: string;
+      reply?: string;
+      suggested_fix?: { max_tokens_field?: string };
+    }>("/llm/test", {
       provider,
       model,
       base_url,
@@ -1202,6 +1210,7 @@ export const api = {
       streaming,
       session_header_key,
       user_agent,
+      max_tokens_field,
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
@@ -1235,13 +1244,42 @@ export const api = {
   // Global retry policy (count + interval for each of the five layers). All zeros = built-in defaults everywhere.
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
-  fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
-    post<{ ok: boolean; error?: string; models?: string[]; model_details?: ModelDetail[] }>("/llm/models", {
+  fetchLLMModels: (
+    provider: string,
+    base_url: string,
+    api_key: string,
+    proxy = "",
+    profile_id?: number,
+    opts?: { force?: boolean; include_all?: boolean },
+  ) =>
+    post<{
+      ok: boolean;
+      error?: string;
+      models?: string[];
+      model_details?: ModelDetail[];
+      filtered_count?: number;
+      cache_source?: string;
+    }>("/llm/models", {
       provider,
       base_url,
       api_key,
       proxy,
       profile_id,
+      force: opts?.force ?? false,
+      include_all: opts?.include_all ?? false,
+    }),
+  lookupLLMModelSpec: (
+    provider: string,
+    model: string,
+    opts?: { base_url?: string; proxy?: string; api_key?: string; profile_id?: number },
+  ) =>
+    post<{ ok: boolean; found?: boolean; detail?: ModelDetail }>("/llm/model-spec", {
+      provider,
+      model,
+      base_url: opts?.base_url ?? "",
+      proxy: opts?.proxy ?? "",
+      api_key: opts?.api_key ?? "",
+      profile_id: opts?.profile_id,
     }),
   llmOAuthStatus: (opts?: { verify?: boolean; force?: boolean }) => {
     const params = new URLSearchParams();

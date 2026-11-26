@@ -1274,9 +1274,22 @@ export interface OAuthStartResult {
 export interface ModelDetail {
   id: string;
   label?: string;
+  context_window?: number;
   context_window_k?: number;
   max_output_tokens?: number;
   reasoning_levels?: string[];
+  default_reasoning_effort?: string;
+  thinking_type?: string;
+  max_tokens_field?: string;
+  price_input_per_m?: number;
+  price_output_per_m?: number;
+  price_cache_read_per_m?: number;
+  price_cache_write_per_m?: number;
+  release_date?: string;
+  supports_tools?: boolean;
+  supports_vision?: boolean;
+  non_chat?: boolean;
+  source?: string;
 }
 
 // ---- Agents ----

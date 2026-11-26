@@ -34,22 +34,63 @@ const INTL_LOCALES: Record<Locale, string> = {
   "zh-CN": "zh-CN",
 };
 
+function readLocaleCookie(): string | null {
+  if (typeof document === "undefined") return null;
+  try {
+    const match = document.cookie.split("; ").find((row) => row.startsWith(`${STORAGE_KEY}=`));
+    return match ? decodeURIComponent(match.slice(STORAGE_KEY.length + 1)) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeLocaleCookie(value: Locale) {
+  if (typeof document === "undefined") return;
+  try {
+    // biome-ignore lint/suspicious/noDocumentCookie: dual persistence backup alongside localStorage
+    document.cookie = `${STORAGE_KEY}=${encodeURIComponent(value)}; path=/; max-age=31536000; SameSite=Lax`;
+  } catch {
+    /* ignore */
+  }
+}
+
 function loadRuntimeDict(active: Locale): Record<string, string> {
   if (active === "en" || typeof window === "undefined") return {};
-  const bag = (window as unknown as { __ARTEX_I18N__?: Record<string, Record<string, string>> }).__ARTEX_I18N__;
-  const d = bag?.[active];
-  return d && typeof d === "object" ? d : {};
+  const win = window as unknown as { __ARTEX_I18N__?: Record<string, Record<string, string>> };
+  const existing = win.__ARTEX_I18N__?.[active];
+  if (existing && typeof existing === "object") return existing;
+  // Self-healing fallback: if an async JS chunk evaluated before I18nBootScript
+  // (or after an SPA redirect), load the dictionary synchronously right now so
+  // locale === "pt-BR" never renders with an empty dictionary.
+  try {
+    const xhr = new XMLHttpRequest();
+    xhr.open("GET", `/locales/${encodeURIComponent(active)}.json`, false);
+    xhr.send(null);
+    if (xhr.status >= 200 && xhr.status < 300 && xhr.responseText) {
+      const parsed = JSON.parse(xhr.responseText) as Record<string, string>;
+      if (parsed && typeof parsed === "object") {
+        win.__ARTEX_I18N__ = win.__ARTEX_I18N__ || {};
+        win.__ARTEX_I18N__[active] = parsed;
+        return parsed;
+      }
+    }
+  } catch {
+    /* fall through to English keys */
+  }
+  return {};
 }
 
 function detectLocale(): Locale {
   // Prerendering (static export) has no window: it renders the default locale.
   if (typeof window === "undefined") return DEFAULT_LOCALE;
   try {
-    const saved = window.localStorage.getItem(STORAGE_KEY);
+    const saved = window.localStorage.getItem(STORAGE_KEY) ?? readLocaleCookie();
     const match = LOCALES.find((l) => l.code === saved);
     if (match) return match.code;
   } catch {
-    /* storage blocked: fall through to the browser language */
+    const saved = readLocaleCookie();
+    const match = LOCALES.find((l) => l.code === saved);
+    if (match) return match.code;
   }
   for (const lang of window.navigator.languages ?? [window.navigator.language]) {
     const tag = lang?.toLowerCase();
@@ -87,7 +128,8 @@ export function setLocale(next: Locale) {
   try {
     window.localStorage.setItem(STORAGE_KEY, next);
   } catch {
-    /* storage blocked: fall back to browser-language detection on reload */
+    /* storage blocked: fall back to cookie / browser-language detection on reload */
   }
+  writeLocaleCookie(next);
   window.location.reload();
 }

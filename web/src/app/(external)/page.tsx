@@ -1,8 +1,12 @@
-import { redirect } from "next/navigation";
+"use client";
 
-import { t } from "@/i18n";
+import * as React from "react";
+import { useRouter } from "next/navigation";
 
 export default function Home() {
-  redirect("/function/tasks");
-  return <>{t("Coming Soon")}</>;
+  const router = useRouter();
+  React.useEffect(() => {
+    router.replace("/function/tasks");
+  }, [router]);
+  return null;
 }

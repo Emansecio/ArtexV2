@@ -53,6 +53,7 @@ type Server struct {
 	oauth  *oauth.Manager
 
 	skillDir string // root directory for skill subdirectories
+	dataDir  string // data root directory (used for persistent model catalog caches, etc.)
 	jwtKey   []byte // HS256 signing key loaded from / generated into keyDir/jwt.key
 
 	scrubSecrets bool // drop ARTEX_PG_DSN and the API keys from the environment once read (binary only)
@@ -91,8 +92,11 @@ type Server struct {
 	// free slots off the same snapshot and over-promote past the limit.
 	concMu sync.Mutex
 
-	modelCatalogMu    sync.Mutex
-	modelCatalogCache map[string]cachedModelCatalog
+	modelCatalogMu         sync.Mutex
+	modelCatalogCache      map[string]cachedModelCatalog
+	modelCatalogRefreshing map[string]bool
+	modelReg               *modelRegistry
+	modelsDevURL           string // test seam: override models.dev endpoint
 
 	readyPG readyCache
 
@@ -237,7 +241,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, dataDir: dataDir, jwtKey: key, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -1140,6 +1144,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/pool", s.pgLLMPoolStatus)
 	mux.HandleFunc("POST /api/llm/pool/reset", s.pgLLMPoolReset)
 	mux.HandleFunc("POST /api/llm/models", s.pgListModels)
+	mux.HandleFunc("POST /api/llm/model-spec", s.pgLookupModelSpec)
 	mux.HandleFunc("GET /api/llm/oauth/status", s.oauthStatus)
 	mux.HandleFunc("POST /api/llm/oauth/start", s.oauthStart)
 	mux.HandleFunc("POST /api/llm/oauth/complete", s.oauthComplete)
@@ -1609,9 +1614,12 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
-	if k := req.ContextWindowK; k > 0 { // 0 = keep default (200K); cap at 1M
-		if k > 1000 {
-			k = 1000
+	if k := req.ContextWindowK; k > 0 { // 0 = keep default (200K); cap at 2M
+		if k >= 8192 {
+			k = (k + 500) / 1000
+		}
+		if k > 2000 {
+			k = 2000
 		}
 		cfg.ContextWindowK = k
 	}
@@ -1670,6 +1678,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		Streaming        *bool  `json:"streaming"`          // omitted = streaming, the same defaults as when saving a profile
 		SessionHeaderKey string `json:"session_header_key"` // non-empty = the test also sends this custom session header, with a one-off random session id as the value
 		UserAgent        string `json:"user_agent"`         // non-empty = the test overrides the User-Agent header with this value (mirrors production)
+		MaxTokensField   string `json:"max_tokens_field"`   // ""=max_tokens | "max_completion_tokens" (openai format only)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1723,6 +1732,15 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
+	if req.Provider == "openai" {
+		mtf := strings.TrimSpace(req.MaxTokensField)
+		if mtf == "" && stored != nil {
+			mtf = stored.MaxTokensField
+		}
+		if mtf == llm.MaxTokensFieldCompletion {
+			cfg.MaxTokensField = mtf
+		}
+	}
 	// Likewise, the streaming mode follows that profile's choice: endpoints supporting only one of the two channels must fail
 	// here already, instead of discovering mid-conversation that "the profile that passed the test cannot run at all".
 	if req.Streaming != nil {
@@ -1805,13 +1823,35 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// is a runtime concern.
 	lat, reply, err := agent.TestConnection(r.Context(), cfg)
 	if err != nil {
-		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		out := map[string]any{"ok": false, "error": err.Error()}
+		if fix := detectTestLLMSuggestedFix(req.Provider, cfg.MaxTokensField, err.Error()); fix != nil {
+			out["suggested_fix"] = fix
+		}
+		writeJSON(w, 200, out)
 		return
 	}
 	// Return the model's actual reply so a "passed" test has evidence: you can see it really spoke, not just an HTTP 200.
 	writeJSON(w, 200, map[string]any{
 		"ok": true, "latency_ms": lat.Milliseconds(), "model": cfg.Model, "reply": truncateReply(reply),
 	})
+}
+
+func detectTestLLMSuggestedFix(provider, currentMaxTokensField, errMsg string) map[string]string {
+	if provider != "openai" {
+		return nil
+	}
+	low := strings.ToLower(errMsg)
+	if currentMaxTokensField != llm.MaxTokensFieldCompletion &&
+		strings.Contains(low, "max_completion_tokens") &&
+		(strings.Contains(low, "max_tokens") || strings.Contains(low, "unsupported_parameter") || strings.Contains(low, "not supported")) {
+		return map[string]string{"max_tokens_field": llm.MaxTokensFieldCompletion}
+	}
+	if currentMaxTokensField == llm.MaxTokensFieldCompletion &&
+		strings.Contains(low, "max_completion_tokens") &&
+		(strings.Contains(low, "unknown") || strings.Contains(low, "unrecognized") || strings.Contains(low, "unsupported")) {
+		return map[string]string{"max_tokens_field": ""}
+	}
+	return nil
 }
 
 // sameLLMEndpoint reports whether two provider/base URL pairs resolve to the same

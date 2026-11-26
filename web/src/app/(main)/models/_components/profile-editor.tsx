@@ -15,6 +15,7 @@ import {
   RefreshCwIcon,
   SaveIcon,
   SlidersHorizontalIcon,
+  SparklesIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -33,19 +34,21 @@ import type { LLMPoolMember, LLMProfile, LLMRetryOverride, ModelDetail, OAuthPro
 import { cn } from "@/lib/utils";
 
 import {
-  CONTEXT_PRESETS,
-  EFFORT_LEVELS,
+  CONTEXT_TOKEN_PRESETS,
+  formatTokensShort,
   fromStore,
-  MAX_TOKENS_FIELD_HINTS,
-  MAX_TOKENS_FIELDS,
+  getEffortLevels,
+  getMaxTokensFieldHint,
+  getMaxTokensFields,
+  getProviders,
+  getThinkingTypes,
   NONE,
   normalizeFormat,
-  PROVIDERS,
+  OUTPUT_TOKEN_PRESETS,
   type ProfileFormat,
   providerConnectionState,
   providerMeta,
   rich,
-  THINKING_TYPES,
   toStore,
 } from "./llm-helpers";
 import { ProviderIcon } from "./provider-icons";
@@ -109,23 +112,32 @@ export function ProfileEditorSheet({
   const [saving, setSaving] = React.useState(false);
   const [models, setModels] = React.useState<string[]>([]);
   const [modelDetails, setModelDetails] = React.useState<Map<string, ModelDetail>>(new Map());
+  const [filteredCount, setFilteredCount] = React.useState(0);
+  const [includeAllModels, setIncludeAllModels] = React.useState(false);
+  const [lookedUpDetail, setLookedUpDetail] = React.useState<ModelDetail | null>(null);
   const [loadingModels, setLoadingModels] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
   const [modelQuery, setModelQuery] = React.useState("");
   const [oauthBusy, setOauthBusy] = React.useState(false);
   const [manualCode, setManualCode] = React.useState("");
   const [manualOpen, setManualOpen] = React.useState(false);
+  const autoNameRef = React.useRef("");
+  const fetchSeqRef = React.useRef(0);
 
   React.useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      fetchSeqRef.current++;
+      return;
+    }
     setName(profile?.name ?? "");
+    autoNameRef.current = "";
     setFormat(normalizeFormat(profile?.format));
     setModel(profile?.model ?? "");
     setBaseUrl(profile?.base_url ?? "");
     setProxy(profile?.proxy ?? "");
     setRps(String(profile?.rate_per_second ?? 0));
     setRpm(String(profile?.rate_per_minute ?? 0));
-    setCw(String(profile?.context_window_k ?? 0));
+    setCw(profile?.context_window_k ? String(profile.context_window_k * 1000) : "0");
     setThinkingType(fromStore(profile?.thinking_type));
     setEffort(fromStore(profile?.reasoning_effort));
     setPriority(String(profile?.priority ?? 0));
@@ -140,6 +152,9 @@ export function ProfileEditorSheet({
     setKeyHint(profile?.api_key_hint ?? "");
     setModels([]);
     setModelDetails(new Map());
+    setFilteredCount(0);
+    setIncludeAllModels(false);
+    setLookedUpDetail(null);
     setModelsOpen(false);
     setModelQuery("");
     setManualCode("");
@@ -148,6 +163,10 @@ export function ProfileEditorSheet({
   }, [open, profile]);
 
   const profileId = profile ? Number(profile.id) : undefined;
+  const providers = getProviders();
+  const thinkingTypes = getThinkingTypes();
+  const effortLevels = getEffortLevels();
+  const maxTokensFields = getMaxTokensFields();
   const meta = providerMeta(format);
   const oauthProv = meta.oauthProvider ?? null;
   const oauthStatus = oauthProv ? oauthMap.get(oauthProv) : undefined;
@@ -219,30 +238,163 @@ export function ProfileEditorSheet({
     return models.filter((m) => m.toLowerCase().includes(q));
   }, [models, modelQuery]);
 
-  async function loadModels() {
-    if (loadingModels) return;
-    setLoadingModels(true);
-    setModels([]);
-    setModelDetails(new Map());
-    setModelQuery("");
-    try {
-      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
-      if (r.ok && r.models && r.models.length > 0) {
-        setModels(r.models);
-        const detailMap = new Map<string, ModelDetail>();
-        for (const d of r.model_details ?? []) {
-          detailMap.set(d.id, d);
-        }
-        setModelDetails(detailMap);
-        setModelsOpen(true);
-        toast.success(t("Loaded {count} models", { count: r.models.length }));
-      } else {
-        toast.error(t("Failed to load models: {error}", { error: r.error ?? t("no models returned") }));
+  const loadModels = React.useCallback(
+    async (opts?: { silent?: boolean; force?: boolean; includeAll?: boolean }) => {
+      const silent = opts?.silent ?? false;
+      const force = opts?.force ?? false;
+      const incAll = opts?.includeAll ?? includeAllModels;
+      const seq = ++fetchSeqRef.current;
+      setLoadingModels(true);
+      if (!silent) {
+        setModelQuery("");
       }
-    } catch (e) {
-      toast.error(t("Error loading models: {error}", { error: (e as Error).message }));
-    } finally {
-      setLoadingModels(false);
+      try {
+        const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId, {
+          force,
+          include_all: incAll,
+        });
+        if (seq !== fetchSeqRef.current) return;
+        if (r.ok && r.models && r.models.length > 0) {
+          setModels(r.models);
+          setFilteredCount(r.filtered_count ?? 0);
+          const detailMap = new Map<string, ModelDetail>();
+          for (const d of r.model_details ?? []) {
+            detailMap.set(d.id, d);
+          }
+          setModelDetails(detailMap);
+          if (!silent) {
+            setModelsOpen(true);
+            toast.success(t("Loaded {count} models", { count: r.models.length }));
+          }
+        } else if (!silent) {
+          setModels([]);
+          setModelDetails(new Map());
+          setFilteredCount(0);
+          toast.error(t("Failed to load models: {error}", { error: r.error ?? t("no models returned") }));
+        }
+      } catch (e) {
+        if (seq !== fetchSeqRef.current) return;
+        if (!silent) {
+          toast.error(t("Error loading models: {error}", { error: (e as Error).message }));
+        }
+      } finally {
+        if (seq === fetchSeqRef.current) {
+          setLoadingModels(false);
+        }
+      }
+    },
+    [format, baseUrl, apiKey, proxy, profileId, includeAllModels],
+  );
+
+  // Automatically fetch available models in the background when a ready provider is active.
+  const canAutoFetch =
+    open &&
+    (Boolean(oauthProv && oauthStatus?.connected) ||
+      (format === "ollama" && ollamaStatus?.state === "connected") ||
+      format === "opencode-zen" ||
+      format === "opencode-go" ||
+      Boolean(!isNew && profile?.api_key_hint && profile.format === format));
+
+  React.useEffect(() => {
+    if (!canAutoFetch) return;
+    void loadModels({ silent: true });
+    // Intentionally scoped to sheet open + provider readiness transitions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, format, oauthStatus?.connected, ollamaStatus?.state, profile?.id]);
+
+  // Debounced spec lookup for typed model IDs not yet present in the fetched list.
+  React.useEffect(() => {
+    if (!open) return;
+    const trimmed = model.trim();
+    if (!trimmed) {
+      setLookedUpDetail(null);
+      return;
+    }
+    if (modelDetails.has(trimmed)) {
+      setLookedUpDetail(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void api
+        .lookupLLMModelSpec(format, trimmed, {
+          base_url: baseUrl,
+          proxy,
+          api_key: apiKey,
+          profile_id: profileId,
+        })
+        .then((res) => {
+          if (cancelled) return;
+          if (res.ok && res.found && res.detail) {
+            setLookedUpDetail(res.detail);
+          } else {
+            setLookedUpDetail(null);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setLookedUpDetail(null);
+        });
+    }, 300);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [open, format, model, modelDetails, baseUrl, proxy, apiKey, profileId]);
+
+  const selectedModelDetail = React.useMemo(() => {
+    const trimmed = model.trim();
+    if (!trimmed) return undefined;
+    const exact = modelDetails.get(trimmed);
+    if (exact) return exact;
+    if (lookedUpDetail && lookedUpDetail.id.toLowerCase() === trimmed.toLowerCase()) {
+      return lookedUpDetail;
+    }
+    return undefined;
+  }, [model, modelDetails, lookedUpDetail]);
+
+  function detectedContextTokens(detail?: ModelDetail): number {
+    if (!detail) return 0;
+    if (detail.context_window && detail.context_window > 0) return detail.context_window;
+    if (detail.context_window_k && detail.context_window_k > 0) return detail.context_window_k * 1000;
+    return 0;
+  }
+
+  function applyModelDetail(detail: ModelDetail, opts?: { notify?: boolean }) {
+    const ctxTokens = detectedContextTokens(detail);
+    if (ctxTokens > 0) {
+      setCw(String(ctxTokens));
+    }
+    if (detail.max_output_tokens && detail.max_output_tokens > 0) {
+      setMaxTokens(String(detail.max_output_tokens));
+    }
+    if (format === "openai") {
+      setMaxTokensField(detail.max_tokens_field ? detail.max_tokens_field : NONE);
+    }
+    if (detail.thinking_type) {
+      setThinkingType(detail.thinking_type);
+    }
+    if (detail.reasoning_levels && detail.reasoning_levels.length > 0) {
+      if (effort === NONE) {
+        if (detail.default_reasoning_effort && detail.reasoning_levels.includes(detail.default_reasoning_effort)) {
+          setEffort(detail.default_reasoning_effort);
+        }
+      } else if (!detail.reasoning_levels.includes(effort)) {
+        setEffort(
+          detail.default_reasoning_effort && detail.reasoning_levels.includes(detail.default_reasoning_effort)
+            ? detail.default_reasoning_effort
+            : detail.reasoning_levels.includes("high")
+              ? "high"
+              : detail.reasoning_levels[0],
+        );
+      }
+    }
+    if (isNew && (!name.trim() || name.trim() === autoNameRef.current)) {
+      const suggested = `${meta.shortLabel} · ${detail.label || detail.id}`;
+      autoNameRef.current = suggested;
+      setName(suggested);
+    }
+    if (opts?.notify) {
+      toast.success(t("Applied auto-detected defaults for {model}", { model: detail.id }));
     }
   }
 
@@ -250,19 +402,14 @@ export function ProfileEditorSheet({
     setModel(selectedId);
     const detail = modelDetails.get(selectedId);
     if (detail) {
-      if (detail.context_window_k && detail.context_window_k > 0) {
-        setCw(String(detail.context_window_k));
-      }
-      if (detail.reasoning_levels && detail.reasoning_levels.length > 0 && effort !== NONE) {
-        if (!detail.reasoning_levels.includes(effort)) {
-          setEffort(detail.reasoning_levels.includes("high") ? "high" : detail.reasoning_levels[0]);
-        }
-      }
+      applyModelDetail(detail);
+    } else if (isNew && (!name.trim() || name.trim() === autoNameRef.current)) {
+      const suggested = `${meta.shortLabel} · ${selectedId}`;
+      autoNameRef.current = suggested;
+      setName(suggested);
     }
     setModelsOpen(false);
   }
-
-  const selectedModelDetail = modelDetails.get(model.trim());
 
   async function testConnection() {
     if (testing) return;
@@ -280,13 +427,29 @@ export function ProfileEditorSheet({
         streaming,
         sessionHeaderKey.trim(),
         userAgent.trim(),
+        format === "openai" ? toStore(maxTokensField) : "",
       );
       if (r.ok) {
         toast.success(t("Connected · {latency}ms · {model}", { latency: r.latency_ms ?? "?", model: r.model ?? model }), {
           description: r.reply ? t("Reply: {reply}", { reply: r.reply }) : undefined,
         });
       } else {
-        toast.error(t("Connection failed: {error}", { error: r.error ?? t("unknown") }));
+        const suggestedField = r.suggested_fix?.max_tokens_field;
+        if (format === "openai" && suggestedField !== undefined) {
+          const nextField = suggestedField === "max_completion_tokens" ? "max_completion_tokens" : NONE;
+          const fieldLabel = suggestedField === "max_completion_tokens" ? "max_completion_tokens" : "max_tokens";
+          toast.error(t("Connection failed: {error}", { error: r.error ?? t("unknown") }), {
+            action: {
+              label: t("Use {field}", { field: fieldLabel }),
+              onClick: () => {
+                setMaxTokensField(nextField);
+                toast.success(t("Cap field switched to {field}; test again.", { field: fieldLabel }));
+              },
+            },
+          });
+        } else {
+          toast.error(t("Connection failed: {error}", { error: r.error ?? t("unknown") }));
+        }
       }
     } catch (e) {
       toast.error(t("Test error: {error}", { error: (e as Error).message }));
@@ -303,6 +466,8 @@ export function ProfileEditorSheet({
     if (saving) return;
     setSaving(true);
     try {
+      const cwRaw = Math.max(0, Math.round(Number(cw) || 0));
+      const contextWindowK = cwRaw === 0 ? 0 : Math.min(2000, Math.max(1, Math.round(cwRaw / 1000)));
       const { id } = await api.saveLLMProfile({
         ...(profile ? { id: Number(profile.id) } : {}),
         name: name.trim(),
@@ -313,7 +478,7 @@ export function ProfileEditorSheet({
         api_key: apiKey,
         rate_per_second: Number(rps) || 0,
         rate_per_minute: Number(rpm) || 0,
-        context_window_k: Number(cw) || 0,
+        context_window_k: contextWindowK,
         thinking_type: toStore(thinkingType),
         reasoning_effort: toStore(effort),
         priority: Number(priority) || 0,
@@ -390,7 +555,7 @@ export function ProfileEditorSheet({
           <section className="grid gap-3.5">
             <StepBadge step={1} title={t("Provider")} />
             <div className="grid grid-cols-2 gap-2">
-              {PROVIDERS.map((p) => {
+              {providers.map((p) => {
                 const selected = format === p.id;
                 const conn = providerConnectionState(p, profiles, healthMap, oauthMap, ollamaStatus);
                 return (
@@ -404,6 +569,9 @@ export function ProfileEditorSheet({
                         setFormat(p.id);
                         setModels([]);
                         setModelDetails(new Map());
+                        setFilteredCount(0);
+                        setIncludeAllModels(false);
+                        setLookedUpDetail(null);
                         setModelsOpen(false);
                         setModelQuery("");
                       }
@@ -599,15 +767,17 @@ export function ProfileEditorSheet({
                       variant="outline"
                       className="shrink-0 gap-1.5"
                       disabled={loadingModels}
-                      onClick={loadModels}
-                      title={t("Load available models from the API")}
+                      onClick={() => void loadModels({ silent: false, force: true })}
+                      title={t("Refresh available models from the API")}
                     >
                       {loadingModels ? <Loader2Icon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
-                      <span className="hidden sm:inline">{t("Fetch")}</span>
+                      <span className="hidden sm:inline">
+                        {models.length > 0 ? t("Models ({count})", { count: models.length }) : t("Fetch")}
+                      </span>
                     </Button>
                   </PopoverTrigger>
                   {models.length > 0 && (
-                    <PopoverContent className="w-80 gap-0 p-0" align="end">
+                    <PopoverContent className="w-96 gap-0 p-0" align="end">
                       <div className="border-b p-1">
                         <Input
                           autoFocus
@@ -627,12 +797,11 @@ export function ProfileEditorSheet({
                         ) : (
                           filteredModels.map((m) => {
                             const d = modelDetails.get(m);
-                            const cwLabel =
-                              d?.context_window_k && d.context_window_k > 0
-                                ? d.context_window_k >= 1000
-                                  ? `${Number((d.context_window_k / 1000).toFixed(1))}M`
-                                  : `${d.context_window_k}K`
-                                : null;
+                            const ctxT = detectedContextTokens(d);
+                            const outT = d?.max_output_tokens ?? 0;
+                            const specParts: string[] = [];
+                            if (ctxT > 0) specParts.push(formatTokensShort(ctxT));
+                            if (outT > 0) specParts.push(t("{n} out", { n: formatTokensShort(outT) }));
                             return (
                               <button
                                 key={m}
@@ -646,9 +815,9 @@ export function ProfileEditorSheet({
                                     <span className="ml-1.5 font-sans text-[11px] text-muted-foreground">{d.label}</span>
                                   )}
                                 </span>
-                                {cwLabel && (
-                                  <Badge variant="outline" className="shrink-0 px-1 py-0 font-mono text-[10px]">
-                                    {cwLabel}
+                                {specParts.length > 0 && (
+                                  <Badge variant="outline" className="shrink-0 px-1.5 py-0 font-mono text-[10px]">
+                                    {specParts.join(" · ")}
                                   </Badge>
                                 )}
                               </button>
@@ -656,55 +825,185 @@ export function ProfileEditorSheet({
                           })
                         )}
                       </div>
+                      {(filteredCount > 0 || includeAllModels) && (
+                        <div className="flex items-center justify-between border-t px-2.5 py-1.5 text-[11px] text-muted-foreground">
+                          <span>
+                            {includeAllModels
+                              ? t("Showing all models (including non-chat)")
+                              : t("{count} non-chat models hidden", { count: filteredCount })}
+                          </span>
+                          <button
+                            type="button"
+                            className="font-medium text-primary hover:underline"
+                            disabled={loadingModels}
+                            onClick={() => {
+                              const next = !includeAllModels;
+                              setIncludeAllModels(next);
+                              void loadModels({ silent: false, force: false, includeAll: next });
+                            }}
+                          >
+                            {includeAllModels ? t("Chat only") : t("Show all")}
+                          </button>
+                        </div>
+                      )}
                     </PopoverContent>
                   )}
                 </Popover>
               </div>
             </div>
 
+            {selectedModelDetail &&
+              (detectedContextTokens(selectedModelDetail) > 0 || (selectedModelDetail.max_output_tokens ?? 0) > 0) && (() => {
+                const detCtx = detectedContextTokens(selectedModelDetail);
+                const detOut = selectedModelDetail.max_output_tokens ?? 0;
+                const curCtx = Math.round(Number(cw) || 0);
+                const curOut = Math.round(Number(maxTokens) || 0);
+                const ctxMatches = detCtx === 0 || Math.abs(curCtx - detCtx) < 1000;
+                const outMatches = detOut === 0 || curOut === detOut;
+                const fieldMatches =
+                  format !== "openai" ||
+                  !selectedModelDetail.max_tokens_field ||
+                  maxTokensField === selectedModelDetail.max_tokens_field;
+                const allMatch = ctxMatches && outMatches && fieldMatches;
+                const sourceLabel =
+                  selectedModelDetail.source === "api"
+                    ? t("Live API")
+                    : selectedModelDetail.source === "ollama"
+                      ? "Ollama"
+                      : selectedModelDetail.source === "models.dev"
+                        ? "models.dev"
+                        : t("Known spec");
+                const hasPrice =
+                  (selectedModelDetail.price_input_per_m ?? 0) > 0 || (selectedModelDetail.price_output_per_m ?? 0) > 0;
+                return (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-primary/25 bg-primary/[0.04] px-3 py-2 text-xs">
+                    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+                      <SparklesIcon className="size-3.5 shrink-0 text-primary" />
+                      <span className="font-medium text-foreground">{t("Auto-detected")}</span>
+                      <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
+                        {sourceLabel}
+                      </Badge>
+                      {detCtx > 0 && (
+                        <span className="font-mono text-muted-foreground">
+                          {t("Context {short}", { short: formatTokensShort(detCtx) })}
+                        </span>
+                      )}
+                      {detOut > 0 && (
+                        <span className="font-mono text-muted-foreground">
+                          · {t("Output {short}", { short: formatTokensShort(detOut) })}
+                        </span>
+                      )}
+                      {hasPrice && (
+                        <span className="font-mono text-muted-foreground">
+                          · ${selectedModelDetail.price_input_per_m ?? 0}/${selectedModelDetail.price_output_per_m ?? 0}/1M
+                        </span>
+                      )}
+                      {format === "openai" && selectedModelDetail.max_tokens_field && (
+                        <span className="font-mono text-muted-foreground">
+                          · {selectedModelDetail.max_tokens_field}
+                        </span>
+                      )}
+                    </div>
+                    {allMatch ? (
+                      <Badge
+                        variant="outline"
+                        className="shrink-0 gap-1 border-emerald-500/40 text-[10px] text-emerald-600 dark:text-emerald-400"
+                      >
+                        <CheckIcon className="size-2.5" /> {t("Applied")}
+                      </Badge>
+                    ) : (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="secondary"
+                        className="h-6 shrink-0 px-2 text-[11px]"
+                        onClick={() => applyModelDetail(selectedModelDetail, { notify: true })}
+                      >
+                        {t("Apply defaults")}
+                      </Button>
+                    )}
+                  </div>
+                );
+              })()}
+
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5">
                 <div className="flex items-center justify-between gap-2">
-                  <Label htmlFor="p-cw">{t("Context window (K)")}</Label>
-                  <div className="flex gap-1">
-                    {CONTEXT_PRESETS.map((k) => (
-                      <button
-                        key={k}
-                        type="button"
-                        onClick={() => setCw(String(k))}
-                        className={cn(
-                          "rounded px-1.5 py-0.5 font-mono text-[10px] transition-colors",
-                          Number(cw) === k
-                            ? "bg-primary text-primary-foreground"
-                            : "bg-muted text-muted-foreground hover:bg-accent hover:text-foreground",
-                        )}
-                      >
-                        {k === 1000 ? "1M" : `${k}K`}
-                      </button>
-                    ))}
-                  </div>
+                  <Label htmlFor="p-cw">{t("Context window (tokens)")}</Label>
+                  <Badge variant="secondary" className="px-1.5 py-0 font-mono text-[10px]">
+                    {Number(cw) > 0 ? formatTokensShort(Number(cw)) : t("Auto (200K)")}
+                  </Badge>
                 </div>
                 <Input
                   id="p-cw"
                   type="number"
                   min={0}
-                  max={1000}
+                  max={2_000_000}
+                  step={1000}
+                  className="font-mono"
                   value={cw}
                   onChange={(e) => setCw(e.target.value)}
-                  placeholder="200"
+                  placeholder="200000"
                 />
+                <div className="flex flex-wrap gap-1">
+                  {CONTEXT_TOKEN_PRESETS.map((tokens) => (
+                    <button
+                      key={tokens}
+                      type="button"
+                      onClick={() => setCw(String(tokens))}
+                      className={cn(
+                        "rounded px-1.5 py-0.5 font-mono text-[10px] transition-colors",
+                        Number(cw) === tokens
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-muted text-muted-foreground hover:bg-accent hover:text-foreground",
+                      )}
+                    >
+                      {formatTokensShort(tokens)}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  {t("Total input+output capacity in tokens (0 = default 200,000). Auto-filled on model selection.")}
+                </p>
               </div>
 
               <div className="grid gap-1.5">
-                <Label htmlFor="p-max-tokens">{t("Output cap · max tokens")}</Label>
+                <div className="flex items-center justify-between gap-2">
+                  <Label htmlFor="p-max-tokens">{t("Output cap (max tokens)")}</Label>
+                  <Badge variant="secondary" className="px-1.5 py-0 font-mono text-[10px]">
+                    {Number(maxTokens) > 0 ? formatTokensShort(Number(maxTokens)) : t("Provider default")}
+                  </Badge>
+                </div>
                 <Input
                   id="p-max-tokens"
                   type="number"
                   min={0}
+                  step={1024}
+                  className="font-mono"
                   value={maxTokens}
                   onChange={(e) => setMaxTokens(e.target.value)}
                   placeholder="0"
                 />
+                <div className="flex flex-wrap gap-1">
+                  {OUTPUT_TOKEN_PRESETS.map((tokens) => (
+                    <button
+                      key={tokens}
+                      type="button"
+                      onClick={() => setMaxTokens(String(tokens))}
+                      className={cn(
+                        "rounded px-1.5 py-0.5 font-mono text-[10px] transition-colors",
+                        Number(maxTokens) === tokens
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-muted text-muted-foreground hover:bg-accent hover:text-foreground",
+                      )}
+                    >
+                      {tokens === 0 ? t("Auto") : formatTokensShort(tokens)}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  {t("Max tokens per reply (0 = omit and let the provider decide). Auto-filled on model selection.")}
+                </p>
               </div>
             </div>
 
@@ -712,14 +1011,14 @@ export function ProfileEditorSheet({
               <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/25 p-3 animate-in fade-in-0 duration-150">
                 <div className="grid gap-0.5">
                   <Label className="text-xs font-medium">{t("Cap field name")}</Label>
-                  <p className="text-muted-foreground text-xs">{MAX_TOKENS_FIELD_HINTS.openai}</p>
+                  <p className="text-muted-foreground text-xs">{getMaxTokensFieldHint("openai")}</p>
                 </div>
                 <Select value={maxTokensField} onValueChange={setMaxTokensField}>
                   <SelectTrigger className="w-52 shrink-0">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {MAX_TOKENS_FIELDS.map((o) => (
+                    {maxTokensFields.map((o) => (
                       <SelectItem key={o.value} value={o.value}>
                         {o.label}
                       </SelectItem>
@@ -737,7 +1036,7 @@ export function ProfileEditorSheet({
             <div className="grid gap-2">
               <Label className="text-xs font-medium text-muted-foreground">{t("Thinking switch · thinking.type")}</Label>
               <div className="grid grid-cols-3 gap-1.5 rounded-lg bg-muted/60 p-1">
-                {THINKING_TYPES.map((o) => {
+                {thinkingTypes.map((o) => {
                   const active = thinkingType === o.value;
                   return (
                     <button
@@ -774,7 +1073,7 @@ export function ProfileEditorSheet({
                 )}
               </div>
               <div className="grid grid-cols-3 gap-1.5 rounded-lg bg-muted/60 p-1 sm:grid-cols-6">
-                {EFFORT_LEVELS.map((o) => {
+                {effortLevels.map((o) => {
                   const active = effort === o.value;
                   return (
                     <button

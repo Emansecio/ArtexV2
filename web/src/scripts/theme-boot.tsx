@@ -57,20 +57,16 @@ export function ThemeBootScript() {
 
         function readPreference(key, fallback) {
           var mode = PERSISTENCE[key];
-          var value = null;
-
-          if (mode === "localStorage") {
-            value = readLocal(key);
+          if (mode === "none") {
+            return fallback;
           }
-
-          if (!value && (mode === "client-cookie" || mode === "server-cookie")) {
+          var value = readLocal(key);
+          if (!value) {
             value = readCookie(key);
           }
-
           if (!value || typeof value !== "string") {
             return fallback;
           }
-
           return value;
         }
 

@@ -9,12 +9,6 @@ import { usePreferencesStore } from "@/stores/preferences/preferences-provider";
 
 const THEME_CYCLE = ["light", "dark", "system"] as const;
 
-const THEME_LABELS: Record<(typeof THEME_CYCLE)[number], string> = {
-  light: t("Light"),
-  dark: t("Dark"),
-  system: t("System"),
-};
-
 export function ThemeSwitcher() {
   const themeMode = usePreferencesStore((s) => s.themeMode);
   const setThemeMode = usePreferencesStore((s) => s.setThemeMode);
@@ -27,8 +21,14 @@ export function ThemeSwitcher() {
     void persistPreference("theme_mode", nextTheme);
   };
 
+  const themeLabels: Record<(typeof THEME_CYCLE)[number], string> = {
+    light: t("Light"),
+    dark: t("Dark"),
+    system: t("System"),
+  };
+
   const themeLabel = t("Current theme: {theme}. Click to cycle themes", {
-    theme: THEME_LABELS[themeMode] ?? themeMode,
+    theme: themeLabels[themeMode] ?? themeMode,
   });
 
   return (

@@ -35,6 +35,10 @@ const (
 	agyManifestBaseURL   = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests"
 	agyUpdateIntervalSec = 24 * 60 * 60
 	agyTokenRelPath      = "antigravity-cli/antigravity-oauth-token"
+
+	agyKeychainService      = "gemini"
+	agyKeychainAccount      = "antigravity"
+	agyKeychainSecretPrefix = "go-keyring-base64:"
 )
 
 // AgyCredential is the typed OAuth credential bundle staged for `agy acp`.
@@ -260,21 +264,83 @@ func extractAgyJWTIdentity(jwt string) (email, sub string) {
 	return strings.TrimSpace(claims.Email), strings.TrimSpace(claims.Sub)
 }
 
-// ExportAgyCredentials reads and parses the token file written by `agy acp --login`.
+// ExportAgyCredentials reads and parses the token file written by `agy acp --login`,
+// falling back to the macOS login keychain (`gemini` / `antigravity`) when `agy`
+// ignores SSH_TTY and persists its consumer grant via go-keyring.
 func ExportAgyCredentials(geminiDir string) (AgyCredential, error) {
 	path := filepath.Join(geminiDir, agyTokenRelPath)
-	if _, err := os.Stat(path); err != nil {
-		found := findAgyOAuthTokenFile(geminiDir)
-		if found == "" {
+	filePath := ""
+	if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
+		filePath = path
+	} else if found := findAgyOAuthTokenFile(geminiDir); found != "" {
+		filePath = found
+	}
+	if filePath != "" {
+		data, err := os.ReadFile(filePath)
+		if err != nil {
 			return AgyCredential{}, errors.New("Antigravity CLI did not write a token file during sign-in")
 		}
-		path = found
+		return ParseAgyStoredCredentials(data)
 	}
-	data, err := os.ReadFile(path)
+	// agy 1.5.17 on macOS ignores SSH_TTY and persists the consumer grant in
+	// the login keychain (`gemini` / `antigravity`, `go-keyring-base64:` JSON).
+	if secret, ok := readMacOSAgyKeychainSecret(); ok {
+		return ParseAgyKeychainCredentials(secret)
+	}
+	return AgyCredential{}, errors.New("Antigravity CLI did not write a token file during sign-in")
+}
+
+// ParseAgyKeychainCredentials decodes the `go-keyring-base64:` envelope `agy` writes
+// to the macOS login keychain and parses the underlying consumer token JSON.
+func ParseAgyKeychainCredentials(secret string) (AgyCredential, error) {
+	trimmed := strings.TrimSpace(secret)
+	encoded := strings.TrimPrefix(trimmed, agyKeychainSecretPrefix)
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" {
+		return AgyCredential{}, errors.New("Antigravity CLI keychain credential is not a go-keyring payload; sign in again")
+	}
+	decoded, err := decodeAgyBase64Flexible(encoded)
 	if err != nil {
-		return AgyCredential{}, errors.New("Antigravity CLI did not write a token file during sign-in")
+		return AgyCredential{}, errors.New("Antigravity CLI keychain credential is not a go-keyring payload; sign in again")
 	}
-	return ParseAgyStoredCredentials(data)
+	return ParseAgyStoredCredentials(decoded)
+}
+
+func decodeAgyBase64Flexible(encoded string) ([]byte, error) {
+	compact := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' || r == '\r' || r == '\n' {
+			return -1
+		}
+		return r
+	}, encoded)
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if data, err := enc.DecodeString(compact); err == nil {
+			return data, nil
+		}
+	}
+	return nil, errors.New("invalid base64")
+}
+
+func readMacOSAgyKeychainSecret() (string, bool) {
+	if runtime.GOOS != "darwin" {
+		return "", false
+	}
+	out, err := exec.Command(
+		"security",
+		"find-generic-password",
+		"-s", agyKeychainService,
+		"-a", agyKeychainAccount,
+		"-w",
+	).Output()
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
 }
 
 func findAgyOAuthTokenFile(dir string) string {

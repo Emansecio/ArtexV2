@@ -7,16 +7,22 @@ function writeClientCookie(serializedCookie: string) {
   document.cookie = serializedCookie;
 }
 
-export function setClientCookie(key: string, value: string, days = 7) {
+export function setClientCookie(key: string, value: string, days = 365) {
   const expires = new Date(Date.now() + days * 864e5).toUTCString();
-  writeClientCookie(`${key}=${value}; expires=${expires}; path=/`);
+  writeClientCookie(`${key}=${encodeURIComponent(value)}; expires=${expires}; path=/; SameSite=Lax`);
 }
 
 export function getClientCookie(key: string) {
-  return document.cookie
+  const raw = document.cookie
     .split("; ")
     .find((row) => row.startsWith(`${key}=`))
-    ?.split("=")[1];
+    ?.slice(key.length + 1);
+  if (raw === undefined) return undefined;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
 }
 
 export function deleteClientCookie(key: string) {

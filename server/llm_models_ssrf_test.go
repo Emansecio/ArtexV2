@@ -143,6 +143,11 @@ func TestLLMModelsDefaultOllamaAllowedWithoutSeam(t *testing.T) {
 	// must NOT be refused by URL validation or dial control even with no test seam.
 	var ollamaHits atomic.Int32
 	fakeOllama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"model_info":{"llama.context_length":131072}}`))
+			return
+		}
 		ollamaHits.Add(1)
 		if r.URL.Path != "/v1/models" {
 			w.WriteHeader(http.StatusNotFound)
@@ -193,6 +198,11 @@ func TestLLMModelsDefaultOllamaAllowedWithoutSeam(t *testing.T) {
 func TestLLMModelsPrivateEndpointsAllowList(t *testing.T) {
 	var allowedHits atomic.Int32
 	allowedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
 		allowedHits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[{"id":"local-llama"}]}`))
@@ -248,6 +258,11 @@ func TestLLMModelsPrivateEndpointsAllowList(t *testing.T) {
 	// stays refused on another port, and still validates scheme & redirects.
 	var dockerHits atomic.Int32
 	dockerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
 		dockerHits.Add(1)
 		if r.URL.Path == "/redirect/v1/models" {
 			http.Redirect(w, r, otherPortSrv.URL+"/secret", http.StatusFound)
@@ -914,7 +929,7 @@ func TestLLMModelsPublicEndpointWorks(t *testing.T) {
 		t.Fatalf("expected ok=true for normal public endpoint, got %v", resp)
 	}
 	rawModels, _ := resp["models"].([]any)
-	if len(rawModels) != 2 || rawModels[0] != "gpt-4o" || rawModels[1] != "o3" {
+	if len(rawModels) != 2 || rawModels[0] != "o3" || rawModels[1] != "gpt-4o" {
 		t.Fatalf("unexpected models: %v", rawModels)
 	}
 }
