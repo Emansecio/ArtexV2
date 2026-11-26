@@ -70,8 +70,11 @@ import type {
   ModelTokenStat,
   NotificationChannel,
   NotificationDelivery,
+  ModelDetail,
+  OAuthProviderId,
   OAuthProviderStatus,
   OAuthStartResult,
+  OllamaStatus,
   NotificationFilter,
   NotificationMeta,
   PromptVar,
@@ -334,7 +337,7 @@ export const api = {
   health: () => get<{ ok: boolean; service: string; version: string; latest_version?: string }>("/health"),
 
   // ---- auth ----
-  authStatus: () => get<{ initialized: boolean }>("/auth/status"),
+  authStatus: () => get<{ initialized: boolean; local_bypass?: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
   authInit: (password: string, setupToken: string) =>
     post<{ token: string }>("/auth/init", { password, setup_token: setupToken }),
@@ -1233,20 +1236,27 @@ export const api = {
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
   fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
-    post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", {
+    post<{ ok: boolean; error?: string; models?: string[]; model_details?: ModelDetail[] }>("/llm/models", {
       provider,
       base_url,
       api_key,
       proxy,
       profile_id,
     }),
-  llmOAuthStatus: () =>
-    get<{ providers: OAuthProviderStatus[] }>("/llm/oauth/status").then((r) => arr(r.providers)),
-  startLLMOAuth: (provider: "chatgpt" | "anthropic") =>
+  llmOAuthStatus: (opts?: { verify?: boolean; force?: boolean }) => {
+    const params = new URLSearchParams();
+    if (opts?.verify) params.set("verify", "1");
+    if (opts?.force) params.set("force", "1");
+    const qs = params.toString();
+    return get<{ providers: OAuthProviderStatus[]; ollama?: OllamaStatus }>(
+      `/llm/oauth/status${qs ? `?${qs}` : ""}`,
+    ).then((r) => ({ providers: arr(r.providers), ollama: r.ollama }));
+  },
+  startLLMOAuth: (provider: OAuthProviderId) =>
     post<OAuthStartResult>("/llm/oauth/start", { provider }),
-  completeLLMOAuth: (provider: "chatgpt" | "anthropic", input: string) =>
+  completeLLMOAuth: (provider: OAuthProviderId, input: string) =>
     post<OAuthProviderStatus>("/llm/oauth/complete", { provider, input }),
-  logoutLLMOAuth: (provider: "chatgpt" | "anthropic") =>
+  logoutLLMOAuth: (provider: OAuthProviderId) =>
     post<{ ok: boolean }>("/llm/oauth/logout", { provider }),
 
   // ---- agents ----

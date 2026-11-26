@@ -1243,20 +1243,40 @@ export interface LLMPoolStatus {
   chain: LLMPoolMember[];
 }
 
+export type OAuthProviderId = "chatgpt" | "anthropic" | "devin" | "antigravity-cli";
+
+export type ProviderConnState = "connected" | "disconnected" | "error";
+
 export interface OAuthProviderStatus {
-  provider: "chatgpt" | "anthropic";
+  provider: OAuthProviderId;
+  state?: ProviderConnState;
   connected: boolean;
   pending: boolean;
   account_hint?: string;
   expires_at?: number;
+  verified_at?: number;
   last_error?: string;
+}
+
+export interface OllamaStatus {
+  state: ProviderConnState;
+  detail?: string;
 }
 
 export interface OAuthStartResult {
   provider: string;
   auth_url: string;
-  redirect_uri: string;
-  state: string;
+  redirect_uri?: string;
+  state?: string;
+  manual_required?: boolean;
+}
+
+export interface ModelDetail {
+  id: string;
+  label?: string;
+  context_window_k?: number;
+  max_output_tokens?: number;
+  reasoning_levels?: string[];
 }
 
 // ---- Agents ----

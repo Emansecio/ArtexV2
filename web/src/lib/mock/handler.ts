@@ -2296,6 +2296,8 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       providers: [
         { provider: "chatgpt", connected: false, pending: false },
         { provider: "anthropic", connected: false, pending: false },
+        { provider: "devin", connected: false, pending: false },
+        { provider: "antigravity-cli", connected: false, pending: false },
       ],
     };
   }

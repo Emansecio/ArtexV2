@@ -1,11 +1,13 @@
 import * as React from "react";
 
 import { t } from "@/i18n";
-import type { LLMPoolMember, LLMProfile, OAuthProviderStatus } from "@/lib/types";
+import type { LLMPoolMember, LLMProfile, OAuthProviderId, OAuthProviderStatus } from "@/lib/types";
 
 export type ProfileFormat =
   | "chatgpt"
   | "anthropic-oauth"
+  | "antigravity-cli"
+  | "devin"
   | "opencode-zen"
   | "opencode-go"
   | "anthropic"
@@ -29,7 +31,7 @@ export interface ProviderMeta {
   modelPlaceholder: string;
   baseUrlPlaceholder: string;
   keyless?: boolean;
-  oauthProvider?: "chatgpt" | "anthropic";
+  oauthProvider?: OAuthProviderId;
   keyPageUrl?: string;
 }
 
@@ -51,6 +53,24 @@ export const PROVIDERS: ProviderMeta[] = [
     modelPlaceholder: "claude-opus-4-8",
     baseUrlPlaceholder: "https://api.anthropic.com",
     oauthProvider: "anthropic",
+  },
+  {
+    id: "antigravity-cli",
+    label: t("Antigravity CLI (OAuth)"),
+    shortLabel: "Antigravity CLI",
+    desc: t("Google Antigravity CLI (Gemini 4 & Claude via ACP)"),
+    modelPlaceholder: "gemini-4-carbon",
+    baseUrlPlaceholder: "acp://antigravity-cli",
+    oauthProvider: "antigravity-cli",
+  },
+  {
+    id: "devin",
+    label: t("Devin (OAuth)"),
+    shortLabel: "Devin",
+    desc: t("Cognition Devin Cascade API (SWE-1.6, Claude, Gemini)"),
+    modelPlaceholder: "swe-1-6",
+    baseUrlPlaceholder: "https://server.codeium.com",
+    oauthProvider: "devin",
   },
   {
     id: "opencode-zen",
@@ -109,7 +129,7 @@ export const PROVIDERS: ProviderMeta[] = [
 ];
 
 export function providerMeta(format?: string): ProviderMeta {
-  return PROVIDERS.find((p) => p.id === format) ?? PROVIDERS[4];
+  return PROVIDERS.find((p) => p.id === format) ?? PROVIDERS.find((p) => p.id === "anthropic")!;
 }
 
 export function normalizeFormat(format?: string): ProfileFormat {
@@ -117,7 +137,7 @@ export function normalizeFormat(format?: string): ProfileFormat {
   return found ? found.id : "anthropic";
 }
 
-export function oauthProviderOf(format?: string): "chatgpt" | "anthropic" | null {
+export function oauthProviderOf(format?: string): OAuthProviderId | null {
   return providerMeta(format).oauthProvider ?? null;
 }
 
@@ -170,6 +190,117 @@ export type Health = {
   dotCls: string;
   hint?: string;
 };
+
+export type ProviderStatusInfo = {
+  state: "connected" | "disconnected" | "error";
+  label: string;
+  hint: string;
+  dotCls: string;
+};
+
+export function providerConnectionState(
+  prov: ProviderMeta,
+  profiles: LLMProfile[],
+  healthMap: Map<string, LLMPoolMember>,
+  oauthMap: Map<string, OAuthProviderStatus>,
+  ollamaStatus?: { state: "connected" | "disconnected" | "error"; detail?: string } | null,
+): ProviderStatusInfo {
+  const matching = profiles.filter((p) => p.format === prov.id);
+  const poolErr = matching
+    .map((p) => healthMap.get(p.id))
+    .find((m) => m && (m.state === "tripped" || m.state === "degraded"));
+
+  if (prov.oauthProvider) {
+    const st = oauthMap.get(prov.oauthProvider);
+    if (st?.state === "error" || (st?.last_error && !st.connected)) {
+      return {
+        state: "error",
+        label: t("Error"),
+        hint: st?.last_error || t("OAuth connection error"),
+        dotCls: "bg-amber-500 ring-2 ring-amber-500/25",
+      };
+    }
+    if (st?.connected) {
+      if (poolErr) {
+        return {
+          state: "error",
+          label: t("Error"),
+          hint: poolErr.last_error || t("Provider degraded or tripped in pool"),
+          dotCls: "bg-amber-500 ring-2 ring-amber-500/25",
+        };
+      }
+      return {
+        state: "connected",
+        label: t("Connected"),
+        hint: st.account_hint ? `${t("Connected")} (${st.account_hint})` : t("Connected"),
+        dotCls: "bg-emerald-500 ring-2 ring-emerald-500/25",
+      };
+    }
+    return {
+      state: "disconnected",
+      label: t("Not signed in"),
+      hint: t("Sign in with OAuth to enable this profile"),
+      dotCls: "bg-red-500 ring-2 ring-red-500/20",
+    };
+  }
+
+  if (prov.id === "ollama") {
+    if (ollamaStatus?.state === "error") {
+      return {
+        state: "error",
+        label: t("Error"),
+        hint: ollamaStatus.detail || t("Ollama error"),
+        dotCls: "bg-amber-500 ring-2 ring-amber-500/25",
+      };
+    }
+    if (ollamaStatus?.state === "connected") {
+      if (poolErr) {
+        return {
+          state: "error",
+          label: t("Error"),
+          hint: poolErr.last_error || t("Provider degraded or tripped in pool"),
+          dotCls: "bg-amber-500 ring-2 ring-amber-500/25",
+        };
+      }
+      return {
+        state: "connected",
+        label: t("Connected"),
+        hint: ollamaStatus.detail || t("Ollama online"),
+        dotCls: "bg-emerald-500 ring-2 ring-emerald-500/25",
+      };
+    }
+    return {
+      state: "disconnected",
+      label: t("Disconnected"),
+      hint: ollamaStatus?.detail || t("Ollama offline"),
+      dotCls: "bg-red-500 ring-2 ring-red-500/20",
+    };
+  }
+
+  const configured = matching.filter((p) => Boolean(p.api_key_hint));
+  if (configured.length === 0) {
+    return {
+      state: "disconnected",
+      label: t("Disconnected"),
+      hint: t("No API Key set; cannot be called"),
+      dotCls: "bg-red-500 ring-2 ring-red-500/20",
+    };
+  }
+  if (poolErr) {
+    return {
+      state: "error",
+      label: t("Error"),
+      hint: poolErr.last_error || t("Provider degraded or tripped in pool"),
+      dotCls: "bg-amber-500 ring-2 ring-amber-500/25",
+    };
+  }
+  return {
+    state: "connected",
+    label: t("Connected"),
+    hint: t("{count} profile(s) configured", { count: configured.length }),
+    dotCls: "bg-emerald-500 ring-2 ring-emerald-500/25",
+  };
+}
 
 export function healthOf(
   p: LLMProfile,

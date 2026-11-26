@@ -2,14 +2,23 @@ package oauth
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Autumn-27/norma/llm"
 )
 
 type memStore struct {
@@ -166,5 +175,157 @@ func TestSingleFlightRefresh(t *testing.T) {
 	}
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("expected single-flight refresh (1 hit), got %d", got)
+	}
+}
+
+func TestDevinPKCEAndExpiryWithoutRefreshToken(t *testing.T) {
+	exp := time.Now().Add(2 * time.Hour).Unix()
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d,"email":"dev@cognition.ai"}`, exp)))
+	jwtTok := "hdr." + payload + ".sig"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["code"] != "devin-code" || body["code_verifier"] == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": jwtTok})
+	}))
+	defer srv.Close()
+
+	st := newMemStore()
+	mgr := NewManager(st)
+	mgr.devinTokenURL = srv.URL
+
+	res, err := mgr.StartLogin(ProviderDevin)
+	if err != nil {
+		t.Fatalf("StartLogin devin: %v", err)
+	}
+	if res.ManualRequired {
+		t.Fatalf("devin should use loopback, not manual_required")
+	}
+	u, err := url.Parse(res.AuthURL)
+	if err != nil || u.Path != "/auth/cli/continue" || u.Query().Get("code_challenge_method") != "S256" {
+		t.Fatalf("unexpected devin auth url: %q", res.AuthURL)
+	}
+
+	// Hit loopback callback
+	cbResp, err := http.Get(fmt.Sprintf("%s?code=devin-code&state=%s", res.RedirectURI, res.State))
+	if err != nil {
+		t.Fatalf("callback GET: %v", err)
+	}
+	cbResp.Body.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !mgr.IsConnected(ProviderDevin) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !mgr.IsConnected(ProviderDevin) {
+		t.Fatalf("devin should be connected after callback")
+	}
+	cred, err := mgr.Credential(context.Background(), ProviderDevin, false)
+	if err != nil || cred.AccessToken != jwtTok || cred.AccountHint != "dev@cognition.ai" {
+		t.Fatalf("unexpected devin credential: cred=%+v err=%v", cred, err)
+	}
+
+	// Force refresh on token without RefreshToken (after 10s grace or simulated expired) must revoke session.
+	mgr.mu.Lock()
+	mgr.lastRefresh[ProviderDevin] = time.Now().Add(-30 * time.Second)
+	mgr.mu.Unlock()
+	if _, err := mgr.AccessToken(context.Background(), ProviderDevin, true); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("expected ErrSessionRevoked on forceRefresh without refresh token, got %v", err)
+	}
+	if mgr.IsConnected(ProviderDevin) {
+		t.Fatalf("expected devin session to be cleared after revocation")
+	}
+}
+
+func TestAntigravityManualHandoffNilLoopbackAndRefresh(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake agy script is unix-only")
+	}
+	tmp := t.TempDir()
+	t.Setenv("ARTEX_AGY_HOME", filepath.Join(tmp, "agy-home"))
+
+	authURL := "https://accounts.google.com/o/oauth2/v2/auth?client_id=" + llm.AgyOAuthClientID + "&scope=openid"
+	script := `#!/bin/sh
+set -eu
+GEMINI_DIR=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--gemini-dir" ]; then
+    GEMINI_DIR="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+echo "Visit: ` + authURL + `"
+IFS= read -r code
+if [ "$code" != "google-auth-code" ]; then
+  exit 1
+fi
+mkdir -p "$GEMINI_DIR/antigravity-cli"
+cat > "$GEMINI_DIR/antigravity-cli/antigravity-oauth-token" <<EOF
+{"auth_method":"consumer","id_token_email":"agy@example.com","token":{"access_token":"ya29.initial","refresh_token":"1//refresh","expiry":"2030-01-02T03:04:05Z"}}
+EOF
+`
+	fakeBin := filepath.Join(tmp, "fake-agy")
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	t.Setenv("ARTEX_AGY_PATH", fakeBin)
+
+	st := newMemStore()
+	mgr := NewManager(st)
+
+	// Verify SignOut with pending antigravity login (pl.cb == nil) never panics.
+	res, err := mgr.StartLogin(ProviderAntigravity)
+	if err != nil {
+		t.Fatalf("StartLogin antigravity: %v", err)
+	}
+	if !res.ManualRequired || !strings.Contains(res.AuthURL, llm.AgyOAuthClientID) {
+		t.Fatalf("unexpected start result: %+v", res)
+	}
+	if err := mgr.SignOut(ProviderAntigravity); err != nil {
+		t.Fatalf("SignOut with nil cb: %v", err)
+	}
+
+	// Start again; pasting a malformed URL without code= must return an error
+	// WITHOUT tearing down the pending login process, so a subsequent valid paste succeeds.
+	res, err = mgr.StartLogin(ProviderAntigravity)
+	if err != nil {
+		t.Fatalf("StartLogin antigravity 2: %v", err)
+	}
+	if _, err := mgr.CompleteManual(context.Background(), ProviderAntigravity, "http://localhost:8080/cb?state=only"); err == nil {
+		t.Fatalf("expected validation error for callback URL missing code")
+	}
+	if !mgr.StatusOf(ProviderAntigravity).Pending {
+		t.Fatalf("expected pending antigravity login to remain active after malformed input")
+	}
+	status, err := mgr.CompleteManual(context.Background(), ProviderAntigravity, "http://localhost:8080/cb?code=google-auth-code")
+	if err != nil {
+		t.Fatalf("CompleteManual antigravity: %v", err)
+	}
+	if !status.Connected || status.AccountHint != "agy@example.com" {
+		t.Fatalf("unexpected status: %+v", status)
+	}
+
+	// Verify Google OAuth2 refresh flow.
+	refreshSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "ya29.refreshed",
+			"expires_in":   3600,
+		})
+	}))
+	defer refreshSrv.Close()
+	mgr.agyTokenURL = refreshSrv.URL
+	mgr.mu.Lock()
+	mgr.lastRefresh[ProviderAntigravity] = time.Now().Add(-30 * time.Second)
+	mgr.mu.Unlock()
+
+	cred, err := mgr.Credential(context.Background(), ProviderAntigravity, true)
+	if err != nil || cred.AccessToken != "ya29.refreshed" || cred.RefreshToken != "1//refresh" {
+		t.Fatalf("unexpected refreshed agy credential: cred=%+v err=%v", cred, err)
 	}
 }

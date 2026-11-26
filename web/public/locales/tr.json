@@ -2817,5 +2817,21 @@
   "Runtime": "Süre",
   "Open task": "Görevi aç",
   "Archive": "Arşivle",
-  "Jump to latest": "En sona git"
+  "Jump to latest": "En sona git",
+  "Antigravity CLI (OAuth)": "Antigravity CLI (OAuth)",
+  "Google Antigravity CLI (Gemini 4 & Claude via ACP)": "Google Antigravity CLI (ACP üzerinden Gemini 4 ve Claude)",
+  "Devin (OAuth)": "Devin (OAuth)",
+  "Cognition Devin Cascade API (SWE-1.6, Claude, Gemini)": "Cognition Devin Cascade API (SWE-1.6, Claude, Gemini)",
+  "Complete Google sign-in in the browser tab, then paste the authorization code or callback URL below.": "Tarayıcı sekmesinde Google oturum açma işlemini tamamlayın, ardından yetkilendirme kodunu veya geri dönüş URL'sini aşağıya yapıştırın.",
+  "Sign in with Devin": "Devin ile giriş yap",
+  "Sign in with Google": "Google ile giriş yap",
+  "Supported: {levels}": "Desteklenen: {levels}",
+  "OAuth connection error": "OAuth bağlantı hatası",
+  "Provider degraded or tripped in pool": "Sağlayıcı havuzda bozulmuş veya devre dışı",
+  "Ollama error": "Ollama hatası",
+  "Ollama online": "Ollama çevrimiçi",
+  "Ollama offline": "Ollama çevrimdışı",
+  "Disconnected": "Bağlı değil",
+  "{count} profile(s) configured": "{count} profil yapılandırıldı",
+  "Check connections": "Bağlantıları kontrol et"
 }

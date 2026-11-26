@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Autumn-27/norma/llm"
 )
 
 var (
@@ -40,19 +42,22 @@ type Credential struct {
 // Status is the UI-safe view of a provider's OAuth connection state.
 type Status struct {
 	Provider    string `json:"provider"`
+	State       string `json:"state"` // "connected" | "disconnected" | "error"
 	Connected   bool   `json:"connected"`
 	Pending     bool   `json:"pending"`
 	AccountHint string `json:"account_hint,omitempty"`
 	ExpiresAt   int64  `json:"expires_at,omitempty"`
+	VerifiedAt  int64  `json:"verified_at,omitempty"`
 	LastError   string `json:"last_error,omitempty"`
 }
 
 // StartResult is returned when a browser OAuth login flow begins.
 type StartResult struct {
-	Provider    string `json:"provider"`
-	AuthURL     string `json:"auth_url"`
-	RedirectURI string `json:"redirect_uri"`
-	State       string `json:"state"`
+	Provider       string `json:"provider"`
+	AuthURL        string `json:"auth_url"`
+	RedirectURI    string `json:"redirect_uri,omitempty"`
+	State          string `json:"state,omitempty"`
+	ManualRequired bool   `json:"manual_required,omitempty"`
 }
 
 // Store is the persistence contract implemented by db.DB.
@@ -72,6 +77,22 @@ type pendingLogin struct {
 	reuseClientID string
 	cb            *LoopbackCallback
 	cancel        context.CancelFunc
+	agy           *agyPendingLogin
+}
+
+func (pl *pendingLogin) closeResources() {
+	if pl == nil {
+		return
+	}
+	if pl.cancel != nil {
+		pl.cancel()
+	}
+	if pl.cb != nil {
+		pl.cb.Close()
+	}
+	if pl.agy != nil {
+		pl.agy.cleanup()
+	}
 }
 
 type refreshFlight struct {
@@ -89,11 +110,14 @@ type Manager struct {
 	// Optional test overrides for token endpoints.
 	chatGPTTokenURL   string
 	anthropicTokenURL string
+	devinTokenURL     string
+	agyTokenURL       string
 
 	mu          sync.Mutex
 	cached      map[string]*Credential
 	loaded      map[string]bool
 	lastRefresh map[string]time.Time
+	verifiedAt  map[string]time.Time
 	generation  map[string]int
 	flights     map[string]*refreshFlight
 	pending     map[string]*pendingLogin
@@ -108,6 +132,7 @@ func NewManager(store Store) *Manager {
 		cached:      map[string]*Credential{},
 		loaded:      map[string]bool{},
 		lastRefresh: map[string]time.Time{},
+		verifiedAt:  map[string]time.Time{},
 		generation:  map[string]int{},
 		flights:     map[string]*refreshFlight{},
 		pending:     map[string]*pendingLogin{},
@@ -124,7 +149,10 @@ func (m *Manager) httpClient() *http.Client {
 
 // ValidProvider reports whether provider is a supported OAuth provider key.
 func ValidProvider(provider string) bool {
-	return provider == ProviderChatGPT || provider == ProviderAnthropic
+	return provider == ProviderChatGPT ||
+		provider == ProviderAnthropic ||
+		provider == ProviderDevin ||
+		provider == ProviderAntigravity
 }
 
 // Statuses returns the UI-safe status of all supported OAuth providers.
@@ -132,6 +160,8 @@ func (m *Manager) Statuses() []Status {
 	return []Status{
 		m.StatusOf(ProviderChatGPT),
 		m.StatusOf(ProviderAnthropic),
+		m.StatusOf(ProviderDevin),
+		m.StatusOf(ProviderAntigravity),
 	}
 }
 
@@ -146,11 +176,80 @@ func (m *Manager) StatusOf(provider string) Status {
 		Pending:   m.pending[provider] != nil,
 		LastError: m.lastErr[provider],
 	}
+	if vAt := m.verifiedAt[provider]; !vAt.IsZero() {
+		st.VerifiedAt = vAt.Unix()
+	}
 	if cred != nil {
 		st.AccountHint = cred.AccountHint
 		st.ExpiresAt = cred.ExpiresAt
+		// Non-refreshable tokens (e.g. Devin) that are already expired are no longer connected.
+		if cred.RefreshToken == "" && cred.ExpiresAt > 0 && time.Now().Unix() >= cred.ExpiresAt {
+			st.Connected = false
+			if st.LastError == "" {
+				st.LastError = ErrSessionRevoked.Error()
+			}
+		}
+	}
+	switch {
+	case st.LastError != "":
+		st.State = "error"
+	case st.Connected:
+		st.State = "connected"
+	default:
+		st.State = "disconnected"
 	}
 	return st
+}
+
+const verifyCacheTTL = 60 * time.Second
+
+// Verify checks a single provider's persisted credential (refreshing if near
+// expiry or expired) with a 60s cache unless force is true.
+func (m *Manager) Verify(ctx context.Context, provider string, force bool) Status {
+	if !ValidProvider(provider) {
+		return Status{Provider: provider, State: "disconnected"}
+	}
+	m.mu.Lock()
+	cred := m.loadLocked(provider)
+	vAt := m.verifiedAt[provider]
+	m.mu.Unlock()
+
+	if cred == nil || cred.AccessToken == "" {
+		return m.StatusOf(provider)
+	}
+	if !force && !vAt.IsZero() && time.Since(vAt) < verifyCacheTTL {
+		return m.StatusOf(provider)
+	}
+
+	vctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := m.Credential(vctx, provider, false)
+	m.mu.Lock()
+	if err == nil {
+		m.lastErr[provider] = ""
+		m.verifiedAt[provider] = time.Now()
+	} else {
+		m.lastErr[provider] = err.Error()
+		m.verifiedAt[provider] = time.Now()
+	}
+	m.mu.Unlock()
+	return m.StatusOf(provider)
+}
+
+// VerifyAll verifies all supported OAuth providers concurrently.
+func (m *Manager) VerifyAll(ctx context.Context, force bool) []Status {
+	provs := []string{ProviderChatGPT, ProviderAnthropic, ProviderDevin, ProviderAntigravity}
+	out := make([]Status, len(provs))
+	var wg sync.WaitGroup
+	for i, p := range provs {
+		wg.Add(1)
+		go func(idx int, prov string) {
+			defer wg.Done()
+			out[idx] = m.Verify(ctx, prov, force)
+		}(i, p)
+	}
+	wg.Wait()
+	return out
 }
 
 // IsConnected reports whether provider has a stored OAuth token.
@@ -158,7 +257,13 @@ func (m *Manager) IsConnected(provider string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c := m.loadLocked(provider)
-	return c != nil && c.AccessToken != ""
+	if c == nil || c.AccessToken == "" {
+		return false
+	}
+	if c.RefreshToken == "" && c.ExpiresAt > 0 && time.Now().Unix() >= c.ExpiresAt {
+		return false
+	}
+	return true
 }
 
 func (m *Manager) loadLocked(provider string) *Credential {
@@ -168,19 +273,27 @@ func (m *Manager) loadLocked(provider string) *Credential {
 	if m.loaded[provider] || m.store == nil {
 		return nil
 	}
-	m.loaded[provider] = true
 	c, err := m.store.GetOAuthCredential(provider)
-	if err == nil && c != nil && c.AccessToken != "" {
+	if err != nil {
+		// Do not pin loaded=true on transient store errors so a later call recovers.
+		return nil
+	}
+	m.loaded[provider] = true
+	if c != nil && c.AccessToken != "" {
 		m.cached[provider] = c
 	}
 	return m.cached[provider]
 }
 
-// StartLogin opens a temporary 127.0.0.1 loopback listener, builds the PKCE
-// authorize URL, and waits asynchronously for the browser redirect.
+// StartLogin opens a temporary 127.0.0.1 loopback listener (or spawns
+// `agy acp --login` for Antigravity CLI), builds the authorize URL, and waits
+// asynchronously for the browser redirect or manual code handoff.
 func (m *Manager) StartLogin(provider string) (*StartResult, error) {
 	if !ValidProvider(provider) {
 		return nil, fmt.Errorf("unsupported oauth provider %q", provider)
+	}
+	if provider == ProviderAntigravity {
+		return m.startAntigravityLogin()
 	}
 	verifier := RandomToken()
 	state := RandomToken()
@@ -190,10 +303,14 @@ func (m *Manager) StartLogin(provider string) (*StartResult, error) {
 
 	var path string
 	var ports []int
-	if provider == ProviderChatGPT {
+	switch provider {
+	case ProviderChatGPT:
 		path = chatGPTCallbackPath
 		ports = []int{1455}
-	} else {
+	case ProviderDevin:
+		path = devinCallbackPath
+		ports = []int{devinCallbackPort}
+	default:
 		path = anthropicCallbackPath
 		ports = []int{53692}
 	}
@@ -204,7 +321,7 @@ func (m *Manager) StartLogin(provider string) (*StartResult, error) {
 	}
 
 	var redirectURI string
-	if provider == ProviderChatGPT {
+	if provider == ProviderChatGPT || provider == ProviderDevin {
 		redirectURI = fmt.Sprintf("http://127.0.0.1:%d%s", cb.Port, path)
 	} else {
 		redirectURI = fmt.Sprintf("http://localhost:%d%s", cb.Port, path)
@@ -212,8 +329,7 @@ func (m *Manager) StartLogin(provider string) (*StartResult, error) {
 
 	m.mu.Lock()
 	if old := m.pending[provider]; old != nil {
-		old.cancel()
-		old.cb.Close()
+		old.closeResources()
 	}
 	var reuseClientID string
 	if existing := m.loadLocked(provider); existing != nil {
@@ -234,9 +350,12 @@ func (m *Manager) StartLogin(provider string) (*StartResult, error) {
 	m.mu.Unlock()
 
 	var authURL string
-	if provider == ProviderChatGPT {
+	switch provider {
+	case ProviderChatGPT:
 		authURL = m.buildChatGPTAuthURL(redirectURI, verifier, state, reuseClientID)
-	} else {
+	case ProviderDevin:
+		authURL = m.buildDevinAuthURL(redirectURI, verifier, state)
+	default:
 		authURL = m.buildAnthropicAuthURL(redirectURI, verifier)
 	}
 
@@ -269,13 +388,26 @@ func (m *Manager) StartLogin(provider string) (*StartResult, error) {
 }
 
 // CompleteManual completes an active login using a manually pasted redirect URL
-// or authorization code (useful over SSH or remote browsers).
+// or authorization code (useful over SSH or remote browsers, and required for Antigravity CLI).
 func (m *Manager) CompleteManual(ctx context.Context, provider, input string) (*Status, error) {
 	m.mu.Lock()
 	pl := m.pending[provider]
 	m.mu.Unlock()
 	if pl == nil {
 		return nil, errors.New("no pending login for this provider; click Sign in first")
+	}
+	if provider == ProviderAntigravity {
+		code, err := llm.AgyAuthorizationCode(input)
+		if err != nil {
+			return nil, err
+		}
+		cred, err := m.completeAntigravityManual(ctx, pl, code)
+		m.finishPending(pl, cred, err)
+		if err != nil {
+			return nil, err
+		}
+		st := m.StatusOf(provider)
+		return &st, nil
 	}
 	code, state := ParseManualInput(input)
 	if code == "" {
@@ -301,7 +433,8 @@ func (m *Manager) completeWithCode(ctx context.Context, pl *pendingLogin, code, 
 	if code == "" {
 		return nil, errors.New("missing authorization code")
 	}
-	if pl.provider == ProviderChatGPT {
+	switch pl.provider {
+	case ProviderChatGPT:
 		clientID := callbackClientID
 		if clientID == "" {
 			clientID = pl.reuseClientID
@@ -317,15 +450,18 @@ func (m *Manager) completeWithCode(ctx context.Context, pl *pendingLogin, code, 
 			"redirect_uri":  {pl.redirectURI},
 			"resource":      {chatGPTResource},
 		}, clientID, nil)
+	case ProviderDevin:
+		return m.exchangeDevin(ctx, code, pl.verifier)
+	default:
+		return m.exchangeAnthropic(ctx, map[string]any{
+			"grant_type":    "authorization_code",
+			"client_id":     anthropicClientID,
+			"code":          code,
+			"state":         state,
+			"redirect_uri":  pl.redirectURI,
+			"code_verifier": pl.verifier,
+		}, nil)
 	}
-	return m.exchangeAnthropic(ctx, map[string]any{
-		"grant_type":    "authorization_code",
-		"client_id":     anthropicClientID,
-		"code":          code,
-		"state":         state,
-		"redirect_uri":  pl.redirectURI,
-		"code_verifier": pl.verifier,
-	}, nil)
 }
 
 func (m *Manager) finishPending(pl *pendingLogin, cred *Credential, err error) {
@@ -335,8 +471,7 @@ func (m *Manager) finishPending(pl *pendingLogin, cred *Credential, err error) {
 		return
 	}
 	delete(m.pending, pl.provider)
-	pl.cancel()
-	pl.cb.Close()
+	pl.closeResources()
 	if err != nil {
 		m.lastErr[pl.provider] = err.Error()
 		return
@@ -363,8 +498,7 @@ func (m *Manager) SignOut(provider string) error {
 	m.generation[provider]++
 	if pl := m.pending[provider]; pl != nil {
 		delete(m.pending, provider)
-		pl.cancel()
-		pl.cb.Close()
+		pl.closeResources()
 	}
 	delete(m.cached, provider)
 	m.loaded[provider] = true
@@ -379,38 +513,60 @@ func (m *Manager) SignOut(provider string) error {
 // AccessToken returns a valid access token for provider, refreshing single-flight
 // when within 180s of expiry or when forceRefresh is requested after a 401.
 func (m *Manager) AccessToken(ctx context.Context, provider string, forceRefresh bool) (string, error) {
+	cred, err := m.Credential(ctx, provider, forceRefresh)
+	if err != nil {
+		return "", err
+	}
+	return cred.AccessToken, nil
+}
+
+// Credential returns a valid Credential copy for provider, refreshing
+// single-flight when within 180s of expiry or when forceRefresh is requested.
+func (m *Manager) Credential(ctx context.Context, provider string, forceRefresh bool) (*Credential, error) {
 	m.mu.Lock()
 	current := m.loadLocked(provider)
 	if current == nil || current.AccessToken == "" {
 		m.mu.Unlock()
-		return "", ErrNotConnected
+		return nil, ErrNotConnected
 	}
 	now := time.Now()
 	expiring := current.ExpiresAt > 0 && current.ExpiresAt-now.Unix() < 180
+	expired := current.ExpiresAt > 0 && current.ExpiresAt <= now.Unix()
 	justRefreshed := !m.lastRefresh[provider].IsZero() && now.Sub(m.lastRefresh[provider]) < 10*time.Second
 	stale := expiring || (forceRefresh && !justRefreshed)
 	flight := m.flights[provider]
 	if !stale && flight == nil {
-		tok := current.AccessToken
+		cp := *current
 		m.mu.Unlock()
-		return tok, nil
+		return &cp, nil
 	}
 	if flight != nil {
 		m.mu.Unlock()
 		select {
 		case <-flight.done:
 			if flight.err != nil {
-				return "", flight.err
+				return nil, flight.err
 			}
-			return flight.cred.AccessToken, nil
+			cp := *flight.cred
+			return &cp, nil
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 	if current.RefreshToken == "" {
-		tok := current.AccessToken
+		if forceRefresh || expired {
+			delete(m.cached, provider)
+			m.lastErr[provider] = ErrSessionRevoked.Error()
+			store := m.store
+			m.mu.Unlock()
+			if store != nil {
+				_ = store.DeleteOAuthCredential(provider)
+			}
+			return nil, ErrSessionRevoked
+		}
+		cp := *current
 		m.mu.Unlock()
-		return tok, nil
+		return &cp, nil
 	}
 	gen := m.generation[provider]
 	flight = &refreshFlight{done: make(chan struct{})}
@@ -449,25 +605,31 @@ func (m *Manager) AccessToken(ctx context.Context, provider string, forceRefresh
 	if err != nil {
 		var te *TransientError
 		if !forceRefresh && current.ExpiresAt > time.Now().Unix() && errors.As(err, &te) {
-			return current.AccessToken, nil
+			cp := *current
+			return &cp, nil
 		}
-		return "", err
+		return nil, err
 	}
-	return fresh.AccessToken, nil
+	cp := *fresh
+	return &cp, nil
 }
 
 func (m *Manager) doRefresh(ctx context.Context, current *Credential) (*Credential, error) {
-	if current.Provider == ProviderChatGPT {
+	switch current.Provider {
+	case ProviderChatGPT:
 		return m.exchangeChatGPT(ctx, url.Values{
 			"grant_type":    {"refresh_token"},
 			"client_id":     {current.ClientID},
 			"refresh_token": {current.RefreshToken},
 			"resource":      {chatGPTResource},
 		}, current.ClientID, current)
+	case ProviderAntigravity:
+		return m.refreshAntigravity(ctx, current)
+	default:
+		return m.exchangeAnthropic(ctx, map[string]any{
+			"grant_type":    "refresh_token",
+			"client_id":     anthropicClientID,
+			"refresh_token": current.RefreshToken,
+		}, current)
 	}
-	return m.exchangeAnthropic(ctx, map[string]any{
-		"grant_type":    "refresh_token",
-		"client_id":     anthropicClientID,
-		"refresh_token": current.RefreshToken,
-	}, current)
 }

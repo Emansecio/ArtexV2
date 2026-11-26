@@ -91,6 +91,9 @@ type Server struct {
 	// free slots off the same snapshot and over-promote past the limit.
 	concMu sync.Mutex
 
+	modelCatalogMu    sync.Mutex
+	modelCatalogCache map[string]cachedModelCatalog
+
 	readyPG readyCache
 
 	cfgMu     sync.Mutex

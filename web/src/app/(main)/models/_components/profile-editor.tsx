@@ -3,10 +3,8 @@
 import * as React from "react";
 
 import {
-  BrainIcon,
   CheckIcon,
   ChevronDownIcon,
-  CpuIcon,
   ExternalLinkIcon,
   KeyRoundIcon,
   Loader2Icon,
@@ -16,10 +14,7 @@ import {
   PlusIcon,
   RefreshCwIcon,
   SaveIcon,
-  ServerIcon,
   SlidersHorizontalIcon,
-  SparklesIcon,
-  TerminalIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -34,7 +29,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Switch } from "@/components/ui/switch";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
-import type { LLMProfile, LLMRetryOverride, OAuthProviderStatus } from "@/lib/types";
+import type { LLMPoolMember, LLMProfile, LLMRetryOverride, ModelDetail, OAuthProviderStatus, OllamaStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import {
@@ -47,11 +42,13 @@ import {
   normalizeFormat,
   PROVIDERS,
   type ProfileFormat,
+  providerConnectionState,
   providerMeta,
   rich,
   THINKING_TYPES,
   toStore,
 } from "./llm-helpers";
+import { ProviderIcon } from "./provider-icons";
 import { ProfileRetryFields, ZERO_OVERRIDE } from "./retry-panel";
 
 function StepBadge({ step, title }: { step: number; title: string }) {
@@ -72,6 +69,9 @@ export function ProfileEditorSheet({
   onSaved,
   oauthMap,
   onReloadOAuth,
+  profiles = [],
+  healthMap = new Map(),
+  ollamaStatus = null,
 }: {
   profile: LLMProfile | null;
   open: boolean;
@@ -79,6 +79,9 @@ export function ProfileEditorSheet({
   onSaved: (id: string) => void;
   oauthMap: Map<string, OAuthProviderStatus>;
   onReloadOAuth: () => Promise<void>;
+  profiles?: LLMProfile[];
+  healthMap?: Map<string, LLMPoolMember>;
+  ollamaStatus?: OllamaStatus | null;
 }) {
   const isNew = !profile;
   const [name, setName] = React.useState("");
@@ -105,6 +108,7 @@ export function ProfileEditorSheet({
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [models, setModels] = React.useState<string[]>([]);
+  const [modelDetails, setModelDetails] = React.useState<Map<string, ModelDetail>>(new Map());
   const [loadingModels, setLoadingModels] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
   const [modelQuery, setModelQuery] = React.useState("");
@@ -135,8 +139,11 @@ export function ProfileEditorSheet({
     setApiKey("");
     setKeyHint(profile?.api_key_hint ?? "");
     setModels([]);
+    setModelDetails(new Map());
     setModelsOpen(false);
     setModelQuery("");
+    setManualCode("");
+    setManualOpen(false);
     setAdvancedOpen(false);
   }, [open, profile]);
 
@@ -162,7 +169,12 @@ export function ProfileEditorSheet({
         return;
       }
       window.open(res.auth_url, "_blank", "noopener,noreferrer");
-      toast.info(t("Complete sign-in in the browser tab that just opened."));
+      if (res.manual_required) {
+        setManualOpen(true);
+        toast.info(t("Complete Google sign-in in the browser tab, then paste the authorization code or callback URL below."));
+      } else {
+        toast.info(t("Complete sign-in in the browser tab that just opened."));
+      }
       await onReloadOAuth();
     } catch (e) {
       toast.error(t("OAuth sign-in failed: {error}", { error: (e as Error).message }));
@@ -211,11 +223,17 @@ export function ProfileEditorSheet({
     if (loadingModels) return;
     setLoadingModels(true);
     setModels([]);
+    setModelDetails(new Map());
     setModelQuery("");
     try {
       const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
       if (r.ok && r.models && r.models.length > 0) {
         setModels(r.models);
+        const detailMap = new Map<string, ModelDetail>();
+        for (const d of r.model_details ?? []) {
+          detailMap.set(d.id, d);
+        }
+        setModelDetails(detailMap);
         setModelsOpen(true);
         toast.success(t("Loaded {count} models", { count: r.models.length }));
       } else {
@@ -227,6 +245,24 @@ export function ProfileEditorSheet({
       setLoadingModels(false);
     }
   }
+
+  function applySelectedModel(selectedId: string) {
+    setModel(selectedId);
+    const detail = modelDetails.get(selectedId);
+    if (detail) {
+      if (detail.context_window_k && detail.context_window_k > 0) {
+        setCw(String(detail.context_window_k));
+      }
+      if (detail.reasoning_levels && detail.reasoning_levels.length > 0 && effort !== NONE) {
+        if (!detail.reasoning_levels.includes(effort)) {
+          setEffort(detail.reasoning_levels.includes("high") ? "high" : detail.reasoning_levels[0]);
+        }
+      }
+    }
+    setModelsOpen(false);
+  }
+
+  const selectedModelDetail = modelDetails.get(model.trim());
 
   async function testConnection() {
     if (testing) return;
@@ -312,12 +348,19 @@ export function ProfileEditorSheet({
     keyPlaceholder = t("Set ({hint}); leave empty to keep it", { hint: keyHint });
   }
 
-  const providerIcon = (id: ProfileFormat) => {
-    if (id === "anthropic" || id === "anthropic-oauth") return <SparklesIcon className="size-4" />;
-    if (id === "ollama") return <ServerIcon className="size-4" />;
-    if (id === "opencode-zen" || id === "opencode-go") return <TerminalIcon className="size-4" />;
-    if (id === "openai-responses" || id === "chatgpt") return <BrainIcon className="size-4" />;
-    return <CpuIcon className="size-4" />;
+  const oauthSignInLabel = () => {
+    switch (oauthProv) {
+      case "chatgpt":
+        return t("Sign in with ChatGPT");
+      case "anthropic":
+        return t("Sign in with Claude");
+      case "devin":
+        return t("Sign in with Devin");
+      case "antigravity-cli":
+        return t("Sign in with Google");
+      default:
+        return t("Sign in");
+    }
   };
 
   return (
@@ -349,15 +392,18 @@ export function ProfileEditorSheet({
             <div className="grid grid-cols-2 gap-2">
               {PROVIDERS.map((p) => {
                 const selected = format === p.id;
+                const conn = providerConnectionState(p, profiles, healthMap, oauthMap, ollamaStatus);
                 return (
                   <button
                     key={p.id}
                     type="button"
                     aria-pressed={selected}
+                    title={`${p.shortLabel} — ${conn.label}: ${conn.hint}`}
                     onClick={() => {
                       if (format !== p.id) {
                         setFormat(p.id);
                         setModels([]);
+                        setModelDetails(new Map());
                         setModelsOpen(false);
                         setModelQuery("");
                       }
@@ -377,11 +423,11 @@ export function ProfileEditorSheet({
                         )}
                       >
                         <span className={cn("transition-colors", selected ? "text-primary" : "text-muted-foreground")}>
-                          {providerIcon(p.id)}
+                          <ProviderIcon format={p.id} className="size-4" />
                         </span>
                         <span className="truncate">{p.shortLabel}</span>
                       </span>
-                      <span className="flex items-center gap-1">
+                      <span className="flex items-center gap-1.5">
                         {p.oauthProvider && (
                           <Badge variant="secondary" className="px-1 py-0 text-[9px] font-medium uppercase">
                             OAuth
@@ -392,6 +438,11 @@ export function ProfileEditorSheet({
                             <CheckIcon className="size-2.5" />
                           </span>
                         )}
+                        <span
+                          aria-label={`${p.shortLabel}: ${conn.label}`}
+                          title={`${conn.label} — ${conn.hint}`}
+                          className={cn("inline-block size-2 shrink-0 rounded-full", conn.dotCls)}
+                        />
                       </span>
                     </div>
                     <p className="line-clamp-2 text-muted-foreground text-xs leading-snug">{p.desc}</p>
@@ -474,7 +525,7 @@ export function ProfileEditorSheet({
                         ) : (
                           <LogInIcon className="size-3.5" />
                         )}
-                        {oauthProv === "chatgpt" ? t("Sign in with ChatGPT") : t("Sign in with Claude")}
+                        {oauthSignInLabel()}
                       </Button>
                     )}
                   </div>
@@ -491,7 +542,7 @@ export function ProfileEditorSheet({
                     >
                       {t("Using a remote browser? Paste redirect URL or code")}
                     </button>
-                    {manualOpen && (
+                    {(manualOpen || oauthProv === "antigravity-cli") && (
                       <div className="flex gap-2">
                         <Input
                           className="h-8 font-mono text-xs"
@@ -574,19 +625,35 @@ export function ProfileEditorSheet({
                             {t("No model matches “{query}”", { query: modelQuery.trim() })}
                           </p>
                         ) : (
-                          filteredModels.map((m) => (
-                            <button
-                              key={m}
-                              type="button"
-                              className="w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs transition-colors hover:bg-accent hover:text-accent-foreground"
-                              onClick={() => {
-                                setModel(m);
-                                setModelsOpen(false);
-                              }}
-                            >
-                              {m}
-                            </button>
-                          ))
+                          filteredModels.map((m) => {
+                            const d = modelDetails.get(m);
+                            const cwLabel =
+                              d?.context_window_k && d.context_window_k > 0
+                                ? d.context_window_k >= 1000
+                                  ? `${Number((d.context_window_k / 1000).toFixed(1))}M`
+                                  : `${d.context_window_k}K`
+                                : null;
+                            return (
+                              <button
+                                key={m}
+                                type="button"
+                                className="flex w-full shrink-0 items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left font-mono text-xs transition-colors hover:bg-accent hover:text-accent-foreground"
+                                onClick={() => applySelectedModel(m)}
+                              >
+                                <span className="min-w-0 flex-1 truncate">
+                                  {m}
+                                  {d?.label && d.label !== m && (
+                                    <span className="ml-1.5 font-sans text-[11px] text-muted-foreground">{d.label}</span>
+                                  )}
+                                </span>
+                                {cwLabel && (
+                                  <Badge variant="outline" className="shrink-0 px-1 py-0 font-mono text-[10px]">
+                                    {cwLabel}
+                                  </Badge>
+                                )}
+                              </button>
+                            );
+                          })
                         )}
                       </div>
                     </PopoverContent>
@@ -698,7 +765,14 @@ export function ProfileEditorSheet({
             </div>
 
             <div className="grid gap-2">
-              <Label className="text-xs font-medium text-muted-foreground">{t("Thinking effort · reasoning_effort")}</Label>
+              <div className="flex items-center justify-between gap-2">
+                <Label className="text-xs font-medium text-muted-foreground">{t("Thinking effort · reasoning_effort")}</Label>
+                {selectedModelDetail?.reasoning_levels && selectedModelDetail.reasoning_levels.length > 0 && (
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {t("Supported: {levels}", { levels: selectedModelDetail.reasoning_levels.join(", ") })}
+                  </span>
+                )}
+              </div>
               <div className="grid grid-cols-3 gap-1.5 rounded-lg bg-muted/60 p-1 sm:grid-cols-6">
                 {EFFORT_LEVELS.map((o) => {
                   const active = effort === o.value;

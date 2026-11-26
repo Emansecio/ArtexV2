@@ -2817,5 +2817,21 @@
   "Runtime": "运行",
   "Open task": "打开任务",
   "Archive": "归档",
-  "Jump to latest": "跳到最新"
+  "Jump to latest": "跳到最新",
+  "Antigravity CLI (OAuth)": "Antigravity CLI (OAuth)",
+  "Google Antigravity CLI (Gemini 4 & Claude via ACP)": "Google Antigravity CLI（通过 ACP 使用 Gemini 4 和 Claude）",
+  "Devin (OAuth)": "Devin (OAuth)",
+  "Cognition Devin Cascade API (SWE-1.6, Claude, Gemini)": "Cognition Devin Cascade API（SWE-1.6、Claude、Gemini）",
+  "Complete Google sign-in in the browser tab, then paste the authorization code or callback URL below.": "请在浏览器标签页中完成 Google 登录，然后将授权码或回调 URL 粘贴到下方。",
+  "Sign in with Devin": "使用 Devin 登录",
+  "Sign in with Google": "使用 Google 登录",
+  "Supported: {levels}": "支持：{levels}",
+  "OAuth connection error": "OAuth 连接错误",
+  "Provider degraded or tripped in pool": "提供商在池中已降级或熔断",
+  "Ollama error": "Ollama 错误",
+  "Ollama online": "Ollama 在线",
+  "Ollama offline": "Ollama 离线",
+  "Disconnected": "未连接",
+  "{count} profile(s) configured": "已配置 {count} 个配置",
+  "Check connections": "检查连接"
 }

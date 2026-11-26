@@ -25,6 +25,7 @@ import (
 	"github.com/Autumn-27/artex/server"
 	"github.com/Autumn-27/artex/skills"
 	"github.com/Autumn-27/artex/toolbox"
+	"github.com/Autumn-27/norma/llm"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
@@ -269,6 +270,7 @@ func run() int {
 	if drainErr != nil {
 		log.Printf("task drain: %v", drainErr)
 	}
+	llm.ShutdownAntigravityPool()
 	// The health writer flushes on ctx.Done(). Wait for it before the deferred
 	// store close, so the last cooling window is not written at a closed database.
 	srv.FlushLLMHealth()

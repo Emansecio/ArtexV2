@@ -2817,5 +2817,21 @@
   "Runtime": "Runtime",
   "Open task": "Abrir tarefa",
   "Archive": "Arquivar",
-  "Jump to latest": "Ir para o final"
+  "Jump to latest": "Ir para o final",
+  "Antigravity CLI (OAuth)": "Antigravity CLI (OAuth)",
+  "Google Antigravity CLI (Gemini 4 & Claude via ACP)": "Google Antigravity CLI (Gemini 4 e Claude via ACP)",
+  "Devin (OAuth)": "Devin (OAuth)",
+  "Cognition Devin Cascade API (SWE-1.6, Claude, Gemini)": "API Cognition Devin Cascade (SWE-1.6, Claude, Gemini)",
+  "Complete Google sign-in in the browser tab, then paste the authorization code or callback URL below.": "Conclua o login com Google na aba do navegador e cole abaixo o código de autorização ou a URL de retorno.",
+  "Sign in with Devin": "Entrar com Devin",
+  "Sign in with Google": "Entrar com Google",
+  "Supported: {levels}": "Suportados: {levels}",
+  "OAuth connection error": "Erro de conexão OAuth",
+  "Provider degraded or tripped in pool": "Provedor degradado ou pausado no pool",
+  "Ollama error": "Erro no Ollama",
+  "Ollama online": "Ollama online",
+  "Ollama offline": "Ollama offline",
+  "Disconnected": "Desconectado",
+  "{count} profile(s) configured": "{count} perfil(is) configurado(s)",
+  "Check connections": "Verificar conexões"
 }

@@ -318,7 +318,11 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, errDataSourceUnavailable)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
+	ip := strings.TrimSpace(clientIP(r, s.trustedProxies))
+	isLoopback := ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
+	proxied := strings.TrimSpace(r.Header.Get("X-Forwarded-For")) != "" || strings.TrimSpace(r.Header.Get("Forwarded")) != ""
+	localBypass := isLoopback && !proxied && (hash == "" || strings.TrimSpace(os.Getenv("ARTEX_ALLOW_LOCAL_BYPASS")) == "1")
+	writeJSON(w, 200, map[string]any{"initialized": hash != "", "local_bypass": localBypass})
 }
 
 // initSetupToken generates the one-time setup token when no admin password is set

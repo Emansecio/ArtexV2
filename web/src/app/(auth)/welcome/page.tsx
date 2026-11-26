@@ -224,7 +224,7 @@ export default function WelcomePage() {
       if (statusRes.status === "fulfilled") {
         initialized = Boolean(statusRes.value.initialized);
         passwordInitializedRef.current = initialized;
-        if (initialized) {
+        if (initialized && !statusRes.value.local_bypass) {
           setAuthMode("login");
           return;
         }

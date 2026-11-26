@@ -72,6 +72,10 @@ const (
 	// FormatOpenAIResponses speaks the OpenAI Responses API (POST /v1/responses),
 	// distinct from FormatOpenAI's Chat Completions (/chat/completions).
 	FormatOpenAIResponses Format = "openai-responses"
+	// FormatDevin speaks Cognition/Devin's Cascade Connect+Protobuf API.
+	FormatDevin Format = "devin"
+	// FormatAntigravity delegates authenticated inference to Google's `agy acp` subprocess.
+	FormatAntigravity Format = "antigravity-cli"
 )
 
 // MaxTokensFieldCompletion is the Config.MaxTokensField value that moves the
@@ -155,6 +159,9 @@ type Config struct {
 	// TokenFunc, when set, dynamically resolves an OAuth Bearer access token
 	// before each request (and is re-invoked with forceRefresh=true once on 401).
 	TokenFunc func(ctx context.Context, forceRefresh bool) (string, error)
+	// AgyCredFunc, when set, dynamically resolves a full typed AgyCredential for
+	// FormatAntigravity without packing JSON into TokenFunc.
+	AgyCredFunc func(ctx context.Context, forceRefresh bool) (AgyCredential, error)
 	// UseBearerAuth sends `Authorization: Bearer <key>` instead of `x-api-key`
 	// on Anthropic Messages requests (used by Claude OAuth and OpenCode gateways).
 	UseBearerAuth bool
@@ -298,8 +305,15 @@ func NewProvider(cfg Config) (Provider, error) {
 			cfg.BaseURL = envOr("OPENAI_BASE_URL", "https://api.openai.com/v1")
 		}
 		return &openaiResponsesProvider{cfg: cfg}, nil
+	case FormatDevin:
+		if cfg.BaseURL == "" {
+			cfg.BaseURL = DevinDefaultBaseURL
+		}
+		return newDevinProvider(cfg), nil
+	case FormatAntigravity:
+		return newAntigravityProvider(cfg), nil
 	default:
-		return nil, fmt.Errorf("llm: unknown format %q (use anthropic, openai or openai-responses)", cfg.Format)
+		return nil, fmt.Errorf("llm: unknown format %q (use anthropic, openai, openai-responses, devin or antigravity-cli)", cfg.Format)
 	}
 }
 

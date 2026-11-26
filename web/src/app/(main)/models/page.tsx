@@ -8,6 +8,7 @@ import {
   PencilIcon,
   PlugZapIcon,
   PlusIcon,
+  RefreshCwIcon,
   StarIcon,
   Trash2Icon,
   ZapIcon,
@@ -20,7 +21,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
-import type { LLMPoolMember, LLMPoolStatus, LLMProfile, OAuthProviderStatus } from "@/lib/types";
+import type { LLMPoolMember, LLMPoolStatus, LLMProfile, OAuthProviderStatus, OllamaStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { FallbackStudio } from "./_components/fallback-studio";
@@ -28,16 +29,20 @@ import {
   healthOf,
   PROVIDERS,
   type ProfileFormat,
+  providerConnectionState,
   providerMeta,
   reasoningSummary,
 } from "./_components/llm-helpers";
 import { ProfileEditorSheet } from "./_components/profile-editor";
+import { ProviderIcon } from "./_components/provider-icons";
 import { RetryPolicyPanel } from "./_components/retry-panel";
 
 export default function ModelsPage() {
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [pool, setPool] = React.useState<LLMPoolStatus | null>(null);
   const [oauthList, setOauthList] = React.useState<OAuthProviderStatus[]>([]);
+  const [ollamaStatus, setOllamaStatus] = React.useState<OllamaStatus | null>(null);
+  const [verifying, setVerifying] = React.useState(false);
   const [tab, setTab] = React.useState("profiles");
   const [providerFilter, setProviderFilter] = React.useState<"all" | ProfileFormat>("all");
   const [editOpen, setEditOpen] = React.useState(false);
@@ -57,9 +62,11 @@ export default function ModelsPage() {
     }
   }, []);
 
-  const loadOAuth = React.useCallback(async () => {
+  const loadOAuth = React.useCallback(async (opts?: { verify?: boolean; force?: boolean }) => {
     try {
-      setOauthList(await api.llmOAuthStatus());
+      const res = await api.llmOAuthStatus(opts);
+      setOauthList(res.providers);
+      if (res.ollama) setOllamaStatus(res.ollama);
     } catch {
       /* ignore */
     }
@@ -71,8 +78,18 @@ export default function ModelsPage() {
     } catch {
       /* ignore */
     }
-    await Promise.all([loadPool(), loadOAuth()]);
+    await Promise.all([loadPool(), loadOAuth({ verify: true })]);
   }, [loadPool, loadOAuth]);
+
+  const verifyConnections = React.useCallback(async () => {
+    if (verifying) return;
+    setVerifying(true);
+    try {
+      await Promise.all([loadPool(), loadOAuth({ verify: true, force: true })]);
+    } finally {
+      setVerifying(false);
+    }
+  }, [verifying, loadPool, loadOAuth]);
 
   React.useEffect(() => {
     void load();
@@ -173,9 +190,15 @@ export default function ModelsPage() {
             {t("Configure AI providers, models, reasoning levels, and automatic failover chains.")}
           </p>
         </div>
-        <Button size="sm" onClick={() => openEditor(null)}>
-          <PlusIcon /> {t("New provider")}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="outline" onClick={() => void verifyConnections()} disabled={verifying}>
+            <RefreshCwIcon className={cn("size-3.5", verifying && "animate-spin")} />
+            {verifying ? t("Checking…") : t("Check connections")}
+          </Button>
+          <Button size="sm" onClick={() => openEditor(null)}>
+            <PlusIcon /> {t("New provider")}
+          </Button>
+        </div>
       </div>
 
       <div className="grid gap-3 md:grid-cols-3">
@@ -187,7 +210,8 @@ export default function ModelsPage() {
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-muted-foreground text-xs">{t("Active model")}</span>
               {activeProfile && (
-                <Badge variant="outline" className="text-[10px] uppercase" lang="en">
+                <Badge variant="outline" className="gap-1 text-[10px] uppercase" lang="en">
+                  <ProviderIcon format={activeProfile.format} className="size-3" />
                   {providerMeta(activeProfile.format).shortLabel}
                 </Badge>
               )}
@@ -283,18 +307,22 @@ export default function ModelsPage() {
                 const count = profiles.filter((p) => p.format === prov.id).length;
                 if (count === 0) return null;
                 const active = providerFilter === prov.id;
+                const conn = providerConnectionState(prov, profiles, healthMap, oauthMap, ollamaStatus);
                 return (
                   <button
                     key={prov.id}
                     type="button"
+                    title={`${prov.shortLabel} — ${conn.label}: ${conn.hint}`}
                     onClick={() => setProviderFilter(prov.id)}
                     className={cn(
-                      "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                      "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
                       active
                         ? "border-primary bg-primary text-primary-foreground"
                         : "border-border bg-card text-muted-foreground hover:text-foreground",
                     )}
                   >
+                    <span className={cn("inline-block size-1.5 rounded-full", conn.dotCls)} />
+                    <ProviderIcon format={prov.id} className="size-3.5" />
                     {prov.shortLabel} ({count})
                   </button>
                 );
@@ -337,7 +365,8 @@ export default function ModelsPage() {
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-1.5">
                           <span className="truncate font-medium text-sm">{p.name}</span>
-                          <Badge variant="outline" className="text-[10px] uppercase" lang="en">
+                          <Badge variant="outline" className="gap-1 text-[10px] uppercase" lang="en">
+                            <ProviderIcon format={p.format} className="size-3" />
                             {providerMeta(p.format).shortLabel}
                           </Badge>
                           <Badge variant="outline" className={cn("ml-auto text-[10px]", h.cls)} title={h.hint}>
@@ -463,7 +492,10 @@ export default function ModelsPage() {
         onOpenChange={setEditOpen}
         onSaved={() => void load()}
         oauthMap={oauthMap}
-        onReloadOAuth={loadOAuth}
+        onReloadOAuth={() => loadOAuth({ verify: true, force: true })}
+        profiles={profiles}
+        healthMap={healthMap}
+        ollamaStatus={ollamaStatus}
       />
     </div>
   );

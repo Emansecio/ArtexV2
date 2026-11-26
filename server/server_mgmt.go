@@ -33,6 +33,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/notify"
+	"github.com/Autumn-27/artex/oauth"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
 )
@@ -2579,6 +2580,150 @@ func (g *modelURLGuard) validateURL(ctx context.Context, rawURL, role string) (*
 	return u, nil
 }
 
+type modelDetail struct {
+	ID              string   `json:"id"`
+	Label           string   `json:"label,omitempty"`
+	ContextWindowK  int      `json:"context_window_k,omitempty"`
+	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
+	ReasoningLevels []string `json:"reasoning_levels,omitempty"`
+}
+
+type cachedModelCatalog struct {
+	models    []string
+	details   []modelDetail
+	expiresAt time.Time
+}
+
+const modelCatalogCacheTTL = 10 * time.Minute
+
+func (s *Server) getCachedModelCatalog(provider string) ([]string, []modelDetail, bool) {
+	s.modelCatalogMu.Lock()
+	defer s.modelCatalogMu.Unlock()
+	if s.modelCatalogCache == nil {
+		return nil, nil, false
+	}
+	c, ok := s.modelCatalogCache[provider]
+	if !ok || time.Now().After(c.expiresAt) {
+		return nil, nil, false
+	}
+	return append([]string(nil), c.models...), append([]modelDetail(nil), c.details...), true
+}
+
+func (s *Server) putCachedModelCatalog(provider string, models []string, details []modelDetail) {
+	s.modelCatalogMu.Lock()
+	defer s.modelCatalogMu.Unlock()
+	if s.modelCatalogCache == nil {
+		s.modelCatalogCache = map[string]cachedModelCatalog{}
+	}
+	s.modelCatalogCache[provider] = cachedModelCatalog{
+		models:    append([]string(nil), models...),
+		details:   append([]modelDetail(nil), details...),
+		expiresAt: time.Now().Add(modelCatalogCacheTTL),
+	}
+}
+
+func (s *Server) invalidateModelCatalogCache(provider string) {
+	s.modelCatalogMu.Lock()
+	defer s.modelCatalogMu.Unlock()
+	if s.modelCatalogCache != nil {
+		delete(s.modelCatalogCache, provider)
+	}
+}
+
+func (s *Server) pgListDevinOrAgyModels(w http.ResponseWriter, r *http.Request, provider, rawBaseURL, rawProxy string) {
+	if strings.TrimSpace(rawBaseURL) != "" && !sameLLMEndpoint(provider, rawBaseURL, provider, "") {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": "OAuth credentials are only sent to the canonical provider endpoint; custom base_url is not allowed"})
+		return
+	}
+	if models, details, ok := s.getCachedModelCatalog(provider); ok {
+		writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details})
+		return
+	}
+
+	var client *http.Client
+	if p := strings.TrimSpace(rawProxy); p != "" {
+		guard := newModelURLGuard(s)
+		proxyURL, err := guard.validateURL(r.Context(), p, "proxy")
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.Proxy = http.ProxyURL(proxyURL)
+		client = &http.Client{Transport: tr, Timeout: 30 * time.Second}
+	} else {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+
+	if provider == "devin" {
+		tok, err := s.ensureOAuth().AccessToken(r.Context(), oauth.ProviderDevin, false)
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		entries, err := llm.FetchDevinModelConfigs(r.Context(), client, llm.DevinDefaultBaseURL, tok)
+		if err != nil {
+			var hse *llm.HTTPStatusError
+			if errors.As(err, &hse) && (hse.StatusCode == http.StatusUnauthorized || hse.StatusCode == http.StatusForbidden) {
+				writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			entries = llm.DevinFallbackCatalog()
+		}
+		models := make([]string, 0, len(entries))
+		details := make([]modelDetail, 0, len(entries))
+		for _, e := range entries {
+			models = append(models, e.ID)
+			details = append(details, modelDetail{
+				ID:              e.ID,
+				Label:           e.Name,
+				ContextWindowK:  e.ContextWindow / 1000,
+				MaxOutputTokens: e.MaxOutputTokens,
+				ReasoningLevels: e.ReasoningLevels,
+			})
+		}
+		if err == nil {
+			s.putCachedModelCatalog(provider, models, details)
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details})
+		return
+	}
+
+	// antigravity-cli
+	cred, err := s.ensureOAuth().Credential(r.Context(), oauth.ProviderAntigravity, false)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	agyCred := llm.AgyCredential{
+		Access:    cred.AccessToken,
+		Refresh:   cred.RefreshToken,
+		ExpiresMS: cred.ExpiresAt * 1000,
+		Email:     cred.AccountHint,
+		AccountID: cred.IDToken,
+	}
+	entries, probeErr := llm.ProbeAntigravityModels(r.Context(), client, agyCred)
+	if probeErr != nil || len(entries) == 0 {
+		entries = llm.AntigravityFallbackCatalog()
+	}
+	models := make([]string, 0, len(entries))
+	details := make([]modelDetail, 0, len(entries))
+	for _, e := range entries {
+		models = append(models, e.ID)
+		details = append(details, modelDetail{
+			ID:              e.ID,
+			Label:           e.DisplayName,
+			ContextWindowK:  e.ContextWindow / 1000,
+			MaxOutputTokens: e.MaxOutputTokens,
+			ReasoningLevels: e.ReasoningLevels,
+		})
+	}
+	if probeErr == nil && len(entries) > 0 {
+		s.putCachedModelCatalog(provider, models, details)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details})
+}
+
 // pgListModels fetches available models from the provider's API endpoint.
 // Supports OpenAI-format (GET /models), Anthropic-format (GET /v1/models) and
 // Ollama (keyless OpenAI-compatible GET /v1/models on the local server); for
@@ -2618,6 +2763,10 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	provider := strings.TrimSpace(req.Provider)
+	if provider == "devin" || provider == "antigravity-cli" {
+		s.pgListDevinOrAgyModels(w, r, provider, req.BaseURL, req.Proxy)
+		return
+	}
 	// Resolve live OAuth access tokens for subscription-backed providers.
 	if provider == "chatgpt" || provider == "anthropic-oauth" {
 		if strings.TrimSpace(req.BaseURL) != "" && !sameLLMEndpoint(provider, req.BaseURL, provider, "") {

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/artex/oauth"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
@@ -156,6 +157,8 @@ const (
 	FormatAnthropicOAuth llm.Format = "anthropic-oauth"
 	FormatOpenCodeZen    llm.Format = "opencode-zen"
 	FormatOpenCodeGo     llm.Format = "opencode-go"
+	FormatDevin          llm.Format = llm.FormatDevin
+	FormatAntigravity    llm.Format = llm.FormatAntigravity
 
 	DefaultOpenCodeZenBaseURL = "https://opencode.ai/zen/v1"
 	DefaultOpenCodeGoBaseURL  = "https://opencode.ai/zen/go/v1"
@@ -190,19 +193,27 @@ func normalizeOllamaBaseURL(raw string) string {
 }
 
 // NeedsAPIKey reports whether this provider format requires a static API key.
-// Local Ollama and OAuth-backed formats (chatgpt, anthropic-oauth) do not.
+// Local Ollama and OAuth-backed formats (chatgpt, anthropic-oauth, devin, antigravity-cli) do not.
 func (c Config) NeedsAPIKey() bool {
-	return c.Format != FormatOllama && c.Format != FormatChatGPT && c.Format != FormatAnthropicOAuth
+	return c.Format != FormatOllama &&
+		c.Format != FormatChatGPT &&
+		c.Format != FormatAnthropicOAuth &&
+		c.Format != FormatDevin &&
+		c.Format != FormatAntigravity
 }
 
-// OAuthProvider returns the oauth.Manager provider key ("chatgpt" or "anthropic")
-// when this config uses OAuth authentication, or "" for API-key/local formats.
+// OAuthProvider returns the oauth.Manager provider key when this config uses
+// OAuth authentication, or "" for API-key/local formats.
 func (c Config) OAuthProvider() string {
 	switch c.Format {
 	case FormatChatGPT:
 		return "chatgpt"
 	case FormatAnthropicOAuth:
 		return "anthropic"
+	case FormatDevin:
+		return oauth.ProviderDevin
+	case FormatAntigravity:
+		return oauth.ProviderAntigravity
 	default:
 		return ""
 	}
@@ -520,6 +531,22 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		if c.Model == "" {
 			c.Model = "deepseek-v3.2"
 		}
+	case "devin":
+		c.Format = FormatDevin
+		if c.BaseURL == "" {
+			c.BaseURL = llm.DevinDefaultBaseURL
+		}
+		if c.Model == "" {
+			c.Model = llm.DevinDefaultModel
+		}
+	case "antigravity-cli":
+		c.Format = FormatAntigravity
+		if c.BaseURL == "" {
+			c.BaseURL = llm.AgyDefaultBaseURL
+		}
+		if c.Model == "" {
+			c.Model = llm.AgyDefaultModel
+		}
 	default:
 		c.Format = llm.FormatAnthropic
 		// provider appends "/v1/messages".
@@ -559,6 +586,10 @@ func (c Config) Provider() string {
 		return "opencode-zen"
 	case FormatOpenCodeGo:
 		return "opencode-go"
+	case FormatDevin:
+		return "devin"
+	case FormatAntigravity:
+		return "antigravity-cli"
 	}
 	return "anthropic"
 }
@@ -614,16 +645,47 @@ func (c Config) NewProvider() (llm.Provider, error) {
 		if strings.TrimSpace(baseURL) == "" {
 			baseURL = DefaultOpenCodeGoBaseURL
 		}
+	case FormatDevin:
+		wireFormat = llm.FormatDevin
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = llm.DevinDefaultBaseURL
+		}
+	case FormatAntigravity:
+		wireFormat = llm.FormatAntigravity
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = llm.AgyDefaultBaseURL
+		}
 	}
 	// OpenCode gateways authenticate Anthropic Messages routes with Bearer (Orb: takesBearerOnMessages).
 	if wireFormat == llm.FormatAnthropic && strings.Contains(strings.ToLower(baseURL), "opencode.ai") {
 		useBearerAuth = true
 	}
 	var tokenFunc func(ctx context.Context, forceRefresh bool) (string, error)
+	var agyCredFunc func(ctx context.Context, forceRefresh bool) (llm.AgyCredential, error)
 	if prov := c.OAuthProvider(); prov != "" && c.OAuthSource != nil {
 		src := c.OAuthSource
 		tokenFunc = func(ctx context.Context, forceRefresh bool) (string, error) {
 			return src.AccessToken(ctx, prov, forceRefresh)
+		}
+		if wireFormat == llm.FormatAntigravity {
+			type credentialSource interface {
+				Credential(ctx context.Context, provider string, forceRefresh bool) (*oauth.Credential, error)
+			}
+			if csrc, ok := src.(credentialSource); ok {
+				agyCredFunc = func(ctx context.Context, forceRefresh bool) (llm.AgyCredential, error) {
+					cred, cerr := csrc.Credential(ctx, prov, forceRefresh)
+					if cerr != nil {
+						return llm.AgyCredential{}, cerr
+					}
+					return llm.AgyCredential{
+						Access:    cred.AccessToken,
+						Refresh:   cred.RefreshToken,
+						ExpiresMS: cred.ExpiresAt * 1000,
+						Email:     cred.AccountHint,
+						AccountID: cred.IDToken,
+					}, nil
+				}
+			}
 		}
 	}
 	lc := llm.Config{
@@ -633,6 +695,7 @@ func (c Config) NewProvider() (llm.Provider, error) {
 		Model:            c.Model,
 		HTTPClient:       client,
 		TokenFunc:        tokenFunc,
+		AgyCredFunc:      agyCredFunc,
 		UseBearerAuth:    useBearerAuth,
 		ExtraHeaders:     extraHeaders,
 		ToolsAsInputItem: toolsAsInputItem,
