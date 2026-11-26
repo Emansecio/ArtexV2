@@ -50,8 +50,14 @@ Query discipline:
 </knowledge-base-guidance>`
 
 // knowledgeBaseGuidance returns the cache-stable operational guidance block when
-// the local secrag knowledge-base search tool is active for this agent.
-func knowledgeBaseGuidance(tools []actool.CoreTool) string {
+// the local secrag knowledge-base search tool is directly active (not deferred)
+// for this agent.
+func knowledgeBaseGuidance(tools []actool.CoreTool, deferred []string) string {
+	for _, d := range deferred {
+		if d == "mcp__secrag__kb_search" {
+			return ""
+		}
+	}
 	for _, t := range tools {
 		if t.Name() == "mcp__secrag__kb_search" {
 			return knowledgeBaseGuidanceBlock
@@ -70,6 +76,9 @@ func seedUnlockFromHistory(msgs []llm.Message, unlockSkill func(string)) {
 		return
 	}
 	for _, m := range msgs {
+		if name, ok := llm.SkillInvocationName(m); ok {
+			unlockSkill(name)
+		}
 		for _, b := range m.ToolUses() {
 			if b.Name != "Skill" {
 				continue

@@ -106,6 +106,20 @@ const unknownBase = 30
 // ScoreRisk scores one tool call. It never panics on malformed input: input
 // that is not a JSON object scores medium with a reason.
 func ScoreRisk(tool string, input json.RawMessage) RiskReport {
+	if tool == executeExtraTool {
+		var in struct {
+			ToolName string          `json:"tool_name"`
+			Params   json.RawMessage `json:"params"`
+		}
+		if json.Unmarshal(input, &in) == nil && in.ToolName != "" && in.ToolName != executeExtraTool {
+			tool = in.ToolName
+			if len(in.Params) > 0 {
+				input = in.Params
+			} else {
+				input = json.RawMessage(`{}`)
+			}
+		}
+	}
 	var fields map[string]any
 	if err := json.Unmarshal(input, &fields); err != nil || fields == nil {
 		return riskReport(unknownBase, []string{"tool input is not a valid JSON object"})
@@ -144,6 +158,8 @@ func ScoreRisk(tool string, input json.RawMessage) RiskReport {
 			return riskReport(webBase+webMutating, []string{"mutating HTTP method " + method})
 		}
 		return riskReport(webBase, []string{})
+	case "mcp__secrag__kb_search", "mcp__secrag__kb_read_section", "mcp__secrag__kb_lookup_cve", "mcp__secrag__kb_stats":
+		return riskReport(0, []string{})
 	}
 	if strings.HasPrefix(tool, "mcp__") {
 		return riskReport(unknownBase, []string{"MCP tool: no specific rules"})

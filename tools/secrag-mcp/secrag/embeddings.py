@@ -15,6 +15,16 @@ BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 DEFAULT_ONNX_THREADS = 4
 
 
+def _parse_onnx_threads(raw: Optional[str]) -> int:
+    if not raw:
+        return 0
+    try:
+        val = int(raw.strip())
+    except ValueError:
+        return 0
+    return val if val > 0 else 0
+
+
 def _l2_normalize(vecs: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(vecs, axis=-1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
@@ -43,10 +53,10 @@ class LocalEmbedder:
         threads: Optional[int] = None,
         prefer_mps: bool = False,
     ):
-        self.model_name = model_name or os.environ.get("SECRAG_EMBED_MODEL", DEFAULT_EMBED_MODEL)
+        self.model_name = (model_name or "").strip() or (os.environ.get("SECRAG_EMBED_MODEL") or "").strip() or DEFAULT_EMBED_MODEL
         self.cache_dir = cache_dir or os.environ.get("SECRAG_MODEL_CACHE") or None
-        env_threads = int(os.environ.get("SECRAG_ONNX_THREADS", "0"))
-        self.threads = threads or env_threads or DEFAULT_ONNX_THREADS
+        env_threads = _parse_onnx_threads(os.environ.get("SECRAG_ONNX_THREADS"))
+        self.threads = (threads if threads and threads > 0 else 0) or env_threads or DEFAULT_ONNX_THREADS
         self.prefer_mps = prefer_mps
         self._fe_model = None
         self._mps_tok = None
@@ -80,18 +90,18 @@ class LocalEmbedder:
         with self._lock:
             if self._mps_checked:
                 return self._mps_model is not None
-            self._mps_checked = True
-            if not self.prefer_mps:
-                return False
             try:
+                if not self.prefer_mps:
+                    return False
                 import torch
                 from transformers import AutoModel, AutoTokenizer
 
                 if not torch.backends.mps.is_available():
                     return False
-                self._mps_tok = AutoTokenizer.from_pretrained(self.model_name)
+                hf_kwargs = {"cache_dir": self.cache_dir} if self.cache_dir else {}
+                self._mps_tok = AutoTokenizer.from_pretrained(self.model_name, **hf_kwargs)
                 self._mps_model = (
-                    AutoModel.from_pretrained(self.model_name, dtype=torch.float16)
+                    AutoModel.from_pretrained(self.model_name, dtype=torch.float16, **hf_kwargs)
                     .to("mps")
                     .eval()
                 )
@@ -100,6 +110,8 @@ class LocalEmbedder:
                 self._mps_tok = None
                 self._mps_model = None
                 return False
+            finally:
+                self._mps_checked = True
 
     def _fmt_doc(self, text: str) -> str:
         t = text[:2400]
@@ -177,10 +189,10 @@ class LocalReranker:
         threads: Optional[int] = None,
         enabled: bool = True,
     ):
-        self.model_name = model_name or os.environ.get("SECRAG_RERANK_MODEL", DEFAULT_RERANK_MODEL)
+        self.model_name = (model_name or "").strip() or (os.environ.get("SECRAG_RERANK_MODEL") or "").strip() or DEFAULT_RERANK_MODEL
         self.cache_dir = cache_dir or os.environ.get("SECRAG_MODEL_CACHE") or None
-        env_threads = int(os.environ.get("SECRAG_ONNX_THREADS", "0"))
-        self.threads = threads or env_threads or DEFAULT_ONNX_THREADS
+        env_threads = _parse_onnx_threads(os.environ.get("SECRAG_ONNX_THREADS"))
+        self.threads = (threads if threads and threads > 0 else 0) or env_threads or DEFAULT_ONNX_THREADS
         env_disable = os.environ.get("SECRAG_DISABLE_RERANK", "").strip().lower() in ("1", "true", "yes")
         self.enabled = enabled and not env_disable
         self._model = None
@@ -215,7 +227,7 @@ class LocalReranker:
         model = self._ensure_loaded()
         if model is None:
             return None
-        clipped = [p[:950] for p in passages]
+        clipped = [p[:700] for p in passages]
         try:
             with self._infer_lock:
                 return [float(s) for s in model.rerank(query[:600], clipped)]

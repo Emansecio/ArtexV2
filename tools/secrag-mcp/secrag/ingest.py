@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import json
 import os
 import shutil
@@ -33,7 +34,7 @@ from .embeddings import LocalEmbedder
 from .storage import KnowledgeStore, extract_cves, extract_mitre_ids, resolve_data_dir, sha256_text
 
 SKIP_DIR_NAMES = {
-    ".git", ".github", "node_modules", "images", "img", "assets", "files",
+    ".git", ".github", "node_modules", "images", "img", "assets",
     "__pycache__", ".gitbook", "static", "media", "videos", "pdfs",
 }
 
@@ -51,6 +52,14 @@ def _git_sync(url: str, dest: Path, sparse_paths: Optional[list[str]] = None) ->
     """Shallow-clone or fast-forward pull a git repository. Returns short HEAD sha."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     if (dest / ".git").exists():
+        if sparse_paths:
+            subprocess.run(
+                ["git", "-C", str(dest), "sparse-checkout", "set", *sparse_paths],
+                check=False,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
         subprocess.run(
             ["git", "-C", str(dest), "pull", "--ff-only", "--quiet"],
             check=False,
@@ -265,39 +274,113 @@ def ingest_privesc_bins(store: KnowledgeStore, src_dir: Path) -> str:
     revs.append("gtfobins:" + _git_sync("https://github.com/GTFOBins/GTFOBins.github.io.git", gtfo))
     gtfo_dir = gtfo / "_gtfobins"
     if gtfo_dir.exists():
-        for p in sorted(gtfo_dir.glob("*")):
-            if not p.is_file():
+        gtfo_files = [p for p in sorted(gtfo_dir.glob("*")) if p.is_file()]
+        gtfo_raw_by_name: dict[str, tuple[str, dict]] = {}
+        for p in gtfo_files:
+            bname = p.name[:-3] if p.name.endswith(".md") else p.name
+            raw_txt = p.read_text(encoding="utf-8", errors="ignore")
+            meta_obj, _ = strip_frontmatter(raw_txt)
+            if isinstance(meta_obj, dict):
+                gtfo_raw_by_name[bname] = (raw_txt, meta_obj)
+
+        for p in gtfo_files:
+            bin_name = p.name[:-3] if p.name.endswith(".md") else p.name
+            entry = gtfo_raw_by_name.get(bin_name)
+            if entry is None:
                 continue
-            raw = p.read_text(encoding="utf-8", errors="ignore")
-            c_hash = sha256_text(raw)
+            raw, meta = entry
+            alias_target = ""
+            effective_meta = meta
+            hash_input = raw
+            visited_aliases = {bin_name}
+            while (
+                isinstance(effective_meta, dict)
+                and not isinstance(effective_meta.get("functions"), dict)
+                and isinstance(effective_meta.get("alias"), str)
+            ):
+                next_alias = effective_meta["alias"].strip()
+                if not next_alias or next_alias in visited_aliases:
+                    effective_meta = {}
+                    break
+                visited_aliases.add(next_alias)
+                target_entry = gtfo_raw_by_name.get(next_alias)
+                if target_entry is None:
+                    effective_meta = {}
+                    break
+                target_raw, effective_meta = target_entry
+                alias_target = next_alias
+                hash_input += "\n#alias:" + target_raw
+
+            funcs = effective_meta.get("functions") if isinstance(effective_meta, dict) else None
+            if not isinstance(funcs, dict):
+                continue
+
+            c_hash = sha256_text(hash_input)
             rel_key = f"gtfobins/{p.name}"
             if store.document_unchanged("privesc-bins", rel_key, c_hash):
                 continue
-            meta, _ = strip_frontmatter(raw)
-            funcs = meta.get("functions") if isinstance(meta, dict) else None
-            if not isinstance(funcs, dict):
-                continue
-            bin_name = p.stem
+
             lines = [f"# GTFOBins: {bin_name}"]
+            if alias_target:
+                lines.append(f"Alias for `{alias_target}`.")
+            top_comment = meta.get("comment") or (effective_meta.get("comment") if alias_target else None)
+            if top_comment:
+                lines.append(str(top_comment).strip())
+
+            extra_tags: list[str] = ["gtfobins", "linux", "privesc", bin_name]
+            if alias_target:
+                extra_tags.append(alias_target)
+
             for fn_name, items in funcs.items():
+                extra_tags.append(str(fn_name))
                 lines.append(f"\n## {fn_name}")
                 if isinstance(items, list):
                     for it in items:
-                        if isinstance(it, dict):
-                            if it.get("description"):
-                                lines.append(str(it["description"]))
-                            if it.get("code"):
-                                lines.append(f"```sh\n{it['code']}\n```")
+                        if not isinstance(it, dict):
+                            continue
+                        item_desc = it.get("comment") or it.get("description")
+                        if item_desc:
+                            lines.append(str(item_desc).strip())
+                        if it.get("from"):
+                            lines.append(f"Inherits from `{it['from']}`.")
+                        if it.get("code"):
+                            lines.append(f"```sh\n{it['code']}\n```")
+                        ctxs = it.get("contexts")
+                        if isinstance(ctxs, dict) and ctxs:
+                            ctx_names = [str(k) for k in ctxs.keys()]
+                            extra_tags.extend(ctx_names)
+                            lines.append(f"Contexts: {', '.join(ctx_names)}")
+                            for ctx_name, ctx_val in ctxs.items():
+                                if not isinstance(ctx_val, dict):
+                                    continue
+                                cap_list = ctx_val.get("list")
+                                if isinstance(cap_list, list) and cap_list:
+                                    caps = [str(c) for c in cap_list if c]
+                                    extra_tags.extend(caps)
+                                    lines.append(f"{ctx_name} capabilities: {', '.join(caps)}")
+                                ctx_comment = ctx_val.get("comment") or ctx_val.get("description")
+                                if ctx_comment:
+                                    lines.append(f"{ctx_name}: {str(ctx_comment).strip()}")
+                                ctx_code = ctx_val.get("code")
+                                if ctx_code:
+                                    lines.append(f"Context `{ctx_name}`:\n```sh\n{ctx_code}\n```")
+
             body = "\n".join(lines).strip()
-            sections = chunk_markdown(body, doc_title=f"GTFOBins: {bin_name}", root_breadcrumb=f"GTFOBins > {bin_name}")
+            sections = chunk_markdown(
+                body,
+                doc_title=f"GTFOBins: {bin_name}",
+                root_breadcrumb=f"GTFOBins > {bin_name}",
+                min_section_chars=1,
+            )
             if sections:
+                url_name = alias_target or bin_name
                 store.upsert_document(
                     source="privesc-bins",
                     category="privesc",
                     rel_path=rel_key,
                     title=f"GTFOBins: {bin_name}",
-                    url=f"https://gtfobins.github.io/gtfobins/{bin_name}/",
-                    tags=["gtfobins", "linux", "privesc", bin_name, *list(funcs.keys())],
+                    url=f"https://gtfobins.github.io/gtfobins/{url_name}/",
+                    tags=list(dict.fromkeys(extra_tags)),
                     cves=[],
                     full_text=body,
                     sections_with_chunks=sections,
@@ -369,7 +452,7 @@ def ingest_privesc_bins(store: KnowledgeStore, src_dir: Path) -> str:
             if store.document_unchanged("privesc-bins", rel_key, c_hash):
                 continue
             meta, _ = strip_frontmatter(raw)
-            if not isinstance(meta, dict):
+            if not isinstance(meta, dict) or not meta:
                 continue
             desc = str(meta.get("description", ""))
             cmd = str(meta.get("command", ""))
@@ -663,6 +746,8 @@ def ingest_bugbounty_writeups(store: KnowledgeStore, src_dir: Path) -> str:
                 extra_tags=tags,
             )
         except Exception as e:
+            if store.conn.in_transaction:
+                store.conn.rollback()
             log(f"bugbounty-writeups ({folder}) warning: {e}")
     log(f"bugbounty-writeups: indexed {total} new/updated docs ({', '.join(revs)})")
     return ",".join(revs)
@@ -670,7 +755,8 @@ def ingest_bugbounty_writeups(store: KnowledgeStore, src_dir: Path) -> str:
 
 def ingest_poc_in_github(store: KnowledgeStore, src_dir: Path) -> str:
     dest = src_dir / "poc-in-github"
-    years = [str(y) for y in range(2018, 2027)]
+    end_year = datetime.date.today().year
+    years = [str(y) for y in range(2018, end_year + 1)]
     rev = _git_sync("https://github.com/nomi-sec/PoC-in-GitHub.git", dest, sparse_paths=years)
     total = 0
     batch = 0
@@ -713,7 +799,7 @@ def ingest_poc_in_github(store: KnowledgeStore, src_dir: Path) -> str:
                 batch = 0
     if batch:
         store.conn.commit()
-    log(f"poc-in-github: indexed {total} new/updated CVE PoC lists 2018-2026 (rev {rev})")
+    log(f"poc-in-github: indexed {total} new/updated CVE PoC lists 2018-{end_year} (rev {rev})")
     return rev
 
 
@@ -759,12 +845,13 @@ def ingest_sigma_rules(store: KnowledgeStore, src_dir: Path) -> str:
 
 def ingest_cvelist_v5(store: KnowledgeStore, src_dir: Path) -> str:
     dest = src_dir / "cvelistV5"
-    years = [f"cves/{y}" for y in range(2020, 2027)]
+    end_year = datetime.date.today().year
+    years = [f"cves/{y}" for y in range(2020, end_year + 1)]
     rev = _git_sync("https://github.com/CVEProject/cvelistV5.git", dest, sparse_paths=years)
     # Dual-tier indexing: 100% of CVEs go to cve_index + FTS5; only high-signal CVEs
     # (CVSS >= 7.0 / high / critical, or already referenced by CISA KEV / Nuclei /
     # Exploit-DB / PoC-in-GitHub) are queued for dense vector embeddings.
-    known_cves = store.known_cve_ids()
+    known_cves = store.known_cve_ids(exclude_source="cvelist-v5")
     total = 0
     high_signal = 0
     lexical_only = 0
@@ -816,7 +903,7 @@ def ingest_cvelist_v5(store: KnowledgeStore, src_dir: Path) -> str:
     if batch:
         store.conn.commit()
     log(
-        f"cvelist-v5: indexed {total} CVEs 2020-2026 "
+        f"cvelist-v5: indexed {total} CVEs 2020-{end_year} "
         f"(vector-queued={high_signal}, lexical-only={lexical_only}, rev {rev})"
     )
     return rev
@@ -920,18 +1007,36 @@ def run_embedding_pass(store: KnowledgeStore, batch_size: int = 512, checkpoint_
     t0 = time.perf_counter()
     done = 0
     since_save = 0
+    unsaved_ids: list[int] = []
 
     for batch in store.iter_unembedded_chunks(batch_size=batch_size):
-        ids = [cid for cid, _ in batch]
-        texts = [txt for _, txt in batch]
-        vecs = embedder.embed_documents(texts, batch_size=64)
-        vec_index.add(np.asarray(ids, dtype=np.uint64), vecs.astype(np.float16))
-        store.mark_chunks_embedded(ids)
-        done += len(ids)
-        since_save += len(ids)
+        already_in: list[int] = []
+        to_embed_ids: list[int] = []
+        to_embed_texts: list[str] = []
+        for cid, txt in batch:
+            if cid in vec_index:
+                already_in.append(cid)
+            else:
+                to_embed_ids.append(cid)
+                to_embed_texts.append(txt)
+
+        if already_in:
+            # Already persisted in kb.usearch from an earlier interrupted checkpoint.
+            store.mark_chunks_embedded(already_in)
+
+        if not to_embed_ids:
+            continue
+
+        vecs = embedder.embed_documents(to_embed_texts, batch_size=64)
+        vec_index.add(np.asarray(to_embed_ids, dtype=np.uint64), vecs.astype(np.float16))
+        unsaved_ids.extend(to_embed_ids)
+        done += len(to_embed_ids)
+        since_save += len(to_embed_ids)
         dirty_index = True
         if since_save >= checkpoint_every:
             store.save_vector_index_atomic(vec_index)
+            store.mark_chunks_embedded(unsaved_ids)
+            unsaved_ids.clear()
             if deleted_ids:
                 store.clear_deleted_vector_ids(deleted_ids)
                 deleted_ids = []
@@ -941,6 +1046,9 @@ def run_embedding_pass(store: KnowledgeStore, batch_size: int = 512, checkpoint_
 
     if dirty_index or not store.vec_path.exists():
         store.save_vector_index_atomic(vec_index)
+    if unsaved_ids:
+        store.mark_chunks_embedded(unsaved_ids)
+        unsaved_ids.clear()
     if deleted_ids:
         store.clear_deleted_vector_ids(deleted_ids)
 
@@ -963,11 +1071,20 @@ def main() -> None:
     parser.add_argument("--stats", action="store_true", help="Print current DB stats and exit")
     args = parser.parse_args()
 
+    want_sources = {s.strip().lower() for s in args.source if s.strip()}
+    if want_sources:
+        valid_sources = {name for name, _, _ in SOURCES}
+        unknown = sorted(want_sources - valid_sources)
+        if unknown:
+            parser.error(
+                f"Unknown --source value(s): {', '.join(unknown)}. "
+                f"Valid sources: {', '.join(sorted(valid_sources))}"
+            )
+
     data_dir = resolve_data_dir(args.data_dir)
-    store = KnowledgeStore(data_dir=data_dir)
+    store = KnowledgeStore(data_dir=data_dir, read_only=bool(args.stats and not args.ensure_schema))
     # Prefix with underscore so `go test ./...` at the repo root never walks cloned repos.
     src_dir = data_dir / "_sources"
-    src_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         if args.ensure_schema:
@@ -978,8 +1095,8 @@ def main() -> None:
             return
 
         if not args.embed_only:
+            src_dir.mkdir(parents=True, exist_ok=True)
             selected = []
-            want_sources = {s.strip().lower() for s in args.source if s.strip()}
             for name, phase, fn in SOURCES:
                 if want_sources:
                     if name in want_sources:
@@ -1001,6 +1118,8 @@ def main() -> None:
                     rev = fn(store, src_dir)
                     store.update_ingestion_state(name, phase, "done", revision=rev)
                 except Exception as exc:
+                    if store.conn.in_transaction:
+                        store.conn.rollback()
                     log(f"ERROR in {name}: {exc}")
                     store.update_ingestion_state(name, phase, "error", error=str(exc))
 

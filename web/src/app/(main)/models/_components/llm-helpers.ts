@@ -339,14 +339,40 @@ export function providerConnectionState(
   };
 }
 
+export type OllamaStatus = {
+  state: "connected" | "disconnected" | "error";
+  detail?: string;
+};
+
+function isDefaultLocalOllamaUrl(baseUrl?: string): boolean {
+  const raw = (baseUrl ?? "").trim().replace(/\/+$/, "").toLowerCase();
+  if (!raw) return true;
+  return (
+    raw === "http://127.0.0.1:11434" ||
+    raw === "http://127.0.0.1:11434/v1" ||
+    raw === "http://localhost:11434" ||
+    raw === "http://localhost:11434/v1"
+  );
+}
+
 export function healthOf(
   p: LLMProfile,
   m?: LLMPoolMember,
   oauthMap?: Map<string, OAuthProviderStatus>,
+  ollamaStatus?: OllamaStatus | null,
 ): Health {
   const oauthProv = oauthProviderOf(p.format);
   if (oauthProv) {
     const st = oauthMap?.get(oauthProv);
+    if (st?.state === "error" || (st?.last_error && !st.connected)) {
+      return {
+        state: "degraded",
+        label: t("Error"),
+        cls: "border-amber-500/50 text-amber-600 dark:text-amber-400",
+        dotCls: "bg-amber-500",
+        hint: st?.last_error || t("OAuth connection error"),
+      };
+    }
     if (!st?.connected) {
       return {
         state: "nokey",
@@ -356,7 +382,28 @@ export function healthOf(
         hint: st?.last_error || t("Sign in with OAuth to enable this profile"),
       };
     }
-  } else if (!p.api_key_hint && p.format !== "ollama") {
+  } else if (p.format === "ollama") {
+    if (ollamaStatus && isDefaultLocalOllamaUrl(p.base_url)) {
+      if (ollamaStatus.state === "error") {
+        return {
+          state: "degraded",
+          label: t("Error"),
+          cls: "border-amber-500/50 text-amber-600 dark:text-amber-400",
+          dotCls: "bg-amber-500",
+          hint: ollamaStatus.detail || t("Ollama error"),
+        };
+      }
+      if (ollamaStatus.state === "disconnected") {
+        return {
+          state: "nokey",
+          label: t("Disconnected"),
+          cls: "border-muted-foreground/40 text-muted-foreground",
+          dotCls: "bg-muted-foreground/60",
+          hint: ollamaStatus.detail || t("Ollama offline"),
+        };
+      }
+    }
+  } else if (!p.api_key_hint) {
     return {
       state: "nokey",
       label: t("No Key configured"),

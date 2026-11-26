@@ -22,6 +22,7 @@ type QueryInput struct {
 	System          []string
 	DynamicBoundary int
 	PromptCacheKey  string
+	SessionID       string
 	Messages        []llm.Message // conversation including the latest user turn
 	// SystemReminder, when non-empty, is prepended as the first message on each
 	// model call. It is not stored in conversation history — the host builds it
@@ -834,6 +835,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		Temperature:     l.in.Temperature,
 		ReasoningEffort: l.reasoningEffort(),
 		PromptCacheKey:  l.in.PromptCacheKey,
+		SessionID:       l.in.SessionID,
 	}
 	if l.in.NonStreaming {
 		return l.completeAndExecute(req)

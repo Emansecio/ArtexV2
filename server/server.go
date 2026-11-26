@@ -94,6 +94,7 @@ type Server struct {
 
 	modelCatalogMu         sync.Mutex
 	modelCatalogCache      map[string]cachedModelCatalog
+	modelCatalogGen        map[string]uint64
 	modelCatalogRefreshing map[string]bool
 	modelReg               *modelRegistry
 	modelsDevURL           string // test seam: override models.dev endpoint
@@ -329,6 +330,18 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
 		})
+		s.mcpPool.lookupFn = func(id int64) (*db.MCPServer, bool) {
+			list, err := m.pg.ListMCP()
+			if err != nil {
+				return nil, false
+			}
+			for _, srv := range list {
+				if srv.ID == id {
+					return srv, true
+				}
+			}
+			return nil, false
+		}
 		wireAgentAugmentWithPool(s.mcpPool, m.pg, s.skillDir, s.hostTools, s.execPriv, s.cachedAgentByKey) // wire visible skills/MCP + traffic/orchestration host tools into the agent toolset
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg, s.cachedAgentByKey) // built-in tools table: filter per agent + override description/schema + inject defaults
@@ -581,7 +594,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	}
 	newID, err := s.m.pg.SaveProfile(&db.LLMProfile{
 		ID: id, Name: "default", Format: format, Model: cfg.Model, BaseURL: cfg.BaseURL, Proxy: cfg.Proxy,
-		APIKey: cfg.APIKey, RatePerSecond: cfg.RatePerSecond, RatePerMinute: cfg.RatePerMinute,
+		APIKey: cfg.APIKey, ClearAPIKey: cfg.OAuthProvider() != "", RatePerSecond: cfg.RatePerSecond, RatePerMinute: cfg.RatePerMinute,
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey, UserAgent: userAgent,
@@ -1623,7 +1636,18 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.ContextWindowK = k
 	}
-	// Keyless formats (Ollama) need no key; the others keep/require one.
+	if cfg.OAuthProvider() != "" {
+		cfg.APIKey = ""
+		if strings.TrimSpace(cfg.BaseURL) != "" && !sameLLMEndpoint(cfg.Provider(), cfg.BaseURL, cfg.Provider(), "") {
+			writeErr(w, 400, "OAuth credentials are only sent to the canonical provider endpoint; custom base_url is not allowed")
+			return
+		}
+		if !s.attachOAuth(&cfg) {
+			writeErr(w, 400, "OAuth account is not signed in; click Sign in first")
+			return
+		}
+	}
+	// Keyless formats (Ollama, OAuth) need no static key; the others keep/require one.
 	// A saved key is only inherited when the endpoint matches the one it was
 	// saved for, so changing provider/base_url cannot rebind a write-only key.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
@@ -1652,56 +1676,94 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.invalidateProfileAgents()
-	if _, ok := s.loadLLMConfig(); !ok {
+	loadedCfg, ok := s.loadLLMConfig()
+	if !ok {
 		writeErr(w, 500, "saved provider is unavailable")
 		return
 	}
-	if err := s.applyLLM(cfg); err != nil {
+	if err := s.applyLLM(loadedCfg); err != nil {
 		writeErr(w, 400, "provider init failed: "+err.Error())
 		return
 	}
-	log.Printf("[engine] LLM configured via UI: %s / %s", cfg.Provider(), cfg.Model)
+	log.Printf("[engine] LLM configured via UI: %s / %s", loadedCfg.Provider(), loadedCfg.Model)
 	s.getLLM(w, r)
 }
 
 // testLLM makes a real minimal completion to verify the config works.
 func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider         string `json:"provider"`
-		Model            string `json:"model"`
-		BaseURL          string `json:"base_url"`
-		Proxy            string `json:"proxy"`
-		APIKey           string `json:"api_key"`
-		ThinkingType     string `json:"thinking_type"`
-		ReasoningEffort  string `json:"reasoning_effort"`
-		ProfileID        *int64 `json:"profile_id"`         // passed when testing a stored profile: if api_key is empty, its stored key is used
-		Streaming        *bool  `json:"streaming"`          // omitted = streaming, the same defaults as when saving a profile
-		SessionHeaderKey string `json:"session_header_key"` // non-empty = the test also sends this custom session header, with a one-off random session id as the value
-		UserAgent        string `json:"user_agent"`         // non-empty = the test overrides the User-Agent header with this value (mirrors production)
-		MaxTokensField   string `json:"max_tokens_field"`   // ""=max_tokens | "max_completion_tokens" (openai format only)
+		Provider         string  `json:"provider"`
+		Model            string  `json:"model"`
+		BaseURL          *string `json:"base_url"`
+		Proxy            *string `json:"proxy"`
+		APIKey           string  `json:"api_key"`
+		ThinkingType     *string `json:"thinking_type"`
+		ReasoningEffort  *string `json:"reasoning_effort"`
+		ProfileID        *int64  `json:"profile_id"`         // passed when testing a stored profile: if api_key is empty, its stored key is used
+		Streaming        *bool   `json:"streaming"`          // omitted = streaming, the same defaults as when saving a profile
+		SessionHeaderKey *string `json:"session_header_key"` // non-empty = the test also sends this custom session header, with a one-off random session id as the value
+		UserAgent        *string `json:"user_agent"`         // non-empty = the test overrides the User-Agent header with this value (mirrors production)
+		MaxTokensField   *string `json:"max_tokens_field"`   // ""=max_tokens | "max_completion_tokens" (openai format only)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	// A stored profile must be tested AS STORED: the list-view test button
-	// sends only profile_id, and ConfigFrom's defaults for an empty
-	// provider/base_url point at the canonical provider endpoint, sending this
-	// profile's key to the wrong host (the stored-key 401s). Fill whatever the
-	// form left empty from the row first; explicit form values still win.
+	// A stored profile must be tested AS STORED when fields are omitted (e.g.
+	// the list-view one-click test button sends only profile_id). When a field
+	// is explicitly sent (including ""), honor the form value so users can test
+	// cleared fields and quick-fixes before saving.
 	var stored *db.LLMProfile
 	if req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			stored = p
 		}
 	}
-	if isMaskedSecret(req.Proxy) { // the form echoes the masked proxy: test with the stored one
-		req.Proxy = ""
-		if stored == nil {
-			s.cfgMu.Lock()
-			req.Proxy = s.llmCfg.Proxy
-			s.cfgMu.Unlock()
+	var baseURL, proxy, thinkingType, reasoningEffort, sessionHeaderKey, userAgent, maxTokensField string
+	if req.BaseURL != nil {
+		baseURL = strings.TrimSpace(*req.BaseURL)
+	} else if stored != nil {
+		baseURL = stored.BaseURL
+	}
+	if req.Proxy != nil {
+		if isMaskedSecret(*req.Proxy) { // the form echoes the masked proxy: test with the stored one
+			if stored != nil {
+				proxy = stored.Proxy
+			} else {
+				s.cfgMu.Lock()
+				proxy = s.llmCfg.Proxy
+				s.cfgMu.Unlock()
+			}
+		} else {
+			proxy = strings.TrimSpace(*req.Proxy)
 		}
+	} else if stored != nil {
+		proxy = stored.Proxy
+	}
+	if req.ThinkingType != nil {
+		thinkingType = strings.TrimSpace(*req.ThinkingType)
+	} else if stored != nil {
+		thinkingType = stored.ThinkingType
+	}
+	if req.ReasoningEffort != nil {
+		reasoningEffort = strings.TrimSpace(*req.ReasoningEffort)
+	} else if stored != nil {
+		reasoningEffort = stored.ReasoningEffort
+	}
+	if req.SessionHeaderKey != nil {
+		sessionHeaderKey = strings.TrimSpace(*req.SessionHeaderKey)
+	} else if stored != nil {
+		sessionHeaderKey = strings.TrimSpace(stored.SessionHeaderKey)
+	}
+	if req.UserAgent != nil {
+		userAgent = strings.TrimSpace(*req.UserAgent)
+	} else if stored != nil {
+		userAgent = strings.TrimSpace(stored.UserAgent)
+	}
+	if req.MaxTokensField != nil {
+		maxTokensField = strings.TrimSpace(*req.MaxTokensField)
+	} else if stored != nil {
+		maxTokensField = stored.MaxTokensField
 	}
 	if stored != nil {
 		if strings.TrimSpace(req.Provider) == "" {
@@ -1710,36 +1772,18 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(req.Model) == "" {
 			req.Model = stored.Model
 		}
-		if strings.TrimSpace(req.BaseURL) == "" {
-			req.BaseURL = stored.BaseURL
-		}
-		if strings.TrimSpace(req.Proxy) == "" {
-			req.Proxy = stored.Proxy
-		}
 		if req.Streaming == nil {
 			st := stored.Streaming
 			req.Streaming = &st
 		}
-		if strings.TrimSpace(req.ThinkingType) == "" {
-			req.ThinkingType = stored.ThinkingType
-		}
-		if strings.TrimSpace(req.ReasoningEffort) == "" {
-			req.ReasoningEffort = stored.ReasoningEffort
-		}
 	}
-	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	cfg := agent.ConfigFrom(req.Provider, req.Model, baseURL, req.APIKey, proxy)
 	// mirror production: send the SAME thinking params so a provider that rejects the
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
-	cfg.ThinkingType = req.ThinkingType
-	cfg.ReasoningEffort = req.ReasoningEffort
-	if req.Provider == "openai" {
-		mtf := strings.TrimSpace(req.MaxTokensField)
-		if mtf == "" && stored != nil {
-			mtf = stored.MaxTokensField
-		}
-		if mtf == llm.MaxTokensFieldCompletion {
-			cfg.MaxTokensField = mtf
-		}
+	cfg.ThinkingType = thinkingType
+	cfg.ReasoningEffort = reasoningEffort
+	if req.Provider == "openai" && maxTokensField == llm.MaxTokensFieldCompletion {
+		cfg.MaxTokensField = maxTokensField
 	}
 	// Likewise, the streaming mode follows that profile's choice: endpoints supporting only one of the two channels must fail
 	// here already, instead of discovering mid-conversation that "the profile that passed the test cannot run at all".
@@ -1749,18 +1793,10 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// The custom session header name follows that profile too: when non-empty, the test request also sends it (value is a one-off random session id,
 	// see TestConnection). Endpoints like opencode zen that mandate x-opencode-session return
 	// 400 without it, so the test path must send it too — otherwise "chat works, test 400s".
-	cfg.SessionHeaderKey = req.SessionHeaderKey
-	// The custom session header name follows that profile regardless of format:
-	// when the form omits it, the stored profile's value is the fallback.
-	if stored != nil && cfg.SessionHeaderKey == "" {
-		cfg.SessionHeaderKey = strings.TrimSpace(stored.SessionHeaderKey)
-	}
+	cfg.SessionHeaderKey = sessionHeaderKey
 	// The custom User-Agent follows the profile too, so the test request uses the
 	// exact UA a real conversation would; the form value wins, else the stored one.
-	cfg.UserAgent = strings.TrimSpace(req.UserAgent)
-	if stored != nil && cfg.UserAgent == "" {
-		cfg.UserAgent = strings.TrimSpace(stored.UserAgent)
-	}
+	cfg.UserAgent = userAgent
 	// Same rule as saving a profile: a value with control characters or over the
 	// length cap never reaches the wire, not even from the test button.
 	ua, err := agent.ValidateUserAgent(cfg.UserAgent)
@@ -1770,7 +1806,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg.UserAgent = ua
 	if cfg.OAuthProvider() != "" {
-		if strings.TrimSpace(req.BaseURL) != "" && !sameLLMEndpoint(req.Provider, req.BaseURL, req.Provider, "") {
+		if baseURL != "" && !sameLLMEndpoint(req.Provider, baseURL, req.Provider, "") {
 			writeJSON(w, 200, map[string]any{"ok": false, "error": "OAuth credentials are only sent to the canonical provider endpoint; custom base_url is not allowed"})
 			return
 		}
@@ -1779,8 +1815,10 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Keyless formats (Ollama, OAuth) skip the static key resolution entirely.
-	if cfg.NeedsAPIKey() {
+	// Non-OAuth formats (including authenticated Ollama gateways) resolve any
+	// saved static key bound to the same endpoint; keyless formats such as
+	// Ollama simply proceed without error when no key is configured.
+	if cfg.OAuthProvider() == "" {
 		// API key resolution precedence: form input > the named profile's stored key > the global config's key.
 		// A stored profile's key is never sent back to the browser, so the form is empty when testing a stored profile and the key comes from the DB.
 		// A saved key is only sent to the endpoint it was saved for: base_url and
@@ -1788,7 +1826,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		// the saved key to any host typed into the form.
 		withheld := false
 		if stored != nil && cfg.APIKey == "" {
-			if sameLLMEndpoint(req.Provider, req.BaseURL, stored.Format, stored.BaseURL) {
+			if sameLLMEndpoint(req.Provider, baseURL, stored.Format, stored.BaseURL) {
 				// Trim like ConfigFrom does for form values: a key stored with
 				// surrounding whitespace runs fine in conversations (the runtime
 				// path re-trims) but would be sent raw here and fail auth.
@@ -1802,14 +1840,14 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 			global := s.llmCfg
 			s.cfgMu.Unlock()
 			if global.APIKey != "" {
-				if sameLLMEndpoint(req.Provider, req.BaseURL, global.Provider(), global.BaseURL) {
+				if sameLLMEndpoint(req.Provider, baseURL, global.Provider(), global.BaseURL) {
 					cfg.APIKey = global.APIKey
 				} else {
 					withheld = true
 				}
 			}
 		}
-		if cfg.APIKey == "" {
+		if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 			msg := "no API key provided"
 			if withheld {
 				msg = "no API key provided: the saved key is only sent to the endpoint it was saved for; enter the key to test a different base URL or provider"

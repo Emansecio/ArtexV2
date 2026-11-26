@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -79,6 +80,20 @@ func updateMCPHealthThrottled(pg *db.DB, id int64, healthy bool, errMsg string) 
 	mcpHealthCache[id] = mcpHealthStamp{healthy: healthy, errMsg: errMsg, at: now}
 	mcpHealthMu.Unlock()
 	_ = pg.UpdateMCPHealth(id, healthy, errMsg)
+}
+
+func updateMCPHealthImmediate(pg *db.DB, id int64, healthy bool, errMsg string) {
+	now := time.Now()
+	mcpHealthMu.Lock()
+	mcpHealthCache[id] = mcpHealthStamp{healthy: healthy, errMsg: errMsg, at: now}
+	mcpHealthMu.Unlock()
+	_ = pg.UpdateMCPHealth(id, healthy, errMsg)
+}
+
+func invalidateMCPHealthCache(id int64) {
+	mcpHealthMu.Lock()
+	delete(mcpHealthCache, id)
+	mcpHealthMu.Unlock()
 }
 
 func listToolsCached(pg *db.DB) ([]cachedToolRow, error) {
@@ -214,6 +229,10 @@ func wireAgentAugmentWithPool(pool *mcpPool, pg *db.DB, skillDir string, hostToo
 			for _, res := range results {
 				m := res.target.m
 				if res.err != nil {
+					if ctx.Err() != nil && errors.Is(res.err, ctx.Err()) {
+						log.Printf("[mcp] %s canceled: %v", m.Name, res.err)
+						continue
+					}
 					log.Printf("[mcp] %s failed: %v", m.Name, res.err)
 					updateMCPHealthThrottled(pg, m.ID, false, res.err.Error())
 					continue

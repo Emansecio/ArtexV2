@@ -203,8 +203,8 @@ func injectDefaults(in json.RawMessage, defs map[string]json.RawMessage) json.Ra
 	}
 	m := map[string]json.RawMessage{}
 	if len(in) > 0 {
-		if err := json.Unmarshal(in, &m); err != nil {
-			return in // non-object input: don't touch it
+		if err := json.Unmarshal(in, &m); err != nil || m == nil {
+			return in // non-object (or JSON null) input: don't touch it
 		}
 	}
 	changed := false

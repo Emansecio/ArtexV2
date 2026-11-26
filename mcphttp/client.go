@@ -50,6 +50,7 @@ type rpcRequest struct {
 type rpcResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      int             `json:"id"`
+	Method  string          `json:"method,omitempty"`
 	Result  json.RawMessage `json:"result"`
 	Error   *rpcError       `json:"error"`
 }
@@ -77,6 +78,11 @@ type Client struct {
 	// after initialization, and the offered version already travels in the
 	// initialize body.
 	initialized bool
+	// sessionExpired is set when the server returns HTTP 404 for an active
+	// session so concurrent callers fail fast with a session-expired error
+	// instead of issuing headerless POSTs that servers reject with HTTP 400.
+	sessionExpired bool
+	closed         bool
 
 	// legacySSE is the pre-2025 MCP SSE transport used by servers such as GSL5.
 	legacySSE    bool
@@ -86,7 +92,7 @@ type Client struct {
 	streamDone   chan struct{}
 	pendingMu    sync.Mutex
 	pending      map[int]chan *rpcResponse
-	streamErr    chan error
+	streamErr    error
 	protocol     string
 }
 
@@ -162,6 +168,36 @@ func parseMCPURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+// insecureTransport returns an *http.Transport with TLS verification disabled
+// while preserving DefaultTransport's proxy, dial timeout/keepalive, TLS
+// handshake timeout, HTTP/2, and idle-connection settings.
+func insecureTransport() *http.Transport {
+	var tr *http.Transport
+	if def, ok := http.DefaultTransport.(*http.Transport); ok && def != nil {
+		tr = def.Clone()
+	} else {
+		tr = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+	if tr.TLSClientConfig == nil {
+		tr.TLSClientConfig = &tls.Config{}
+	} else {
+		tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+	}
+	tr.TLSClientConfig.InsecureSkipVerify = true
+	return tr
+}
+
 // New connects to a remote MCP endpoint and performs the initialize handshake.
 // headers are sent on every request (Authorization, custom API keys, …).
 // When insecure is true, TLS certificate verification is skipped so servers that
@@ -184,7 +220,7 @@ func New(ctx context.Context, server, url string, headers map[string]string, ins
 	}
 	hc := &http.Client{Timeout: timeout, CheckRedirect: redirectPolicy(base)}
 	if insecure {
-		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		hc.Transport = insecureTransport()
 	}
 	c := &Client{
 		server:   server,
@@ -213,11 +249,15 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 	}
 	hc := &http.Client{CheckRedirect: redirectPolicy(base)} // the SSE stream is intentionally long-lived.
 	if insecure {
-		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		hc.Transport = insecureTransport()
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
+	// Respect caller ctx during initial connect + endpoint discovery + initialize;
+	// detach once connected so the long-lived SSE stream survives after handshake.
+	stopHandshakeCancel := context.AfterFunc(ctx, cancel)
 	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, sseURL, nil)
 	if err != nil {
+		stopHandshakeCancel()
 		cancel()
 		return nil, err
 	}
@@ -227,18 +267,22 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		stopHandshakeCancel()
 		cancel()
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
+		stopHandshakeCancel()
 		cancel()
 		return nil, fmt.Errorf("mcp sse http %d: %s", resp.StatusCode, readSnippet(resp.Body))
 	}
-	reader := bufio.NewReader(resp.Body)
-	endpoint, err := readSSEEndpoint(reader, base)
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64*1024), mcpMaxRPCBytes)
+	endpoint, err := readSSEEndpoint(sc, base)
 	if err != nil {
 		resp.Body.Close()
+		stopHandshakeCancel()
 		cancel()
 		return nil, err
 	}
@@ -253,13 +297,18 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 		streamCancel: cancel,
 		streamDone:   make(chan struct{}),
 		pending:      make(map[int]chan *rpcResponse),
-		streamErr:    make(chan error, 1),
 		protocol:     legacySSEProtocolVersion,
 	}
-	go c.readLegacySSE(reader)
+	go c.readLegacySSE(sc)
 	if err := c.initialize(ctx); err != nil {
+		stopHandshakeCancel()
 		_ = c.Close()
 		return nil, err
+	}
+	if !stopHandshakeCancel() {
+		// Handshake ctx expired right as initialize finished; streamCtx was cancelled.
+		_ = c.Close()
+		return nil, ctx.Err()
 	}
 	return c, nil
 }
@@ -268,19 +317,13 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 // endpoint must stay on the origin of the configured SSE URL: the POSTs that
 // follow carry the operator's headers, and a remote server must not be able to
 // retarget them.
-func readSSEEndpoint(r *bufio.Reader, base *url.URL) (string, error) {
-	for {
-		line, err := r.ReadString('\n')
-		if err != nil {
-			return "", fmt.Errorf("mcp sse endpoint: %w", err)
-		}
-		line = strings.TrimRight(line, "\r\n")
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		candidate := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+func readSSEEndpoint(sc *bufio.Scanner, base *url.URL) (string, error) {
+	eventType := ""
+	var dataBuf strings.Builder
+	resolveCandidate := func(candidate string) (string, error) {
+		candidate = strings.TrimSpace(candidate)
 		if candidate == "" {
-			continue
+			return "", nil
 		}
 		u, err := url.Parse(candidate)
 		if err != nil {
@@ -298,28 +341,80 @@ func readSSEEndpoint(r *bufio.Reader, base *url.URL) (string, error) {
 		}
 		return abs.String(), nil
 	}
-}
-
-func (c *Client) readLegacySSE(r *bufio.Reader) {
-	defer close(c.streamDone)
-	for {
-		line, err := r.ReadString('\n')
-		if err != nil {
-			if !errors.Is(err, context.Canceled) {
-				select {
-				case c.streamErr <- err:
-				default:
+	for sc.Scan() {
+		line := strings.TrimRight(sc.Text(), "\r")
+		if line == "" {
+			if dataBuf.Len() > 0 && (eventType == "" || eventType == "endpoint") {
+				if ep, err := resolveCandidate(dataBuf.String()); err != nil || ep != "" {
+					return ep, err
 				}
 			}
+			eventType = ""
+			dataBuf.Reset()
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			if eventType != "" && eventType != "endpoint" {
+				continue
+			}
+			val := strings.TrimPrefix(line, "data:")
+			val = strings.TrimPrefix(val, " ")
+			if dataBuf.Len() > 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(val)
+			if dataBuf.Len() > mcpMaxRPCBytes {
+				return "", fmt.Errorf("mcp sse endpoint payload exceeds %d bytes", mcpMaxRPCBytes)
+			}
+		}
+	}
+	if dataBuf.Len() > 0 && (eventType == "" || eventType == "endpoint") {
+		if ep, err := resolveCandidate(dataBuf.String()); err != nil || ep != "" {
+			return ep, err
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("mcp sse endpoint: %w", err)
+	}
+	return "", fmt.Errorf("mcp sse endpoint: %w", io.EOF)
+}
+
+func (c *Client) readLegacySSE(sc *bufio.Scanner) {
+	var err error
+	defer func() {
+		if err == nil {
+			err = io.EOF
+		} else if errors.Is(err, context.Canceled) {
+			err = errors.New("connection closed")
+		}
+		c.pendingMu.Lock()
+		c.streamErr = err
+		c.pendingMu.Unlock()
+		close(c.streamDone)
+	}()
+	eventType := ""
+	var dataBuf strings.Builder
+	flush := func() {
+		defer func() {
+			eventType = ""
+			dataBuf.Reset()
+		}()
+		if dataBuf.Len() == 0 {
 			return
 		}
-		line = strings.TrimRight(line, "\r\n")
-		if !strings.HasPrefix(line, "data:") {
-			continue
+		if eventType != "" && eventType != "message" {
+			return
 		}
 		var response rpcResponse
-		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &response); err != nil || response.ID == 0 {
-			continue
+		if uerr := json.Unmarshal([]byte(strings.TrimSpace(dataBuf.String())), &response); uerr != nil || response.ID == 0 || response.Method != "" {
+			return
 		}
 		c.pendingMu.Lock()
 		ch := c.pending[response.ID]
@@ -329,6 +424,44 @@ func (c *Client) readLegacySSE(r *bufio.Reader) {
 			ch <- &response
 		}
 	}
+	for sc.Scan() {
+		line := strings.TrimRight(sc.Text(), "\r")
+		if line == "" {
+			flush()
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			val := strings.TrimPrefix(line, "data:")
+			val = strings.TrimPrefix(val, " ")
+			if dataBuf.Len() > 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(val)
+			if dataBuf.Len() > mcpMaxRPCBytes {
+				err = fmt.Errorf("sse payload exceeds %d bytes", mcpMaxRPCBytes)
+				return
+			}
+		}
+	}
+	flush()
+	err = sc.Err()
+}
+
+func (c *Client) getStreamErr() error {
+	c.pendingMu.Lock()
+	err := c.streamErr
+	c.pendingMu.Unlock()
+	if err == nil {
+		return io.EOF
+	}
+	return err
 }
 
 func (c *Client) initialize(ctx context.Context) error {
@@ -359,6 +492,7 @@ func (c *Client) initialize(ctx context.Context) error {
 			c.protocol = negotiated.ProtocolVersion
 		}
 		c.initialized = true
+		c.sessionExpired = false
 		c.mu.Unlock()
 		return c.notify(ctx, "notifications/initialized", map[string]any{})
 	}
@@ -375,21 +509,37 @@ func isUnsupportedVersion(err error) bool {
 		strings.Contains(msg, "unsupported_protocol_version")
 }
 
-// Tools lists the server's tools and adapts them to CoreTools.
+// Tools lists the server's tools (following MCP nextCursor pagination when
+// present) and adapts them to CoreTools.
 func (c *Client) Tools(ctx context.Context) ([]actool.CoreTool, error) {
-	raw, err := c.call(ctx, "tools/list", map[string]any{})
-	if err != nil {
-		return nil, err
-	}
-	var res struct {
-		Tools []remoteTool `json:"tools"`
-	}
-	if err := json.Unmarshal(raw, &res); err != nil {
-		return nil, err
-	}
-	out := make([]actool.CoreTool, 0, len(res.Tools))
-	for _, rt := range res.Tools {
-		out = append(out, c.wrap(rt))
+	const maxPages = 20
+	var out []actool.CoreTool
+	cursor := ""
+	seenCursors := map[string]bool{}
+	for page := 0; page < maxPages; page++ {
+		params := map[string]any{}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		raw, err := c.call(ctx, "tools/list", params)
+		if err != nil {
+			return nil, err
+		}
+		var res struct {
+			Tools      []remoteTool `json:"tools"`
+			NextCursor string       `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return nil, err
+		}
+		for _, rt := range res.Tools {
+			out = append(out, c.wrap(rt))
+		}
+		if res.NextCursor == "" || seenCursors[res.NextCursor] {
+			break
+		}
+		seenCursors[res.NextCursor] = true
+		cursor = res.NextCursor
 	}
 	return out, nil
 }
@@ -423,33 +573,22 @@ func (c *Client) wrap(rt remoteTool) actool.CoreTool {
 			if len(in) > 0 {
 				_ = json.Unmarshal(in, &args)
 			}
+			if args == nil {
+				args = map[string]any{}
+			}
 			raw, err := c.call(ctx, "tools/call", map[string]any{"name": rt.Name, "arguments": args})
 			if err != nil {
 				return actool.Errorf("Error: " + err.Error()), nil
 			}
-			var res struct {
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
-				IsError bool `json:"isError"`
-			}
-			if err := json.Unmarshal(raw, &res); err != nil {
+			text, isErr, err := formatMCPToolResult(raw, mcpMaxRPCBytes)
+			if err != nil {
 				return actool.Errorf("Error: bad MCP response: " + err.Error()), nil
 			}
-			var b strings.Builder
-			for _, blk := range res.Content {
-				b.WriteString(blk.Text)
-				if b.Len() > mcpMaxRPCBytes {
-					break
-				}
-			}
-			text := b.String()
 			// Consistent with built-in/custom tools: oversized output goes through Capture —
 			// truncated at the session's MaxOutputChars (default 30000), and when
 			// ToolOutputDir is configured the full output spills to disk leaving only the
 			// head + pointer, so a large MCP result does not flood the context whole.
-			return actool.Result{Content: []llm.ContentBlock{llm.TextBlock(actool.Capture(tc, text))}, IsError: res.IsError}, nil
+			return actool.Result{Content: []llm.ContentBlock{llm.TextBlock(actool.Capture(tc, text))}, IsError: isErr}, nil
 		},
 	}
 	if readOnly {
@@ -461,6 +600,101 @@ func (c *Client) wrap(rt remoteTool) actool.CoreTool {
 	return actool.Build(spec)
 }
 
+func formatMCPToolResult(raw json.RawMessage, maxBytes int) (string, bool, error) {
+	var res struct {
+		Content []struct {
+			Type        string `json:"type"`
+			Text        string `json:"text"`
+			MimeType    string `json:"mimeType"`
+			URI         string `json:"uri"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Resource    *struct {
+				URI      string `json:"uri"`
+				MimeType string `json:"mimeType"`
+				Text     string `json:"text"`
+				Blob     string `json:"blob"`
+			} `json:"resource"`
+		} `json:"content"`
+		StructuredContent json.RawMessage `json:"structuredContent"`
+		IsError           bool            `json:"isError"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return "", false, err
+	}
+	var b strings.Builder
+	for _, blk := range res.Content {
+		var part string
+		switch blk.Type {
+		case "", "text":
+			part = blk.Text
+		case "image":
+			if blk.MimeType != "" {
+				part = fmt.Sprintf("[image: %s]", blk.MimeType)
+			} else {
+				part = "[image]"
+			}
+		case "audio":
+			if blk.MimeType != "" {
+				part = fmt.Sprintf("[audio: %s]", blk.MimeType)
+			} else {
+				part = "[audio]"
+			}
+		case "resource":
+			if blk.Resource != nil {
+				if blk.Resource.Text != "" {
+					part = blk.Resource.Text
+				} else if blk.Resource.URI != "" {
+					if blk.Resource.MimeType != "" {
+						part = fmt.Sprintf("[resource: %s (%s)]", blk.Resource.URI, blk.Resource.MimeType)
+					} else {
+						part = fmt.Sprintf("[resource: %s]", blk.Resource.URI)
+					}
+				} else if blk.Resource.Blob != "" {
+					if blk.Resource.MimeType != "" {
+						part = fmt.Sprintf("[resource: %s]", blk.Resource.MimeType)
+					} else {
+						part = "[resource: binary]"
+					}
+				}
+			}
+		case "resource_link":
+			if blk.URI != "" {
+				label := blk.URI
+				if blk.Name != "" {
+					label = fmt.Sprintf("%s (%s)", blk.Name, blk.URI)
+				}
+				if blk.Description != "" {
+					label += ": " + blk.Description
+				}
+				part = "[resource_link: " + label + "]"
+			}
+		default:
+			part = blk.Text
+		}
+		if part == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(part)
+		if maxBytes > 0 && b.Len() > maxBytes {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		trimmed := bytes.TrimSpace(res.StructuredContent)
+		if len(trimmed) > 0 && string(trimmed) != "null" {
+			if maxBytes > 0 && len(trimmed) > maxBytes {
+				trimmed = trimmed[:maxBytes]
+			}
+			b.Write(trimmed)
+		}
+	}
+	return b.String(), res.IsError, nil
+}
+
 // Call invokes one tool and returns the concatenated text of its content blocks
 // (ScopeSentry answers with a single JSON text block). Unlike the CoreTool wrapper
 // from Tools(), this bypasses the agent permission (AskUser) layer — it is meant
@@ -470,29 +704,50 @@ func (c *Client) Call(ctx context.Context, tool string, args any) (string, error
 	if err != nil {
 		return "", err
 	}
-	var res struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-		IsError bool `json:"isError"`
-	}
-	if err := json.Unmarshal(raw, &res); err != nil {
+	text, isErr, err := formatMCPToolResult(raw, mcpMaxRPCBytes)
+	if err != nil {
 		return "", fmt.Errorf("bad MCP response: %w", err)
 	}
-	var text strings.Builder
-	for _, blk := range res.Content {
-		text.WriteString(blk.Text)
+	if isErr {
+		return text, fmt.Errorf("mcp tool %q error: %s", tool, text)
 	}
-	if res.IsError {
-		return text.String(), fmt.Errorf("mcp tool %q error: %s", tool, text.String())
+	return text, nil
+}
+
+// Alive reports whether the underlying transport/session is still usable.
+func (c *Client) Alive() bool {
+	if c == nil {
+		return false
 	}
-	return text.String(), nil
+	if c.legacySSE {
+		if c.streamDone == nil {
+			return false
+		}
+		select {
+		case <-c.streamDone:
+			return false
+		default:
+			return true
+		}
+	}
+	c.mu.Lock()
+	alive := !c.closed && !c.sessionExpired
+	c.mu.Unlock()
+	return alive
 }
 
 // Close terminates the MCP session best-effort (DELETE with the session id, per the
 // Streamable HTTP spec). Servers that don't track sessions simply ignore it.
 func (c *Client) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	sid := c.sessionID
+	c.mu.Unlock()
+	defer func() {
+		if c.http != nil && c.http.Transport != nil {
+			c.http.CloseIdleConnections()
+		}
+	}()
 	if c.legacySSE {
 		if c.streamCancel != nil {
 			c.streamCancel()
@@ -506,13 +761,12 @@ func (c *Client) Close() error {
 		}
 		return nil
 	}
-	c.mu.Lock()
-	sid := c.sessionID
-	c.mu.Unlock()
 	if sid == "" {
 		return nil
 	}
-	req, err := http.NewRequest(http.MethodDelete, c.url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.url, nil)
 	if err != nil {
 		return nil
 	}
@@ -558,6 +812,14 @@ func (c *Client) roundTrip(ctx context.Context, body rpcRequest, expectResp bool
 	if c.legacySSE {
 		return c.legacyRoundTrip(ctx, body, expectResp)
 	}
+	c.mu.Lock()
+	expired := c.sessionExpired
+	sid := c.sessionID
+	initialized, version := c.initialized, c.protocol
+	c.mu.Unlock()
+	if expired && body.Method != "initialize" {
+		return nil, fmt.Errorf("mcp http 404: session expired: session previously invalidated")
+	}
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -568,10 +830,6 @@ func (c *Client) roundTrip(ctx context.Context, body rpcRequest, expectResp bool
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	c.mu.Lock()
-	sid := c.sessionID
-	initialized, version := c.initialized, c.protocol
-	c.mu.Unlock()
 	if initialized && version != "" {
 		req.Header.Set("MCP-Protocol-Version", version)
 	}
@@ -593,10 +851,21 @@ func (c *Client) roundTrip(ctx context.Context, body rpcRequest, expectResp bool
 		if got := resp.Header.Get("Mcp-Session-Id"); got != "" {
 			c.mu.Lock()
 			c.sessionID = got
+			c.sessionExpired = false
 			c.mu.Unlock()
 		}
 	}
 
+	if resp.StatusCode == http.StatusNotFound && sid != "" {
+		c.mu.Lock()
+		if c.sessionID == sid {
+			c.sessionID = ""
+			c.initialized = false
+			c.sessionExpired = true
+		}
+		c.mu.Unlock()
+		return nil, fmt.Errorf("mcp http 404: session expired: %s", readSnippet(resp.Body))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("mcp http %d: %s", resp.StatusCode, readSnippet(resp.Body))
 	}
@@ -633,6 +902,11 @@ func decodeRPC(r io.Reader) (*rpcResponse, error) {
 // Calls run concurrently: the shared reader demultiplexes responses to callers
 // by JSON-RPC ID through c.pending, so serializing the POSTs is unnecessary.
 func (c *Client) legacyRoundTrip(ctx context.Context, body rpcRequest, expectResp bool) (*rpcResponse, error) {
+	select {
+	case <-c.streamDone:
+		return nil, fmt.Errorf("mcp sse stream: %w", c.getStreamErr())
+	default:
+	}
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -662,22 +936,29 @@ func (c *Client) legacyRoundTrip(ctx context.Context, body rpcRequest, expectRes
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		// Drain so the connection stays eligible for HTTP/1.1 keep-alive reuse.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("mcp sse http %d: %s", resp.StatusCode, readSnippet(resp.Body))
+		snippet := readSnippet(resp.Body)
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("mcp sse http %d: %s", resp.StatusCode, snippet)
 	}
+	// Drain and close immediately so the HTTP/1.1 connection returns to the
+	// keep-alive pool instead of remaining pinned open while waiting for the
+	// asynchronous JSON-RPC response on the SSE stream.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
 	if !expectResp {
 		return nil, nil
 	}
 	select {
 	case response := <-responseCh:
 		return response, nil
-	case err := <-c.streamErr:
-		return nil, fmt.Errorf("mcp sse stream: %w", err)
+	case <-c.streamDone:
+		select {
+		case response := <-responseCh:
+			return response, nil
+		default:
+		}
+		return nil, fmt.Errorf("mcp sse stream: %w", c.getStreamErr())
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -699,7 +980,7 @@ func parseSSE(r io.Reader, wantID int) (*rpcResponse, error) {
 		if err := json.Unmarshal([]byte(payload), &out); err != nil {
 			return nil, false
 		}
-		if out.ID != wantID {
+		if out.ID != wantID || out.Method != "" {
 			return nil, false
 		}
 		return &out, true

@@ -342,7 +342,7 @@ func builtinsDigest() string {
 	h := sha256.New()
 	h.Write([]byte("builtins-v2\n"))
 	fmt.Fprintf(h, "browser:%s|%s\n", browserMCPCommand, browserMCPSeedArgs)
-	fmt.Fprintf(h, "secrag:%s|%s|%s\n", secragMCPName, secragMCPCommand, secragMCPSeedSetting)
+	fmt.Fprintf(h, "secrag:%s|%s|%s|%s\n", secragMCPName, secragMCPCommand, secragMCPSeedSetting, secragMCPAutoVisSeedV2)
 	for _, a := range builtinAgents {
 		fmt.Fprintf(h, "%s|%s|%s|%s|%v|%v\n", a.key, a.name, a.role, a.desc, a.interactiveShell, a.runSeconds != nil)
 		if a.runSeconds != nil {
@@ -520,7 +520,7 @@ ON CONFLICT DO NOTHING`, r.kind, r.pattern, r.note); err != nil {
 // that MCP is enabled/configured.
 var builtinSkillVisibility = map[string][]string{
 	"api-recon":   {"auto", "pentest", "worker"},
-	"cybersec-kb": {"mainagent", "planner", "worker", "pentest", "retester"},
+	"cybersec-kb": {"mainagent", "planner", "worker", "auto", "pentest", "retester"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default

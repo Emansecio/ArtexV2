@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -34,14 +33,153 @@ type pooledMCPEntry struct {
 	client      mcpClient
 	tools       []actool.CoreTool
 	toolsAt     time.Time
-	lastUsed    atomic.Int64
-	inFlight    atomic.Int64
+
+	mu       sync.Mutex
+	lastUsed int64
+	inFlight int64
+	closed   bool
+
+	closeOnce sync.Once
 }
 
 func (e *pooledMCPEntry) touch() {
-	if e != nil {
-		e.lastUsed.Store(time.Now().UnixNano())
+	if e == nil {
+		return
 	}
+	e.mu.Lock()
+	e.lastUsed = time.Now().UnixNano()
+	e.mu.Unlock()
+}
+
+func (e *pooledMCPEntry) setLastUsedForTest(ts int64) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	e.lastUsed = ts
+	e.mu.Unlock()
+}
+
+func (e *pooledMCPEntry) isClosed() bool {
+	if e == nil {
+		return true
+	}
+	e.mu.Lock()
+	c := e.closed
+	e.mu.Unlock()
+	return c
+}
+
+func (e *pooledMCPEntry) markClosed() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	e.closed = true
+	e.mu.Unlock()
+}
+
+// beginCall atomically checks that the entry is still open and increments
+// inFlight, eliminating any race window with reapIdle.
+func (e *pooledMCPEntry) beginCall() bool {
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return false
+	}
+	e.inFlight++
+	e.lastUsed = time.Now().UnixNano()
+	e.mu.Unlock()
+	return true
+}
+
+func (e *pooledMCPEntry) endCall() {
+	e.endCallTouch(true)
+}
+
+func (e *pooledMCPEntry) endCallTouch(updateLastUsed bool) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	if e.inFlight > 0 {
+		e.inFlight--
+	}
+	if updateLastUsed && !e.closed {
+		e.lastUsed = time.Now().UnixNano()
+	}
+	e.mu.Unlock()
+}
+
+func (e *pooledMCPEntry) inFlightCount() int64 {
+	if e == nil {
+		return 0
+	}
+	e.mu.Lock()
+	n := e.inFlight
+	e.mu.Unlock()
+	return n
+}
+
+func (e *pooledMCPEntry) clientAlive() bool {
+	if e == nil {
+		return false
+	}
+	if e.client == nil {
+		return true
+	}
+	if ac, ok := e.client.(interface{ Alive() bool }); ok {
+		return ac.Alive()
+	}
+	return true
+}
+
+// tryEvictDead atomically marks a dead entry closed if it has no in-flight calls.
+func (e *pooledMCPEntry) tryEvictDead() bool {
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	if e.closed || e.inFlight > 0 {
+		e.mu.Unlock()
+		return false
+	}
+	e.closed = true
+	e.mu.Unlock()
+	return true
+}
+
+// tryEvictIdle atomically marks the entry closed if it has no in-flight calls
+// and has been idle since before cutoff.
+func (e *pooledMCPEntry) tryEvictIdle(cutoff int64) bool {
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	if e.closed || e.inFlight > 0 || e.lastUsed == 0 || e.lastUsed >= cutoff {
+		e.mu.Unlock()
+		return false
+	}
+	e.closed = true
+	e.mu.Unlock()
+	return true
+}
+
+func (e *pooledMCPEntry) closeClient() error {
+	if e == nil {
+		return nil
+	}
+	e.markClosed()
+	var err error
+	e.closeOnce.Do(func() {
+		if e.client != nil {
+			err = e.client.Close()
+		}
+	})
+	return err
 }
 
 func mcpIdleTTL() time.Duration {
@@ -63,10 +201,14 @@ func mcpIdleTTL() time.Duration {
 // warm across agent runs so planner rounds, workers, and chat turns do not pay
 // process-spawn + initialize + tools/list + teardown on every single turn.
 type mcpPool struct {
-	ctx     context.Context
-	mu      sync.Mutex
-	entries map[int64]*pooledMCPEntry
-	sf      singleflight.Group
+	ctx       context.Context
+	mu        sync.Mutex
+	entries   map[int64]*pooledMCPEntry
+	gen       map[int64]uint64
+	closed    bool
+	sf        singleflight.Group
+	connectFn func(context.Context, *db.MCPServer, ExecPrivilege) (mcpClient, error)
+	lookupFn  func(id int64) (*db.MCPServer, bool)
 }
 
 func newMCPPool(ctx context.Context) *mcpPool {
@@ -74,8 +216,10 @@ func newMCPPool(ctx context.Context) *mcpPool {
 		ctx = context.Background()
 	}
 	p := &mcpPool{
-		ctx:     ctx,
-		entries: map[int64]*pooledMCPEntry{},
+		ctx:       ctx,
+		entries:   map[int64]*pooledMCPEntry{},
+		gen:       map[int64]uint64{},
+		connectFn: connectMCP,
 	}
 	if ttl := mcpIdleTTL(); ttl > 0 {
 		interval := ttl
@@ -109,26 +253,35 @@ func (p *mcpPool) reapIdle(ttl time.Duration) {
 			delete(p.entries, id)
 			continue
 		}
-		if ent.inFlight.Load() > 0 {
-			continue
-		}
-		if last := ent.lastUsed.Load(); last > 0 && last < cutoff {
+		if ent.tryEvictIdle(cutoff) || (!ent.clientAlive() && ent.tryEvictDead()) {
 			stale = append(stale, ent)
 			delete(p.entries, id)
 		}
 	}
 	p.mu.Unlock()
 	for _, ent := range stale {
-		if ent.client != nil {
-			_ = ent.client.Close()
-		}
+		_ = ent.closeClient()
 	}
+}
+
+func cloneMCPServer(m *db.MCPServer) *db.MCPServer {
+	if m == nil {
+		return nil
+	}
+	cp := *m
+	if len(m.Args) > 0 {
+		cp.Args = append(json.RawMessage(nil), m.Args...)
+	}
+	if len(m.Env) > 0 {
+		cp.Env = append(json.RawMessage(nil), m.Env...)
+	}
+	return &cp
 }
 
 func mcpFingerprint(m *db.MCPServer, priv ExecPrivilege) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%d|%s|%s|%s|%s|%s|%v|%d|%v|%d|%d",
-		m.ID, m.Transport, m.Command, m.Args, m.URL, m.Env, m.Insecure, m.TimeoutSeconds,
+	fmt.Fprintf(h, "%d|%s|%s|%s|%s|%s|%s|%v|%d|%v|%d|%d",
+		m.ID, m.Name, m.Transport, m.Command, m.Args, m.URL, m.Env, m.Insecure, m.TimeoutSeconds,
 		priv.Enabled, priv.UID, priv.GID)
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -149,27 +302,66 @@ func (p *mcpPool) Acquire(ctx context.Context, m *db.MCPServer, priv ExecPrivile
 		// Without a pool, close would leak if not managed; caller shouldn't hit nil here.
 		return ts, nil
 	}
+	srvCopy := cloneMCPServer(m)
+	ent, tools, err := p.acquireEntry(ctx, srvCopy, priv)
+	if err != nil {
+		return nil, err
+	}
+	return wrapPooledTools(p, srvCopy, priv, ent, tools), nil
+}
+
+func (p *mcpPool) acquireEntry(ctx context.Context, m *db.MCPServer, priv ExecPrivilege) (*pooledMCPEntry, []actool.CoreTool, error) {
 	fp := mcpFingerprint(m, priv)
 
+	var deadFast *pooledMCPEntry
 	p.mu.Lock()
-	ent := p.entries[m.ID]
-	if ent != nil && ent.fingerprint == fp && time.Since(ent.toolsAt) < mcpToolsCacheTTL {
-		ent.touch()
-		wrapped := wrapPooledTools(p, m.ID, ent, ent.tools)
+	if p.closed {
 		p.mu.Unlock()
-		return wrapped, nil
+		return nil, nil, fmt.Errorf("mcp pool closed")
 	}
+	ent := p.entries[m.ID]
+	if ent != nil && !ent.isClosed() && !ent.clientAlive() {
+		ent.markClosed()
+		delete(p.entries, m.ID)
+		deadFast = ent
+		ent = nil
+	}
+	if ent != nil && !ent.isClosed() && ent.fingerprint == fp && time.Since(ent.toolsAt) < mcpToolsCacheTTL {
+		ent.touch()
+		tools := ent.tools
+		p.mu.Unlock()
+		return ent, tools, nil
+	}
+	startGen := p.gen[m.ID]
 	p.mu.Unlock()
+	if deadFast != nil {
+		go func(e *pooledMCPEntry) { _ = e.closeClient() }(deadFast)
+	}
 
 	type acquiredMCP struct {
 		ent   *pooledMCPEntry
 		tools []actool.CoreTool
 	}
-	key := fmt.Sprintf("%d:%s", m.ID, fp)
-	v, err, _ := p.sf.Do(key, func() (any, error) {
+	key := fmt.Sprintf("%d:%d:%s", m.ID, startGen, fp)
+	ch := p.sf.DoChan(key, func() (any, error) {
+		var deadSF *pooledMCPEntry
 		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("mcp pool closed")
+		}
+		if p.gen[m.ID] != startGen {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("mcp server invalidated during connect")
+		}
 		cur := p.entries[m.ID]
-		if cur != nil && cur.fingerprint == fp {
+		if cur != nil && !cur.isClosed() && !cur.clientAlive() {
+			cur.markClosed()
+			delete(p.entries, m.ID)
+			deadSF = cur
+			cur = nil
+		}
+		if cur != nil && !cur.isClosed() && cur.fingerprint == fp {
 			if time.Since(cur.toolsAt) < mcpToolsCacheTTL {
 				cur.touch()
 				res := acquiredMCP{ent: cur, tools: cur.tools}
@@ -178,37 +370,71 @@ func (p *mcpPool) Acquire(ctx context.Context, m *db.MCPServer, priv ExecPrivile
 			}
 			// Same client, refresh tools list only. Hold inFlight across the
 			// Tools() RPC so reapIdle cannot evict and close cur mid-refresh.
-			cur.inFlight.Add(1)
-			cur.touch()
-			p.mu.Unlock()
-			tctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
-			ts, terr := cur.client.Tools(tctx)
-			cancel()
-			if terr == nil {
-				p.mu.Lock()
-				cur.touch()
-				cur.inFlight.Add(-1)
-				if p.entries[m.ID] == cur {
-					cur.tools = ts
-					cur.toolsAt = time.Now()
+			if cur.beginCall() {
+				p.mu.Unlock()
+				tctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
+				ts, terr := cur.client.Tools(tctx)
+				cancel()
+				if terr == nil {
+					p.mu.Lock()
+					cur.endCall()
+					if !p.closed && p.gen[m.ID] == startGen && p.entries[m.ID] == cur && !cur.isClosed() {
+						cur.tools = ts
+						cur.toolsAt = time.Now()
+						p.mu.Unlock()
+						return acquiredMCP{ent: cur, tools: ts}, nil
+					}
+					if p.closed {
+						p.mu.Unlock()
+						return nil, fmt.Errorf("mcp pool closed")
+					}
+					if p.gen[m.ID] != startGen {
+						p.mu.Unlock()
+						return nil, fmt.Errorf("mcp server invalidated during connect")
+					}
 					p.mu.Unlock()
-					return acquiredMCP{ent: cur, tools: ts}, nil
+				} else {
+					cur.endCallTouch(false)
+					// Broken connection: evict and reconnect below unless invalidated/closed.
+					p.evictIfMatch(m.ID, cur)
+					p.mu.Lock()
+					if p.closed {
+						p.mu.Unlock()
+						return nil, fmt.Errorf("mcp pool closed")
+					}
+					if p.gen[m.ID] != startGen {
+						p.mu.Unlock()
+						return nil, fmt.Errorf("mcp server invalidated during connect")
+					}
+					p.mu.Unlock()
+				}
+			} else {
+				if p.closed {
+					p.mu.Unlock()
+					return nil, fmt.Errorf("mcp pool closed")
+				}
+				if p.gen[m.ID] != startGen {
+					p.mu.Unlock()
+					return nil, fmt.Errorf("mcp server invalidated during connect")
 				}
 				p.mu.Unlock()
-			} else {
-				cur.inFlight.Add(-1)
-				// Broken connection: evict and reconnect below.
-				p.evictIfMatch(m.ID, cur)
 			}
 		} else {
 			p.mu.Unlock()
+		}
+		if deadSF != nil {
+			go func(e *pooledMCPEntry) { _ = e.closeClient() }(deadSF)
 		}
 
 		// Dial using pool-lifetime context so cancelling one agent run does not
 		// terminate shared MCP connections or stdio subprocesses.
 		dialCtx, cancel := context.WithTimeout(p.ctx, 45*time.Second)
 		defer cancel()
-		cl, cerr := connectMCP(dialCtx, m, priv)
+		dial := p.connectFn
+		if dial == nil {
+			dial = connectMCP
+		}
+		cl, cerr := dial(dialCtx, m, priv)
 		if cerr != nil {
 			return nil, fmt.Errorf("connect: %w", cerr)
 		}
@@ -227,22 +453,40 @@ func (p *mcpPool) Acquire(ctx context.Context, m *db.MCPServer, priv ExecPrivile
 		}
 		next.touch()
 		p.mu.Lock()
+		if p.closed || p.gen[m.ID] != startGen {
+			wasClosed := p.closed
+			p.mu.Unlock()
+			_ = cl.Close()
+			if wasClosed {
+				return nil, fmt.Errorf("mcp pool closed")
+			}
+			return nil, fmt.Errorf("mcp server invalidated during connect")
+		}
 		old := p.entries[m.ID]
 		p.entries[m.ID] = next
 		p.mu.Unlock()
-		if old != nil && old.client != nil {
-			go func(c mcpClient) { _ = c.Close() }(old.client)
+		if old != nil {
+			old.markClosed()
+			go func(e *pooledMCPEntry) { _ = e.closeClient() }(old)
 		}
 		return acquiredMCP{ent: next, tools: ts}, nil
 	})
-	if err != nil {
-		return nil, err
+	select {
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	case sfRes := <-ch:
+		if sfRes.Err != nil {
+			return nil, nil, sfRes.Err
+		}
+		res := sfRes.Val.(acquiredMCP)
+		return res.ent, res.tools, nil
 	}
-	res := v.(acquiredMCP)
-	return wrapPooledTools(p, m.ID, res.ent, res.tools), nil
 }
 
 func (p *mcpPool) evictIfMatch(id int64, ent *pooledMCPEntry) {
+	if ent != nil {
+		ent.markClosed()
+	}
 	p.mu.Lock()
 	cur := p.entries[id]
 	if cur != ent {
@@ -251,8 +495,8 @@ func (p *mcpPool) evictIfMatch(id int64, ent *pooledMCPEntry) {
 	}
 	delete(p.entries, id)
 	p.mu.Unlock()
-	if cur != nil && cur.client != nil {
-		go func(c mcpClient) { _ = c.Close() }(cur.client)
+	if cur != nil {
+		go func(e *pooledMCPEntry) { _ = e.closeClient() }(cur)
 	}
 }
 
@@ -261,11 +505,16 @@ func (p *mcpPool) Invalidate(id int64) {
 		return
 	}
 	p.mu.Lock()
+	if p.gen == nil {
+		p.gen = map[int64]uint64{}
+	}
+	p.gen[id]++
 	cur := p.entries[id]
 	delete(p.entries, id)
 	p.mu.Unlock()
-	if cur != nil && cur.client != nil {
-		go func(c mcpClient) { _ = c.Close() }(cur.client)
+	if cur != nil {
+		cur.markClosed()
+		go func(e *pooledMCPEntry) { _ = e.closeClient() }(cur)
 	}
 }
 
@@ -274,15 +523,19 @@ func (p *mcpPool) CloseAll() {
 		return
 	}
 	p.mu.Lock()
+	p.closed = true
 	all := make([]*pooledMCPEntry, 0, len(p.entries))
 	for id, ent := range p.entries {
+		if ent != nil {
+			ent.markClosed()
+		}
 		all = append(all, ent)
 		delete(p.entries, id)
 	}
 	p.mu.Unlock()
 	for _, ent := range all {
-		if ent != nil && ent.client != nil {
-			if err := ent.client.Close(); err != nil {
+		if ent != nil {
+			if err := ent.closeClient(); err != nil {
 				log.Printf("[mcp-pool] close id=%d: %v", ent.id, err)
 			}
 		}
@@ -291,45 +544,181 @@ func (p *mcpPool) CloseAll() {
 
 type pooledMCPTool struct {
 	actool.CoreTool
-	pool *mcpPool
-	id   int64
-	ent  *pooledMCPEntry
+	pool   *mcpPool
+	server *db.MCPServer
+	priv   ExecPrivilege
+	id     int64
+	ent    *pooledMCPEntry
+}
+
+// isMCPTransportError identifies genuine transport-level failures returned by
+// stdio/HTTP/SSE MCP clients (as opposed to domain-level tool errors whose text
+// may incidentally contain words like "disclosed", "port closed", or "eof").
+func isMCPTransportError(res actool.Result) bool {
+	if !res.IsError {
+		return false
+	}
+	for _, b := range res.Content {
+		low := strings.ToLower(strings.TrimSpace(b.Text))
+		if !strings.HasPrefix(low, "error:") {
+			continue
+		}
+		if strings.Contains(low, "mcp: connection closed") ||
+			strings.Contains(low, "broken pipe") ||
+			strings.Contains(low, "connection refused") ||
+			strings.Contains(low, "connection reset") ||
+			strings.Contains(low, "use of closed network connection") ||
+			strings.Contains(low, "file already closed") ||
+			strings.Contains(low, "mcp sse stream:") ||
+			strings.Contains(low, "mcp http 404") ||
+			strings.Contains(low, "mcp sse http 404") ||
+			strings.Contains(low, "process already finished") ||
+			strings.HasSuffix(low, ": eof") ||
+			strings.HasSuffix(low, " eof") ||
+			strings.Contains(low, "unexpected eof") {
+			return true
+		}
+	}
+	return false
+}
+
+// isSafePreExecMCPError identifies transport errors where the remote MCP server
+// rejected the request before executing the tool (expired Streamable HTTP or
+// legacy SSE session returning HTTP 404), making a single reconnect-and-retry
+// safe even for non-readOnly tools per the MCP Streamable HTTP specification.
+func isSafePreExecMCPError(res actool.Result) bool {
+	if !res.IsError {
+		return false
+	}
+	for _, b := range res.Content {
+		low := strings.ToLower(strings.TrimSpace(b.Text))
+		if !strings.HasPrefix(low, "error:") {
+			continue
+		}
+		if strings.Contains(low, "mcp http 404: session expired") ||
+			strings.Contains(low, "mcp sse http 404") {
+			return true
+		}
+	}
+	return false
+}
+
+func findToolByName(tools []actool.CoreTool, name string) actool.CoreTool {
+	for _, candidate := range tools {
+		if candidate.Name() == name {
+			return candidate
+		}
+	}
+	return nil
+}
+
+// activeServerConfig resolves the latest config when lookupFn is wired, ensuring
+// disabled or deleted MCP servers are never respawned by an older session.
+func (t pooledMCPTool) activeServerConfig() (*db.MCPServer, error) {
+	if t.pool != nil && t.pool.lookupFn != nil {
+		fresh, ok := t.pool.lookupFn(t.id)
+		if !ok || fresh == nil || !fresh.Enabled {
+			name := ""
+			if t.server != nil {
+				name = t.server.Name
+			}
+			return nil, fmt.Errorf("mcp server %q is disabled or removed", name)
+		}
+		return cloneMCPServer(fresh), nil
+	}
+	return t.server, nil
+}
+
+// resolveAndBegin returns an active pooled entry (with inFlight already
+// incremented via beginCall) and CoreTool for this tool name. If the originally
+// captured entry was reaped for idleness, invalidated, or crashed mid-session,
+// it transparently re-acquires a fresh client from the pool.
+func (t pooledMCPTool) resolveAndBegin(ctx context.Context, forceReacquire bool) (*pooledMCPEntry, actool.CoreTool, *db.MCPServer, error) {
+	if !forceReacquire && t.ent != nil {
+		if !t.ent.clientAlive() {
+			if t.pool != nil {
+				t.pool.evictIfMatch(t.id, t.ent)
+			} else {
+				t.ent.markClosed()
+			}
+		} else if t.ent.beginCall() {
+			return t.ent, t.CoreTool, t.server, nil
+		}
+	}
+	if t.pool == nil || t.server == nil {
+		if t.ent != nil {
+			t.ent.beginCall()
+		}
+		return t.ent, t.CoreTool, t.server, nil
+	}
+	srv, err := t.activeServerConfig()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for retry := 0; retry < 2; retry++ {
+		ent, tools, aerr := t.pool.acquireEntry(ctx, srv, t.priv)
+		if aerr != nil {
+			return nil, nil, nil, aerr
+		}
+		live := findToolByName(tools, t.Name())
+		if live == nil {
+			return nil, nil, nil, fmt.Errorf("mcp tool %s not advertised after reconnect", t.Name())
+		}
+		if !ent.clientAlive() {
+			t.pool.evictIfMatch(t.id, ent)
+			continue
+		}
+		if ent.beginCall() {
+			return ent, live, srv, nil
+		}
+	}
+	return nil, nil, nil, fmt.Errorf("mcp entry closed during reconnect")
 }
 
 func (t pooledMCPTool) Call(ctx context.Context, input json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
-	if t.ent != nil {
-		t.ent.inFlight.Add(1)
-		t.ent.touch()
-		defer func() {
-			t.ent.touch()
-			t.ent.inFlight.Add(-1)
-		}()
-	}
-	res, err := t.CoreTool.Call(ctx, input, tc)
-	if err != nil {
-		t.pool.evictIfMatch(t.id, t.ent)
-		return res, err
-	}
-	if res.IsError {
-		for _, b := range res.Content {
-			low := strings.ToLower(b.Text)
-			if strings.Contains(low, "broken pipe") ||
-				strings.Contains(low, "connection refused") ||
-				strings.Contains(low, "connection reset") ||
-				strings.Contains(low, "closed") ||
-				strings.Contains(low, "eof") {
-				t.pool.evictIfMatch(t.id, t.ent)
-				break
+	readOnly := t.IsReadOnly(input)
+	for attempt := 0; attempt < 2; attempt++ {
+		ent, live, srv, err := t.resolveAndBegin(ctx, attempt > 0)
+		if err != nil {
+			return actool.Errorf("Error: mcp reconnect failed: " + err.Error()), nil
+		}
+
+		callCtx := ctx
+		var cancel context.CancelFunc
+		if srv != nil && srv.TimeoutSeconds > 0 {
+			callCtx, cancel = context.WithTimeout(ctx, time.Duration(srv.TimeoutSeconds)*time.Second)
+		}
+		res, callErr := live.Call(callCtx, input, tc)
+		if cancel != nil {
+			cancel()
+		}
+		evict := callErr != nil || isMCPTransportError(res)
+		if ent != nil {
+			ent.endCallTouch(!evict)
+		}
+
+		if callErr != nil {
+			t.pool.evictIfMatch(t.id, ent)
+			if attempt == 0 && readOnly && ctx.Err() == nil && t.pool != nil && t.server != nil {
+				continue
+			}
+			return res, callErr
+		}
+		if evict {
+			t.pool.evictIfMatch(t.id, ent)
+			if attempt == 0 && (readOnly || isSafePreExecMCPError(res)) && ctx.Err() == nil && t.pool != nil && t.server != nil {
+				continue
 			}
 		}
+		return res, nil
 	}
-	return res, nil
+	return actool.Errorf("Error: mcp call failed after reconnect"), nil
 }
 
-func wrapPooledTools(p *mcpPool, id int64, ent *pooledMCPEntry, tools []actool.CoreTool) []actool.CoreTool {
+func wrapPooledTools(p *mcpPool, server *db.MCPServer, priv ExecPrivilege, ent *pooledMCPEntry, tools []actool.CoreTool) []actool.CoreTool {
 	out := make([]actool.CoreTool, len(tools))
 	for i, t := range tools {
-		out[i] = pooledMCPTool{CoreTool: t, pool: p, id: id, ent: ent}
+		out[i] = pooledMCPTool{CoreTool: t, pool: p, server: server, priv: priv, id: server.ID, ent: ent}
 	}
 	return out
 }

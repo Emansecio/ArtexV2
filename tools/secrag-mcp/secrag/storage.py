@@ -8,6 +8,8 @@ import re
 import sqlite3
 import threading
 import time
+import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -20,13 +22,18 @@ from . import EMBED_DIM
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "secrag"
 
 CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
+CVE_PARSE_RE = re.compile(r"(?:CVE[-_\s]+)?(\d{4})[-_\s]+(\d{4,7})", re.IGNORECASE)
 MITRE_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
-TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-./:+]*")
+TOKEN_RE = re.compile(r"[A-Za-z0-9_\-][A-Za-z0-9_\-./:+]*")
 
 # Subsets with <= this many embedded chunks use exact SIMD matmul (100% recall in ~15-40 ms)
-# instead of approximate global HNSW over-fetching.
-EXACT_SUBSET_THRESHOLD = 15_000
+# instead of approximate global HNSW over-fetching. 35,000 covers both 'web' (~22k) and
+# 'cloud' (~27k), the two most frequently queried pentest domains.
+EXACT_SUBSET_THRESHOLD = 35_000
 FTS_SELECTIVE_DF_CAP = 25_000
+DEFAULT_FTS_TOKENIZE = "porter unicode61 tokenchars '-_'"
+_TOKENIZE_CLAUSE_RE = re.compile(r"tokenize\s*=\s*'((?:''|[^'])*)'", re.IGNORECASE)
+_STEM_CACHE_MAX = 4096
 
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "como", "da", "das", "de",
@@ -50,9 +57,12 @@ class ChunkRecord:
     content: str
 
 
+CacheSignature = tuple[int, int, int, int, int, int]
+
+
 @dataclass
 class _MetaCache:
-    mtime: float
+    sig: CacheSignature
     max_id: int
     cat_to_id: dict[str, int]
     src_to_id: dict[str, int]
@@ -60,6 +70,20 @@ class _MetaCache:
     src_arr: np.ndarray  # uint8[max_id + 1]
     cat_embed_ids: dict[str, np.ndarray]  # only populated for small categories
     src_embed_ids: dict[str, np.ndarray]  # only populated for small sources
+
+
+def _reap_ro_conn(
+    conn: sqlite3.Connection,
+    store_ref: weakref.ReferenceType["KnowledgeStore"],
+) -> None:
+    store = store_ref()
+    if store is not None:
+        with store._conn_lock:
+            store._ro_conns.discard(conn)
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 def resolve_data_dir(data_dir: Optional[str | Path] = None) -> Path:
@@ -98,7 +122,8 @@ def extract_mitre_ids(text: str) -> list[str]:
 
 def extract_fts5_tokens(query: str) -> list[str]:
     """Extract deduplicated technical tokens safe for FTS5 quoting."""
-    raw_tokens = TOKEN_RE.findall(query)
+    raw_tokens = [t.strip(".:/") for t in TOKEN_RE.findall(query)]
+    raw_tokens = [t for t in raw_tokens if t and any(ch.isalnum() for ch in t)]
     tokens: list[str] = []
     seen: set[str] = set()
     for tok in raw_tokens:
@@ -140,7 +165,7 @@ class KnowledgeStore:
 
         self._tls = threading.local()
         self._conn_lock = threading.Lock()
-        self._all_conns: list[sqlite3.Connection] = []
+        self._ro_conns: set[sqlite3.Connection] = set()
         self._write_conn: Optional[sqlite3.Connection] = None
 
         if not self.read_only:
@@ -150,8 +175,18 @@ class KnowledgeStore:
         self._vec_lock = threading.RLock()
         self._vec_index: Optional[Index] = None
         self._vec_mtime: float = 0.0
+        self._vec_key: tuple[int, int, int] = (0, 0, 0)
         self._meta_cache: Optional[_MetaCache] = None
+        self._stats_cache_key: Optional[CacheSignature] = None
+        self._stats_cache: Optional[dict] = None
         self._has_vocab: Optional[bool] = None
+        self._vocab_missing_sig: Optional[CacheSignature] = None
+        self._stem_lock = threading.Lock()
+        self._stem_conn: Optional[sqlite3.Connection] = None
+        self._stem_conn_spec: Optional[str] = None
+        self._stem_spec: Optional[str] = None
+        self._stem_spec_sig: Optional[CacheSignature] = None
+        self._stem_cache: OrderedDict[tuple[str, str], tuple[str, ...]] = OrderedDict()
 
     def _open_connection(self, read_only: bool) -> sqlite3.Connection:
         uri = f"file:{self.db_path}" + ("?mode=ro" if read_only else "")
@@ -170,8 +205,13 @@ class KnowledgeStore:
         conn.execute("PRAGMA temp_store = MEMORY")
         conn.execute("PRAGMA cache_size = -65536")
         conn.execute("PRAGMA mmap_size = 268435456")
-        with self._conn_lock:
-            self._all_conns.append(conn)
+        if read_only:
+            with self._conn_lock:
+                self._ro_conns.add(conn)
+            try:
+                weakref.finalize(threading.current_thread(), _reap_ro_conn, conn, weakref.ref(self))
+            except TypeError:
+                pass
         return conn
 
     @property
@@ -235,6 +275,7 @@ class KnowledgeStore:
             CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);
             CREATE INDEX IF NOT EXISTS idx_chunks_category ON chunks(category);
             CREATE INDEX IF NOT EXISTS idx_chunks_embedded ON chunks(embedded) WHERE embedded = 0;
+            CREATE INDEX IF NOT EXISTS idx_chunks_meta_embedded ON chunks(category, source, id) WHERE embedded = 1;
 
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 title,
@@ -244,7 +285,7 @@ class KnowledgeStore:
                 content,
                 content='chunks',
                 content_rowid='id',
-                tokenize='porter unicode61 tokenchars ''-_.:/'''
+                tokenize='porter unicode61 tokenchars ''-_'''
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_vocab USING fts5vocab(chunks_fts, row);
@@ -259,7 +300,7 @@ class KnowledgeStore:
                 VALUES ('delete', old.id, old.title, old.breadcrumb, old.tags, old.cves, old.content);
             END;
 
-            CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+            CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF title, breadcrumb, tags, cves, content ON chunks BEGIN
                 INSERT INTO chunks_fts(chunks_fts, rowid, title, breadcrumb, tags, cves, content)
                 VALUES ('delete', old.id, old.title, old.breadcrumb, old.tags, old.cves, old.content);
                 INSERT INTO chunks_fts(rowid, title, breadcrumb, tags, cves, content)
@@ -294,20 +335,97 @@ class KnowledgeStore:
             );
             """
         )
+        # Migrate existing DBs whose chunks_au trigger fires on non-text column updates (e.g. embedded=1).
+        au_row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_au'"
+        ).fetchone()
+        if au_row is not None and "OF title" not in (au_row["sql"] or ""):
+            self.conn.commit()
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute("DROP TRIGGER IF EXISTS chunks_au")
+                self.conn.execute(
+                    """
+                    CREATE TRIGGER chunks_au AFTER UPDATE OF title, breadcrumb, tags, cves, content ON chunks BEGIN
+                        INSERT INTO chunks_fts(chunks_fts, rowid, title, breadcrumb, tags, cves, content)
+                        VALUES ('delete', old.id, old.title, old.breadcrumb, old.tags, old.cves, old.content);
+                        INSERT INTO chunks_fts(rowid, title, breadcrumb, tags, cves, content)
+                        VALUES (new.id, new.title, new.breadcrumb, new.tags, new.cves, new.content);
+                    END
+                    """
+                )
+                self.conn.commit()
+            except BaseException:
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
+        # Migrate existing DBs using the legacy punctuation-gluing FTS5 tokenizer ('-_.:/').
+        fts_row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
+        ).fetchone()
+        if fts_row is not None and "-_.:/" in (fts_row["sql"] or ""):
+            self.conn.commit()
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute("DROP TABLE IF EXISTS chunks_fts_vocab")
+                self.conn.execute("DROP TABLE IF EXISTS chunks_fts")
+                self.conn.execute(
+                    """
+                    CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                        title,
+                        breadcrumb,
+                        tags,
+                        cves,
+                        content,
+                        content='chunks',
+                        content_rowid='id',
+                        tokenize='porter unicode61 tokenchars ''-_'''
+                    )
+                    """
+                )
+                self.conn.execute(
+                    "CREATE VIRTUAL TABLE chunks_fts_vocab USING fts5vocab(chunks_fts, row)"
+                )
+                self.conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+                self.conn.commit()
+            except BaseException:
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
         self.conn.commit()
 
     def close(self) -> None:
         with self._vec_lock:
             self._vec_index = None
+            self._vec_mtime = 0.0
+            self._vec_key = (0, 0, 0)
             self._meta_cache = None
+            self._stats_cache = None
+            self._stats_cache_key = None
+        with self._stem_lock:
+            stem_conn = self._stem_conn
+            self._stem_conn = None
+            self._stem_conn_spec = None
+            self._stem_spec = None
+            self._stem_spec_sig = None
+            self._stem_cache.clear()
+        if stem_conn is not None:
+            try:
+                stem_conn.close()
+            except Exception:
+                pass
         with self._conn_lock:
-            for c in self._all_conns:
-                try:
-                    c.close()
-                except Exception:
-                    pass
-            self._all_conns.clear()
+            conns = list(self._ro_conns)
+            self._ro_conns.clear()
+            write_conn = self._write_conn
             self._write_conn = None
+        if write_conn is not None:
+            conns.append(write_conn)
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
 
     # ---- Write / Ingestion API ----
 
@@ -352,88 +470,112 @@ class KnowledgeStore:
             "SELECT id, content_hash FROM documents WHERE source = ? AND rel_path = ?",
             (source, rel_path),
         ).fetchone()
-        if existing is not None:
-            if existing["content_hash"] == c_hash:
-                return int(existing["id"]), [], []
-            removed_rows = self.conn.execute(
-                "SELECT id, embedded FROM chunks WHERE doc_id = ?", (existing["id"],)
-            ).fetchall()
-            removed_chunk_ids = [int(r["id"]) for r in removed_rows]
-            removed_vec_ids = [(int(r["id"]),) for r in removed_rows if int(r["embedded"]) == 1]
-            if removed_vec_ids:
-                self.conn.executemany(
-                    "INSERT OR IGNORE INTO deleted_vectors(chunk_id) VALUES (?)",
-                    removed_vec_ids,
-                )
-            self.conn.execute("DELETE FROM documents WHERE id = ?", (existing["id"],))
+        if existing is not None and existing["content_hash"] == c_hash:
+            return int(existing["id"]), [], []
 
-        cur = self.conn.execute(
-            """
-            INSERT INTO documents(source, category, rel_path, title, url, tags, cves, content_hash, full_text, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (source, category, rel_path, title, url, tags_str, cves_str, c_hash, full_text, now),
-        )
-        doc_id = int(cur.lastrowid)
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN")
+        self.conn.execute("SAVEPOINT upsert_document")
+        try:
+            if existing is not None:
+                removed_rows = self.conn.execute(
+                    "SELECT id, embedded FROM chunks WHERE doc_id = ?", (existing["id"],)
+                ).fetchall()
+                removed_chunk_ids = [int(r["id"]) for r in removed_rows]
+                removed_vec_ids = [(int(r["id"]),) for r in removed_rows if int(r["embedded"]) == 1]
+                if removed_vec_ids:
+                    self.conn.executemany(
+                        "INSERT OR IGNORE INTO deleted_vectors(chunk_id) VALUES (?)",
+                        removed_vec_ids,
+                    )
+                self.conn.execute("DELETE FROM documents WHERE id = ?", (existing["id"],))
 
-        new_chunk_ids: list[int] = []
-        for idx, (heading, breadcrumb, sec_content, chunk_texts) in enumerate(sections_with_chunks):
-            sec_cur = self.conn.execute(
+            cur = self.conn.execute(
                 """
-                INSERT INTO sections(doc_id, section_idx, heading, breadcrumb, content)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO documents(source, category, rel_path, title, url, tags, cves, content_hash, full_text, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (doc_id, idx, heading, breadcrumb, sec_content),
+                (source, category, rel_path, title, url, tags_str, cves_str, c_hash, full_text, now),
             )
-            section_id = int(sec_cur.lastrowid)
-            for ch in chunk_texts:
-                ch_clean = ch.strip()
-                if not ch_clean:
-                    continue
-                ch_cves = extract_cves(breadcrumb + "\n" + ch_clean)
-                ch_cves_str = " ".join(ch_cves) if ch_cves else cves_str
-                embed_flag = 0 if embed_chunks else 2
-                ch_cur = self.conn.execute(
-                    """
-                    INSERT INTO chunks(doc_id, section_id, source, category, title, breadcrumb, tags, cves, content, content_hash, embedded)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        doc_id,
-                        section_id,
-                        source,
-                        category,
-                        title,
-                        breadcrumb,
-                        tags_str,
-                        ch_cves_str,
-                        ch_clean,
-                        sha256_text(ch_clean),
-                        embed_flag,
-                    ),
-                )
-                new_chunk_ids.append(int(ch_cur.lastrowid))
+            doc_id = int(cur.lastrowid)
 
-        if cve_entries:
-            for cve_id, severity, is_kev, summary in cve_entries:
-                self.conn.execute(
+            single_section = len(sections_with_chunks) == 1
+            new_chunk_ids: list[int] = []
+            for idx, (heading, breadcrumb, sec_content, chunk_texts) in enumerate(sections_with_chunks):
+                sec_cur = self.conn.execute(
                     """
-                    INSERT OR REPLACE INTO cve_index(cve_id, doc_id, source, severity, is_kev, summary)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO sections(doc_id, section_idx, heading, breadcrumb, content)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (cve_id.upper(), doc_id, source, severity or "", 1 if is_kev else 0, summary[:500]),
+                    (doc_id, idx, heading, breadcrumb, sec_content),
                 )
-        elif cves:
-            summary = title[:240]
-            for cve_id in cves[:20]:
-                self.conn.execute(
-                    """
-                    INSERT OR IGNORE INTO cve_index(cve_id, doc_id, source, severity, is_kev, summary)
-                    VALUES (?, ?, ?, '', 0, ?)
-                    """,
-                    (cve_id.upper(), doc_id, source, summary),
-                )
+                section_id = int(sec_cur.lastrowid)
+                for ch in chunk_texts:
+                    ch_clean = ch.strip()
+                    if not ch_clean:
+                        continue
+                    ch_cves = extract_cves(breadcrumb + "\n" + ch_clean)
+                    if ch_cves:
+                        ch_cves_str = " ".join(ch_cves)
+                    elif single_section:
+                        ch_cves_str = cves_str
+                    else:
+                        ch_cves_str = ""
+                    embed_flag = 0 if embed_chunks else 2
+                    ch_cur = self.conn.execute(
+                        """
+                        INSERT INTO chunks(doc_id, section_id, source, category, title, breadcrumb, tags, cves, content, content_hash, embedded)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            doc_id,
+                            section_id,
+                            source,
+                            category,
+                            title,
+                            breadcrumb,
+                            tags_str,
+                            ch_cves_str,
+                            ch_clean,
+                            sha256_text(ch_clean),
+                            embed_flag,
+                        ),
+                    )
+                    new_chunk_ids.append(int(ch_cur.lastrowid))
 
+            if cve_entries:
+                for cve_id, severity, is_kev, summary in cve_entries:
+                    self.conn.execute(
+                        """
+                        INSERT OR REPLACE INTO cve_index(cve_id, doc_id, source, severity, is_kev, summary)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (cve_id.upper(), doc_id, source, severity or "", 1 if is_kev else 0, summary[:500]),
+                    )
+            elif cves:
+                summary = title[:240]
+                for cve_id in cves[:20]:
+                    self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO cve_index(cve_id, doc_id, source, severity, is_kev, summary)
+                        VALUES (?, ?, ?, '', 0, ?)
+                        """,
+                        (cve_id.upper(), doc_id, source, summary),
+                    )
+
+            self.conn.execute("RELEASE SAVEPOINT upsert_document")
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK TO SAVEPOINT upsert_document")
+                self.conn.execute("RELEASE SAVEPOINT upsert_document")
+            except sqlite3.Error:
+                pass
+            raise
+
+        with self._vec_lock:
+            self._meta_cache = None
+            self._stats_cache = None
+            self._stats_cache_key = None
         return doc_id, new_chunk_ids, removed_chunk_ids
 
     def get_deleted_vector_ids(self) -> list[int]:
@@ -486,12 +628,16 @@ class KnowledgeStore:
         )
         self.conn.commit()
 
-    def known_cve_ids(self) -> set[str]:
-        """Return all CVE IDs currently present in cve_index."""
-        return {
-            r["cve_id"]
-            for r in self.conn.execute("SELECT DISTINCT cve_id FROM cve_index").fetchall()
-        }
+    def known_cve_ids(self, exclude_source: Optional[str] = None) -> set[str]:
+        """Return all CVE IDs currently present in cve_index, optionally excluding one source."""
+        if exclude_source:
+            rows = self.conn.execute(
+                "SELECT DISTINCT cve_id FROM cve_index WHERE source != ?",
+                (exclude_source,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT DISTINCT cve_id FROM cve_index").fetchall()
+        return {r["cve_id"] for r in rows}
 
     def iter_unembedded_chunks(self, batch_size: int = 256) -> Iterable[list[tuple[int, str]]]:
         """Yield batches of (chunk_id, text_for_embedding) where embedded = 0."""
@@ -514,7 +660,9 @@ class KnowledgeStore:
                 last_id = int(r["id"])
                 header = r["breadcrumb"]
                 if r["cves"]:
-                    header = f"{header} [{r['cves']}]"
+                    cve_tokens = r["cves"].split()[:8]
+                    if cve_tokens:
+                        header = f"{header} [{' '.join(cve_tokens)}]"
                 text = f"{header}\n{r['content']}"
                 batch.append((last_id, text))
             yield batch
@@ -526,6 +674,10 @@ class KnowledgeStore:
             "UPDATE chunks SET embedded = 1 WHERE id = ?", [(cid,) for cid in chunk_ids]
         )
         self.conn.commit()
+        with self._vec_lock:
+            self._meta_cache = None
+            self._stats_cache = None
+            self._stats_cache_key = None
 
     # ---- Vector Index (USearch HNSW f16) & Lightweight Filter Cache ----
 
@@ -549,15 +701,21 @@ class KnowledgeStore:
         with self._vec_lock:
             self._vec_index = None
             self._vec_mtime = 0.0
+            self._vec_key = (0, 0, 0)
             self._meta_cache = None
 
-    def get_readonly_vector_index(self) -> Optional[Index]:
-        if not self.vec_path.exists() or self.vec_path.stat().st_size == 0:
-            return None
-        mtime = self.vec_path.stat().st_mtime
+    def get_readonly_vector_index_with_sig(self) -> tuple[Optional[Index], CacheSignature]:
         with self._vec_lock:
-            if self._vec_index is not None and self._vec_mtime == mtime:
-                return self._vec_index
+            sig = self.cache_signature()
+            try:
+                vst = self.vec_path.stat()
+            except OSError:
+                return None, sig
+            if vst.st_size == 0:
+                return None, sig
+            vec_key = (vst.st_mtime_ns, vst.st_size, vst.st_ino)
+            if self._vec_index is not None and self._vec_key == vec_key:
+                return self._vec_index, sig
             idx = Index(
                 ndim=EMBED_DIM,
                 metric="cos",
@@ -566,24 +724,61 @@ class KnowledgeStore:
                 expansion_add=128,
                 expansion_search=64,
             )
-            idx.view(str(self.vec_path))
+            try:
+                idx.view(str(self.vec_path))
+            except (OSError, RuntimeError):
+                return None, sig
             self._vec_index = idx
-            self._vec_mtime = mtime
+            self._vec_mtime = vst.st_mtime
+            self._vec_key = vec_key
             self._meta_cache = None
-            return idx
+            return idx, self.cache_signature()
 
-    def _get_meta_cache(self, mtime: float) -> _MetaCache:
+    def get_readonly_vector_index(self) -> Optional[Index]:
+        idx, _ = self.get_readonly_vector_index_with_sig()
+        return idx
+
+    def cache_signature(self) -> CacheSignature:
+        """Lightweight (db_mtime_ns, db_size, wal_mtime_ns, wal_size, vec_mtime_ns, vec_ino)
+        signature for read caches. Including the WAL file and vector inode ensures caches
+        invalidate immediately during concurrent secrag-ingest before a WAL checkpoint occurs."""
+        try:
+            st = self.db_path.stat()
+            db_m, db_s = st.st_mtime_ns, st.st_size
+        except OSError:
+            db_m, db_s = 0, 0
+        wal_path = Path(str(self.db_path) + "-wal")
+        try:
+            wst = wal_path.stat()
+            wal_m, wal_s = wst.st_mtime_ns, wst.st_size
+        except OSError:
+            wal_m, wal_s = 0, 0
+        try:
+            vst = self.vec_path.stat()
+            vec_m, vec_ino = vst.st_mtime_ns, vst.st_ino
+        except OSError:
+            vec_m, vec_ino = 0, 0
+        return (db_m, db_s, wal_m, wal_s, vec_m, vec_ino)
+
+    def _get_meta_cache(self, sig: Optional[CacheSignature] = None) -> _MetaCache:
+        if sig is None:
+            sig = self.cache_signature()
         with self._vec_lock:
-            if self._meta_cache is not None and self._meta_cache.mtime == mtime:
+            if self._meta_cache is not None and self._meta_cache.sig == sig:
                 return self._meta_cache
 
-            rows = self.conn.execute("SELECT id, category, source, embedded FROM chunks").fetchall()
+            # Only embedded=1 chunks exist in the USearch HNSW index; skipping
+            # lexical-only (embedded=2) rows and sqlite3.Row wrappers cuts cold
+            # load time and memory dramatically.
+            cur = self.conn.cursor()
+            cur.row_factory = None
+            rows = cur.execute("SELECT id, category, source FROM chunks WHERE embedded = 1").fetchall()
             if not rows:
-                cache = _MetaCache(mtime, 0, {}, {}, np.zeros(1, dtype=np.uint8), np.zeros(1, dtype=np.uint8), {}, {})
+                cache = _MetaCache(sig, 0, {}, {}, np.zeros(1, dtype=np.uint8), np.zeros(1, dtype=np.uint8), {}, {})
                 self._meta_cache = cache
                 return cache
 
-            max_id = max(int(r["id"]) for r in rows)
+            max_id = max(int(r[0]) for r in rows)
             cat_to_id: dict[str, int] = {}
             src_to_id: dict[str, int] = {}
             cat_arr = np.zeros(max_id + 1, dtype=np.uint8)
@@ -591,10 +786,8 @@ class KnowledgeStore:
             cat_lists: dict[str, list[int]] = {}
             src_lists: dict[str, list[int]] = {}
 
-            for r in rows:
-                cid = int(r["id"])
-                cat = r["category"]
-                src = r["source"]
+            for cid_raw, cat, src in rows:
+                cid = int(cid_raw)
                 cnum = cat_to_id.get(cat)
                 if cnum is None:
                     cnum = len(cat_to_id) + 1
@@ -605,9 +798,8 @@ class KnowledgeStore:
                     src_to_id[src] = snum
                 cat_arr[cid] = cnum
                 src_arr[cid] = snum
-                if int(r["embedded"]) == 1:
-                    cat_lists.setdefault(cat, []).append(cid)
-                    src_lists.setdefault(src, []).append(cid)
+                cat_lists.setdefault(cat, []).append(cid)
+                src_lists.setdefault(src, []).append(cid)
 
             cat_embed_ids = {
                 k: np.asarray(v, dtype=np.uint64)
@@ -620,7 +812,7 @@ class KnowledgeStore:
                 if len(v) <= EXACT_SUBSET_THRESHOLD
             }
             cache = _MetaCache(
-                mtime=mtime,
+                sig=sig,
                 max_id=max_id,
                 cat_to_id=cat_to_id,
                 src_to_id=src_to_id,
@@ -634,30 +826,103 @@ class KnowledgeStore:
 
     # ---- Read / Search API ----
 
-    def _token_doc_freq(self, token: str) -> int:
-        """Estimate FTS5 document frequency via chunks_fts_vocab in <0.1 ms."""
-        if self._has_vocab is False:
-            return 1000
-        low = token.lower()
+    def _get_fts_tokenize_spec(self) -> str:
+        sig = self.cache_signature()
+        with self._stem_lock:
+            if self._stem_spec is not None and self._stem_spec_sig == sig:
+                return self._stem_spec
+        spec = DEFAULT_FTS_TOKENIZE
         try:
             row = self.conn.execute(
-                "SELECT doc FROM chunks_fts_vocab WHERE term = ?", (low,)
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
             ).fetchone()
-            if row is not None:
-                self._has_vocab = True
-                return int(row["doc"])
-            # Porter stem fallback (e.g. 'authorization' -> 'author')
-            stem_prefix = low[: max(3, len(low) - 4)]
+            if row is not None and row["sql"]:
+                m = _TOKENIZE_CLAUSE_RE.search(row["sql"])
+                if m:
+                    spec = m.group(1).replace("''", "'")
+        except sqlite3.OperationalError:
+            pass
+        with self._stem_lock:
+            self._stem_spec = spec
+            self._stem_spec_sig = sig
+        return spec
+
+    def _fts5_stems(self, text: str) -> tuple[str, ...]:
+        """Tokenize and Porter-stem text using SQLite FTS5 with chunks_fts's exact tokenizer."""
+        spec = self._get_fts_tokenize_spec()
+        cache_key = (spec, text)
+        with self._stem_lock:
+            cached = self._stem_cache.get(cache_key)
+            if cached is not None:
+                self._stem_cache.move_to_end(cache_key)
+                return cached
+
+            if self._stem_conn is None or self._stem_conn_spec != spec:
+                if self._stem_conn is not None:
+                    try:
+                        self._stem_conn.close()
+                    except Exception:
+                        pass
+                sconn = sqlite3.connect(":memory:", check_same_thread=False)
+                escaped = spec.replace("'", "''")
+                sconn.execute(f"CREATE VIRTUAL TABLE stem_fts USING fts5(x, tokenize='{escaped}')")
+                sconn.execute("CREATE VIRTUAL TABLE stem_vocab USING fts5vocab(stem_fts, row)")
+                self._stem_conn = sconn
+                self._stem_conn_spec = spec
+
+            self._stem_conn.execute("DELETE FROM stem_fts")
+            self._stem_conn.execute("INSERT INTO stem_fts(rowid, x) VALUES (1, ?)", (text,))
+            stems = tuple(
+                str(r[0])
+                for r in self._stem_conn.execute("SELECT term FROM stem_vocab").fetchall()
+            )
+            self._stem_conn.execute("DELETE FROM stem_fts")
+
+            self._stem_cache[cache_key] = stems
+            self._stem_cache.move_to_end(cache_key)
+            while len(self._stem_cache) > _STEM_CACHE_MAX:
+                self._stem_cache.popitem(last=False)
+            return stems
+
+    def _single_term_doc_freq(self, low: str) -> int:
+        stems = self._fts5_stems(low)
+        if not stems:
+            return 0
+        if len(stems) == 1:
             row = self.conn.execute(
-                "SELECT MAX(doc) AS d FROM chunks_fts_vocab WHERE term >= ? AND term <= ?",
-                (stem_prefix, low),
+                "SELECT doc FROM chunks_fts_vocab WHERE term = ?", (stems[0],)
             ).fetchone()
             self._has_vocab = True
-            if row is not None and row["d"] is not None:
-                return int(row["d"])
+            self._vocab_missing_sig = None
+            return int(row["doc"]) if row is not None else 0
+        placeholders = ",".join("?" for _ in stems)
+        rows = self.conn.execute(
+            f"SELECT term, doc FROM chunks_fts_vocab WHERE term IN ({placeholders})",
+            stems,
+        ).fetchall()
+        self._has_vocab = True
+        self._vocab_missing_sig = None
+        doc_by_term = {str(r["term"]): int(r["doc"]) for r in rows}
+        if any(s not in doc_by_term for s in stems):
             return 0
-        except sqlite3.OperationalError:
-            self._has_vocab = False
+        return min(doc_by_term[s] for s in stems)
+
+    def _token_doc_freq(self, token: str) -> int:
+        """Return exact FTS5 document frequency via SQLite Porter stemming + chunks_fts_vocab."""
+        if self._vocab_missing_sig is not None:
+            if self._vocab_missing_sig == self.cache_signature():
+                return 1000
+            self._vocab_missing_sig = None
+            self._has_vocab = None
+        low = token.lower().strip(".:/")
+        if not low:
+            return 0
+        try:
+            return self._single_term_doc_freq(low)
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                self._has_vocab = False
+                self._vocab_missing_sig = self.cache_signature()
             return 1000
 
     def fts_search(
@@ -697,7 +962,10 @@ class KnowledgeStore:
         def _run_and_merge(fts_expr: str) -> None:
             if not fts_expr or len(results) >= limit:
                 return
-            rows = self.conn.execute(sql, [fts_expr, *params_extra, limit]).fetchall()
+            try:
+                rows = self.conn.execute(sql, [fts_expr, *params_extra, limit]).fetchall()
+            except sqlite3.OperationalError:
+                return
             for r in rows:
                 cid = int(r["id"])
                 if cid not in seen:
@@ -741,7 +1009,7 @@ class KnowledgeStore:
         source: Optional[str] = None,
         limit: int = 40,
     ) -> list[tuple[int, float]]:
-        idx = self.get_readonly_vector_index()
+        idx, sig = self.get_readonly_vector_index_with_sig()
         if idx is None or len(idx) == 0:
             return []
 
@@ -749,11 +1017,8 @@ class KnowledgeStore:
         src = source.lower() if source else None
         q = query_vec.astype(np.float32)
 
-        with self._vec_lock:
-            mtime = self._vec_mtime
-
         if cat or src:
-            meta = self._get_meta_cache(mtime)
+            meta = self._get_meta_cache(sig)
             # Small-subset fast path: exact SIMD dot product -> 100% recall in ~15-40 ms!
             subset: Optional[np.ndarray] = None
             if cat and not src and cat in meta.cat_embed_ids:
@@ -774,7 +1039,27 @@ class KnowledgeStore:
             if subset is not None:
                 if len(subset) == 0:
                     return []
-                vecs = np.asarray(idx.get(subset), dtype=np.float32)
+                raw_vecs = idx.get(subset)
+                if raw_vecs is None:
+                    return []
+                vecs: Optional[np.ndarray] = None
+                if isinstance(raw_vecs, np.ndarray):
+                    vecs = raw_vecs.astype(np.float32, copy=False)
+                else:
+                    try:
+                        candidate = np.asarray(raw_vecs, dtype=np.float32)
+                        if candidate.ndim == 2 and candidate.shape[1] == EMBED_DIM:
+                            vecs = candidate
+                        elif candidate.ndim == 1 and len(subset) == 1 and candidate.shape[0] == EMBED_DIM:
+                            vecs = candidate.reshape(1, -1)
+                    except (ValueError, TypeError):
+                        vecs = None
+                    if vecs is None:
+                        keep_pairs = [(int(k), v) for k, v in zip(subset, raw_vecs) if v is not None]
+                        if not keep_pairs:
+                            return []
+                        subset = np.asarray([p[0] for p in keep_pairs], dtype=np.uint64)
+                        vecs = np.asarray([p[1] for p in keep_pairs], dtype=np.float32)
                 if vecs.ndim == 1:
                     vecs = vecs.reshape(1, -1)
                 # Guard against missing/removed keys returning NaN or zero vectors
@@ -798,18 +1083,22 @@ class KnowledgeStore:
             if (cat and want_c < 0) or (src and want_s < 0):
                 return []
             fetch_k = min(len(idx), max(limit * 6, 300))
-            matches = idx.search(q, fetch_k)
-            keys = np.asarray(matches.keys, dtype=np.int64)
-            dists = np.asarray(matches.distances, dtype=np.float32)
-            in_bounds = (keys >= 0) & (keys <= meta.max_id)
-            safe_keys = np.where(in_bounds, keys, 0)
-            mask = in_bounds
-            if cat:
-                mask = mask & (meta.cat_arr[safe_keys] == want_c)
-            if src:
-                mask = mask & (meta.src_arr[safe_keys] == want_s)
-            filtered_keys = keys[mask][:limit]
-            filtered_dists = dists[mask][:limit]
+            for _attempt in range(2):
+                matches = idx.search(q, fetch_k)
+                keys = np.asarray(matches.keys, dtype=np.int64)
+                dists = np.asarray(matches.distances, dtype=np.float32)
+                in_bounds = (keys >= 0) & (keys <= meta.max_id)
+                safe_keys = np.where(in_bounds, keys, 0)
+                mask = in_bounds
+                if cat:
+                    mask = mask & (meta.cat_arr[safe_keys] == want_c)
+                if src:
+                    mask = mask & (meta.src_arr[safe_keys] == want_s)
+                filtered_keys = keys[mask][:limit]
+                filtered_dists = dists[mask][:limit]
+                if len(filtered_keys) >= limit or fetch_k >= len(idx):
+                    return [(int(k), float(d)) for k, d in zip(filtered_keys, filtered_dists)]
+                fetch_k = min(len(idx), fetch_k * 4)
             return [(int(k), float(d)) for k, d in zip(filtered_keys, filtered_dists)]
 
         fetch_k = min(limit, len(idx))
@@ -875,7 +1164,24 @@ class KnowledgeStore:
                 (section_id, doc_id),
             ).fetchone()
             if sec is None:
-                return None
+                # Document exists, but section_id did not match — return a helpful
+                # fallback with the document overview + section outline so agents
+                # can pick a valid section_id without an extra search turn.
+                full_text = doc["full_text"]
+                return {
+                    "doc_id": int(doc["id"]),
+                    "section_id": None,
+                    "section_not_found": int(section_id),
+                    "source": doc["source"],
+                    "category": doc["category"],
+                    "title": doc["title"],
+                    "path": doc["rel_path"],
+                    "url": doc["url"],
+                    "cves": doc["cves"],
+                    "content": full_text[: min(max_chars, 4000)],
+                    "truncated": len(full_text) > min(max_chars, 4000),
+                    "outline": outline[:30],
+                }
             content = sec["content"]
             truncated = len(content) > max_chars
             return {
@@ -909,9 +1215,11 @@ class KnowledgeStore:
         }
 
     def lookup_cve(self, cve_id: str, limit: int = 15) -> dict:
-        norm = cve_id.strip().upper()
-        if not norm.startswith("CVE-"):
-            norm = "CVE-" + norm
+        raw = (cve_id or "").strip().upper()
+        m = CVE_PARSE_RE.search(raw)
+        if not m:
+            return {"cve_id": raw, "is_kev": False, "match_count": 0, "matches": []}
+        norm = f"CVE-{m.group(1)}-{m.group(2)}"
 
         rows = self.conn.execute(
             """
@@ -935,16 +1243,34 @@ class KnowledgeStore:
             (norm, limit),
         ).fetchall()
 
-        # Batch-load the first section of all matched documents in 1 query (no N+1)
+        # Batch-load the first section mentioning this CVE per matched document,
+        # falling back to section_idx = 0 only when no specific section matches.
         doc_ids = [int(r["doc_id"]) for r in rows]
         first_sections: dict[int, sqlite3.Row] = {}
         if doc_ids:
             placeholders = ",".join("?" for _ in doc_ids)
             for s in self.conn.execute(
-                f"SELECT doc_id, id, breadcrumb, content FROM sections WHERE doc_id IN ({placeholders}) AND section_idx = 0",
-                doc_ids,
+                f"""
+                SELECT doc_id, id, section_idx, breadcrumb, content
+                FROM sections
+                WHERE doc_id IN ({placeholders})
+                  AND (instr(upper(content), ?) > 0 OR instr(upper(breadcrumb), ?) > 0)
+                ORDER BY doc_id ASC, section_idx ASC
+                """,
+                [*doc_ids, norm, norm],
             ).fetchall():
-                first_sections[int(s["doc_id"])] = s
+                did = int(s["doc_id"])
+                if did not in first_sections:
+                    first_sections[did] = s
+
+            missing_ids = [did for did in doc_ids if did not in first_sections]
+            if missing_ids:
+                m_placeholders = ",".join("?" for _ in missing_ids)
+                for s in self.conn.execute(
+                    f"SELECT doc_id, id, section_idx, breadcrumb, content FROM sections WHERE doc_id IN ({m_placeholders}) AND section_idx = 0",
+                    missing_ids,
+                ).fetchall():
+                    first_sections[int(s["doc_id"])] = s
 
         matches = []
         seen_docs: set[int] = set()
@@ -967,7 +1293,7 @@ class KnowledgeStore:
                 }
             )
 
-        # Also check FTS5 mentions not yet in cve_index
+        # Also check FTS5 mentions not yet in cve_index (exact canonical CVE token only)
         if len(matches) < limit:
             fts_hits = self.fts_search(norm, limit=limit)
             cids = [cid for cid, _ in fts_hits]
@@ -975,6 +1301,9 @@ class KnowledgeStore:
             for cid in cids:
                 ch = chunks.get(cid)
                 if not ch or ch.doc_id in seen_docs:
+                    continue
+                haystack = f"{ch.cves} {ch.title} {ch.breadcrumb} {ch.content}".upper()
+                if norm not in haystack:
                     continue
                 seen_docs.add(ch.doc_id)
                 matches.append(
@@ -1002,27 +1331,11 @@ class KnowledgeStore:
         }
 
     def stats(self) -> dict:
-        total_docs = int(self.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
-        total_sections = int(self.conn.execute("SELECT COUNT(*) FROM sections").fetchone()[0])
-        total_chunks = int(self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
-        embedded_chunks = int(
-            self.conn.execute("SELECT COUNT(*) FROM chunks WHERE embedded = 1").fetchone()[0]
-        )
-        lexical_only_chunks = int(
-            self.conn.execute("SELECT COUNT(*) FROM chunks WHERE embedded = 2").fetchone()[0]
-        )
-        pending_embed_chunks = int(
-            self.conn.execute("SELECT COUNT(*) FROM chunks WHERE embedded = 0").fetchone()[0]
-        )
-        total_cves = int(
-            self.conn.execute("SELECT COUNT(DISTINCT cve_id) FROM cve_index").fetchone()[0]
-        )
-        categories = [
-            {"category": r["category"], "documents": int(r["cnt"])}
-            for r in self.conn.execute(
-                "SELECT category, COUNT(*) AS cnt FROM documents GROUP BY category ORDER BY cnt DESC"
-            ).fetchall()
-        ]
+        sig = self.cache_signature()
+        with self._vec_lock:
+            if self._stats_cache is not None and self._stats_cache_key == sig:
+                return self._stats_cache
+
         sources = [
             {
                 "source": r["source"],
@@ -1038,12 +1351,35 @@ class KnowledgeStore:
                 "SELECT * FROM ingestion_state ORDER BY phase ASC, source ASC"
             ).fetchall()
         ]
+        categories = [
+            {"category": r["category"], "documents": int(r["cnt"])}
+            for r in self.conn.execute(
+                "SELECT category, COUNT(*) AS cnt FROM documents GROUP BY category ORDER BY cnt DESC"
+            ).fetchall()
+        ]
+        total_docs = sum(c["documents"] for c in categories)
+        total_sections = int(self.conn.execute("SELECT COUNT(*) FROM sections").fetchone()[0])
+        # All three counts use covering indexes (idx_chunks_doc, idx_chunks_meta_embedded,
+        # idx_chunks_embedded), avoiding unindexed full-table scans on embedded=2 and
+        # staying exact even when kb.usearch lags SQLite or ingestion is in flight.
+        total_chunks = int(self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        embedded_chunks = int(
+            self.conn.execute("SELECT COUNT(*) FROM chunks WHERE embedded = 1").fetchone()[0]
+        )
+        pending_embed_chunks = int(
+            self.conn.execute("SELECT COUNT(*) FROM chunks WHERE embedded = 0").fetchone()[0]
+        )
+        lexical_only_chunks = max(0, total_chunks - embedded_chunks - pending_embed_chunks)
         vec_idx = self.get_readonly_vector_index()
         vec_count = len(vec_idx) if vec_idx is not None else 0
+
+        total_cves = int(
+            self.conn.execute("SELECT COUNT(DISTINCT cve_id) FROM cve_index").fetchone()[0]
+        )
         db_mb = round(self.db_path.stat().st_size / (1024 * 1024), 1) if self.db_path.exists() else 0.0
         vec_mb = round(self.vec_path.stat().st_size / (1024 * 1024), 1) if self.vec_path.exists() else 0.0
 
-        return {
+        result = {
             "data_dir": str(self.data_dir),
             "documents": total_docs,
             "sections": total_sections,
@@ -1058,3 +1394,7 @@ class KnowledgeStore:
             "categories": categories,
             "sources": sources,
         }
+        with self._vec_lock:
+            self._stats_cache = result
+            self._stats_cache_key = sig
+        return result

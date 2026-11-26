@@ -988,7 +988,9 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 	// random session id so the test uses the exact same header logic as a real
 	// conversation; endpoints without a SessionHeaderKey don't read it, no side
 	// effects.
-	ctx = transcript.WithSessionID(ctx, "conntest-"+transcript.NewSessionID())
+	testSessionID := "conntest-" + transcript.NewSessionID()
+	ctx = transcript.WithSessionID(ctx, testSessionID)
+	defer llm.ShutdownAntigravitySession(testSessionID)
 	start := time.Now()
 	// MaxTokens must be generous: reasoning models (e.g. deepseek-v4-pro) emit a long
 	// stretch of thinking before answering (measured ~2900 tokens even for a one-word
@@ -1000,6 +1002,7 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 	// avoid burning tokens in a resume loop.
 	reply, err := agentcore.Run(ctx, agentcore.Options{
 		Provider:       prov,
+		SessionID:      testSessionID,
 		SystemPrompt:   []string{"You are a connection test. Just output the two characters OK — no thinking, no explanation, nothing else."},
 		Tools:          []actool.CoreTool{}, // not nil: nil means the SDK's unconfined file and shell tools
 		PermissionMode: acperm.ModeBypass,

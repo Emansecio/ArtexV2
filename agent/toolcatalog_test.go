@@ -122,4 +122,10 @@ func TestDecorateToolInjectsDefaults(t *testing.T) {
 	if seen["limit"] != float64(9) {
 		t.Errorf("limit = %v, want 9 (no override)", seen["limit"])
 	}
+
+	// JSON null input must not panic with assignment to nil map.
+	res, err := dec.Call(context.Background(), json.RawMessage(`null`), nil)
+	if err != nil || res.IsError {
+		t.Fatalf("null input failed: res=%+v err=%v", res, err)
+	}
 }

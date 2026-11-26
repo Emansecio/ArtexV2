@@ -572,11 +572,16 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 	if s.opts.SystemReminderFunc != nil {
 		reminderExtra = s.opts.SystemReminderFunc()
 	}
+	sessionID := s.sessionID
+	if sessionID == "" {
+		sessionID = s.opts.SessionID
+	}
 	in := harness.QueryInput{
 		Provider:                s.opts.Provider,
 		System:                  s.system(),
 		DynamicBoundary:         s.opts.DynamicBoundary,
 		PromptCacheKey:          s.opts.PromptCacheKey,
+		SessionID:               sessionID,
 		Messages:                s.messages,
 		SystemReminder:          buildSystemReminder(reminderExtra),
 		Tools:                   s.registry,

@@ -115,7 +115,7 @@ func TestReadSSEEndpointSameOrigin(t *testing.T) {
 	}
 	read := func(line string) (string, error) {
 		stream := "event: endpoint\ndata: " + line + "\n\n"
-		return readSSEEndpoint(bufio.NewReader(strings.NewReader(stream)), base)
+		return readSSEEndpoint(bufio.NewScanner(strings.NewReader(stream)), base)
 	}
 	for _, line := range []string{
 		"/message?sessionId=1",
@@ -153,7 +153,7 @@ func TestReadSSEEndpointDefaultPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	stream := "data: https://mcp.example.com:443/message\n\n"
-	if _, err := readSSEEndpoint(bufio.NewReader(strings.NewReader(stream)), base); err != nil {
+	if _, err := readSSEEndpoint(bufio.NewScanner(strings.NewReader(stream)), base); err != nil {
 		t.Fatalf("explicit default port refused: %v", err)
 	}
 }
@@ -236,5 +236,119 @@ func TestMCPClientAllowsSameOriginRedirect(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+func TestReadSSEEndpointIgnoresNonEndpointEvents(t *testing.T) {
+	base, err := url.Parse("https://mcp.example.com/sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := strings.Join([]string{
+		": keepalive comment",
+		"event: ping",
+		"data: ok",
+		"",
+		"event: status",
+		"data: ready",
+		"",
+		"event: endpoint",
+		"data: /message?sessionId=real-123",
+		"",
+	}, "\n")
+	got, err := readSSEEndpoint(bufio.NewScanner(strings.NewReader(stream)), base)
+	if err != nil {
+		t.Fatalf("readSSEEndpoint failed: %v", err)
+	}
+	want := "https://mcp.example.com/message?sessionId=real-123"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestLegacySSEMultiLineDataAndAlive(t *testing.T) {
+	messages := make(chan string, 4)
+	closeStream := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sse":
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			// Emit a non-endpoint event before the endpoint event.
+			fmt.Fprint(w, "event: ping\ndata: keepalive\n\n")
+			fmt.Fprint(w, "event: endpoint\ndata: /message\n\n")
+			flusher.Flush()
+			for {
+				select {
+				case frame := <-messages:
+					fmt.Fprint(w, frame)
+					flusher.Flush()
+				case <-closeStream:
+					return
+				case <-r.Context().Done():
+					return
+				}
+			}
+		case "/message":
+			var req rpcRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			if req.ID == 0 {
+				return
+			}
+			var res any
+			switch req.Method {
+			case "initialize":
+				res = map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}}
+			case "tools/call":
+				res = map[string]any{"content": []any{map[string]any{"type": "text", "text": "multiline-ok"}}}
+			default:
+				res = map[string]any{}
+			}
+			resBytes, _ := json.Marshal(res)
+			pretty, _ := json.MarshalIndent(rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: resBytes}, "", "  ")
+			var frame strings.Builder
+			frame.WriteString("event: message\n")
+			for _, ln := range strings.Split(string(pretty), "\n") {
+				frame.WriteString("data: ")
+				frame.WriteString(ln)
+				frame.WriteByte('\n')
+			}
+			frame.WriteByte('\n')
+			messages <- frame.String()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := NewSSE(ctx, "test", srv.URL+"/sse", nil, false)
+	if err != nil {
+		t.Fatalf("NewSSE failed: %v", err)
+	}
+	defer c.Close()
+
+	if !c.Alive() {
+		t.Fatal("expected live SSE client to report Alive() == true")
+	}
+	got, err := c.Call(ctx, "echo", map[string]any{})
+	if err != nil || got != "multiline-ok" {
+		t.Fatalf("Call() = %q, %v; want multiline-ok", got, err)
+	}
+
+	// Simulate remote SSE disconnect and confirm Alive() flips false.
+	close(closeStream)
+	select {
+	case <-c.streamDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for SSE streamDone")
+	}
+	if c.Alive() {
+		t.Fatal("expected disconnected SSE client to report Alive() == false")
 	}
 }

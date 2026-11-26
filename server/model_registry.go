@@ -141,19 +141,23 @@ func (r *modelRegistry) Refresh(ctx context.Context, force bool) bool {
 		r.mu.Unlock()
 		return true
 	}
-	if !force && !r.lastAttempt.IsZero() && time.Since(r.lastAttempt) < modelsDevRetryBackoff {
-		r.mu.Unlock()
-		return r.snap != nil
-	}
 	if r.refreshing {
 		ch := r.doneCh
 		r.mu.Unlock()
 		select {
 		case <-ch:
-			return true
+			r.mu.RLock()
+			ok := r.snap != nil
+			r.mu.RUnlock()
+			return ok
 		case <-ctx.Done():
 			return false
 		}
+	}
+	if !force && !r.lastAttempt.IsZero() && time.Since(r.lastAttempt) < modelsDevRetryBackoff {
+		ok := r.snap != nil
+		r.mu.Unlock()
+		return ok
 	}
 	r.refreshing = true
 	r.lastAttempt = time.Now()
@@ -256,20 +260,22 @@ func (r *modelRegistry) Lookup(provider, modelID string) (modelDetail, bool) {
 	}
 
 	d := modelDetail{
-		ID:                  modelID,
-		Label:               hit.Name,
-		ContextWindow:       hit.ContextWindow,
-		ContextWindowK:      tokensToK(hit.ContextWindow),
-		MaxOutputTokens:     hit.MaxOutputTokens,
-		ReasoningLevels:     append([]string(nil), hit.ReasoningLevels...),
-		ReleaseDate:         hit.ReleaseDate,
-		SupportsTools:       hit.SupportsTools,
-		SupportsVision:      hit.SupportsVision,
-		PriceInputPerM:      hit.PriceInputPerM,
-		PriceOutputPerM:     hit.PriceOutputPerM,
-		PriceCacheReadPerM:  hit.PriceCacheReadPerM,
-		PriceCacheWritePerM: hit.PriceCacheWritePerM,
-		Source:              "models.dev",
+		ID:              modelID,
+		Label:           hit.Name,
+		ContextWindow:   hit.ContextWindow,
+		ContextWindowK:  tokensToK(hit.ContextWindow),
+		MaxOutputTokens: hit.MaxOutputTokens,
+		ReasoningLevels: append([]string(nil), hit.ReasoningLevels...),
+		ReleaseDate:     hit.ReleaseDate,
+		SupportsTools:   hit.SupportsTools,
+		SupportsVision:  hit.SupportsVision,
+		Source:          "models.dev",
+	}
+	if provider != "ollama" {
+		d.PriceInputPerM = hit.PriceInputPerM
+		d.PriceOutputPerM = hit.PriceOutputPerM
+		d.PriceCacheReadPerM = hit.PriceCacheReadPerM
+		d.PriceCacheWritePerM = hit.PriceCacheWritePerM
 	}
 	if len(d.ReasoningLevels) > 0 {
 		for _, pref := range []string{"high", "medium", "low"} {
@@ -308,7 +314,7 @@ func modelsDevProviderKeys(provider, rawLower string) []string {
 	case "anthropic", "anthropic-oauth":
 		out = append(out, "anthropic")
 	case "openai", "openai-responses", "chatgpt":
-		out = append(out, "openai", "openrouter")
+		out = append(out, "openai")
 	case "opencode-zen":
 		out = append(out, "opencode", "anthropic", "openai", "google", "deepseek", "xai")
 	case "opencode-go":
@@ -384,6 +390,26 @@ func fetchModelsDevSnapshot(ctx context.Context, client *http.Client, endpoint s
 	return parseModelsDevDocument(body)
 }
 
+// modelsDevVariantScore ranks candidate entries that normalize to the same key
+// so unsuffixed/paid canonical entries deterministically beat `:free` or other
+// `:variant` entries regardless of Go map iteration order.
+func modelsDevVariantScore(lowID, normID string, e modelsDevEntry) int {
+	score := 0
+	if lowID == normID {
+		score += 100
+	}
+	if !strings.Contains(lowID, ":") {
+		score += 40
+	}
+	if !strings.HasSuffix(lowID, ":free") && !strings.Contains(strings.ToLower(e.Name), "(free)") {
+		score += 20
+	}
+	if e.PriceInputPerM > 0 || e.PriceOutputPerM > 0 {
+		score += 10
+	}
+	return score
+}
+
 func parseModelsDevDocument(body []byte) (*modelsDevSnapshot, error) {
 	// Parse top-level provider map lazily so we skip struct reflection on ~310 non-canonical providers.
 	var top map[string]json.RawMessage
@@ -423,6 +449,8 @@ func parseModelsDevDocument(body []byte) (*modelsDevSnapshot, error) {
 		Global:     make(map[string]modelsDevEntry, 512),
 	}
 	globalRank := make(map[string]int, 512)
+	globalScore := make(map[string]int, 512)
+	globalID := make(map[string]string, 512)
 
 	for provKey, rawProv := range top {
 		pk := strings.ToLower(strings.TrimSpace(provKey))
@@ -435,6 +463,8 @@ func parseModelsDevDocument(body []byte) (*modelsDevSnapshot, error) {
 			continue
 		}
 		pm := make(map[string]modelsDevEntry, len(prov.Models))
+		pmNormScore := make(map[string]int, len(prov.Models))
+		pmNormID := make(map[string]string, len(prov.Models))
 		for mapID, m := range prov.Models {
 			id := strings.TrimSpace(m.ID)
 			if id == "" {
@@ -486,19 +516,35 @@ func parseModelsDevDocument(body []byte) (*modelsDevSnapshot, error) {
 			}
 			lowID := strings.ToLower(id)
 			normID := normalizeModelKey(id)
+			vScore := modelsDevVariantScore(lowID, normID, entry)
 			pm[lowID] = entry
-			if normID != "" && normID != lowID {
-				if _, exists := pm[normID]; !exists {
-					pm[normID] = entry
+			if normID != "" {
+				if lowID == normID {
+					pmNormScore[normID] = vScore
+					pmNormID[normID] = lowID
+				} else {
+					prevScore, exists := pmNormScore[normID]
+					if !exists || vScore > prevScore || (vScore == prevScore && lowID < pmNormID[normID]) {
+						pm[normID] = entry
+						pmNormScore[normID] = vScore
+						pmNormID[normID] = lowID
+					}
 				}
 			}
-			if rank > globalRank[lowID] {
-				globalRank[lowID] = rank
-				snap.Global[lowID] = entry
+			putGlobal := func(key string) {
+				prevRank, exists := globalRank[key]
+				if !exists ||
+					rank > prevRank ||
+					(rank == prevRank && (vScore > globalScore[key] || (vScore == globalScore[key] && lowID < globalID[key]))) {
+					globalRank[key] = rank
+					globalScore[key] = vScore
+					globalID[key] = lowID
+					snap.Global[key] = entry
+				}
 			}
-			if normID != "" && rank > globalRank[normID] {
-				globalRank[normID] = rank
-				snap.Global[normID] = entry
+			putGlobal(lowID)
+			if normID != "" && normID != lowID {
+				putGlobal(normID)
 			}
 		}
 		if len(pm) > 0 {
@@ -587,6 +633,15 @@ func (s *Server) writeDiskProviderCatalog(provider string, models []string, deta
 		Details:   details,
 	}
 	_ = writeJSONAtomic(filepath.Join(dir, key+".json"), doc)
+}
+
+func (s *Server) deleteDiskProviderCatalog(provider string) {
+	dir := s.modelCatalogCacheDir()
+	key := safeCatalogFileKey(provider)
+	if dir == "" || key == "" {
+		return
+	}
+	_ = os.Remove(filepath.Join(dir, key+".json"))
 }
 
 func writeJSONAtomic(dest string, v any) error {

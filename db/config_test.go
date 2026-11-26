@@ -80,6 +80,52 @@ func TestDeleteProfileContextHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestSaveProfileClearAPIKey(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		SkipPGUnavailable(t, err)
+	}
+	t.Cleanup(func() { d.Close() })
+
+	name := fmt.Sprintf("t-clear-key-%d", time.Now().UnixNano())
+	pid, err := d.SaveProfile(&LLMProfile{
+		Name: name, Format: "anthropic", Model: "claude-x", APIKey: "sk-original-1234",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { deleteTestProfile(t, d, pid) })
+
+	// Default blank update keeps existing key and hint.
+	if _, err := d.SaveProfile(&LLMProfile{
+		ID: pid, Name: name, Format: "anthropic", Model: "claude-y",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.ProfileByID(pid)
+	if err != nil || got == nil || got.APIKey != "sk-original-1234" {
+		t.Fatalf("blank update without ClearAPIKey: got=%+v err=%v", got, err)
+	}
+
+	// Update with ClearAPIKey=true and blank APIKey clears both api_key and api_key_hint to NULL.
+	if _, err := d.SaveProfile(&LLMProfile{
+		ID: pid, Name: name, Format: "chatgpt", Model: "gpt-5.4", ClearAPIKey: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d.ProfileByID(pid)
+	if err != nil || got == nil || got.APIKey != "" {
+		t.Fatalf("ClearAPIKey update kept api_key: got=%+v err=%v", got, err)
+	}
+	var keyNull, hintNull bool
+	if err := d.QueryRow(`SELECT api_key IS NULL, api_key_hint IS NULL FROM llm_profiles WHERE id=$1`, pid).Scan(&keyNull, &hintNull); err != nil {
+		t.Fatal(err)
+	}
+	if !keyNull || !hintNull {
+		t.Fatalf("expected api_key and api_key_hint to be NULL, got keyNull=%v hintNull=%v", keyNull, hintNull)
+	}
+}
+
 func TestConfigStores(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {

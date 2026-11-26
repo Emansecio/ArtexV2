@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 const (
@@ -34,9 +35,13 @@ const (
 
 	agyStartupTimeout       = 60 * time.Second
 	agyParallelToolDebounce = 25 * time.Millisecond
-	agyIdleRetire           = 5 * time.Minute
 	agyEventIdleTimeout     = 300 * time.Second
 	agyDefaultMaxProcs      = 6
+)
+
+var (
+	agyIdleRetire   = 5 * time.Minute
+	agyReapInterval = time.Minute
 )
 
 func agyMaxProcs() int {
@@ -71,6 +76,7 @@ type agyProcess struct {
 	cmd               *exec.Cmd
 	stdin             io.WriteCloser
 	msgCh             chan agyACPMessage
+	done              chan struct{}
 	bridge            *agyMCPBridge
 	nextID            uint64
 	toolsKey          string
@@ -87,6 +93,7 @@ type agyProcess struct {
 	activePromptID    uint64
 	parked            map[string]chan agyMCPToolOutput
 	deliveredMessages int
+	deliveredHashes   []uint64
 	lastUsed          time.Time
 
 	killOnce sync.Once
@@ -169,6 +176,9 @@ func (p *agyProcess) rpc(ctx context.Context, method string, params any) (json.R
 
 func (p *agyProcess) Kill() {
 	p.killOnce.Do(func() {
+		if p.done != nil {
+			close(p.done)
+		}
 		for k, ch := range p.parked {
 			close(ch)
 			delete(p.parked, k)
@@ -189,15 +199,119 @@ func (p *agyProcess) Kill() {
 // ---------- Global process pool ----------
 
 type agyPoolSlot struct {
-	mu   sync.Mutex
-	proc *agyProcess
+	mu        sync.Mutex
+	proc      *agyProcess
+	lastUsed  time.Time
+	evicted   bool
+	abandoned bool
+
+	cancelMu     sync.Mutex
+	cancel       context.CancelFunc
+	shuttingDown bool
+}
+
+func (s *agyPoolSlot) setCancel(fn context.CancelFunc) bool {
+	s.cancelMu.Lock()
+	if s.shuttingDown {
+		s.cancelMu.Unlock()
+		fn()
+		return false
+	}
+	s.cancel = fn
+	s.cancelMu.Unlock()
+	return true
+}
+
+func (s *agyPoolSlot) clearCancel() {
+	s.cancelMu.Lock()
+	s.cancel = nil
+	s.cancelMu.Unlock()
+}
+
+func (s *agyPoolSlot) beginShutdown() {
+	s.cancelMu.Lock()
+	s.shuttingDown = true
+	fn := s.cancel
+	s.cancelMu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 var (
-	agyPoolMu    sync.Mutex
-	agyPoolSlots = map[string]*agyPoolSlot{}
-	agySessionSeq atomic.Uint64
+	agyPoolMu        sync.Mutex
+	agyPoolSlots     = map[string]*agyPoolSlot{}
+	agySessionSeq    atomic.Uint64
+	agyReaperRunning bool
+	agyReaperStop    chan struct{}
 )
+
+func reapIdleAgyLocked(now time.Time) []*agyProcess {
+	var toKill []*agyProcess
+	retire := agyIdleRetire
+	for k, s := range agyPoolSlots {
+		if s.mu.TryLock() {
+			if s.proc != nil && now.Sub(s.proc.lastUsed) > retire {
+				toKill = append(toKill, s.proc)
+				s.proc = nil
+				s.evicted = true
+				delete(agyPoolSlots, k)
+			} else if s.proc == nil && (s.abandoned || (!s.lastUsed.IsZero() && now.Sub(s.lastUsed) > retire)) {
+				s.evicted = true
+				delete(agyPoolSlots, k)
+			}
+			s.mu.Unlock()
+		}
+	}
+	return toKill
+}
+
+func ensureAgyReaperLocked() {
+	if agyReaperRunning || len(agyPoolSlots) == 0 {
+		return
+	}
+	interval := agyReapInterval
+	if agyIdleRetire > 0 && agyIdleRetire < interval {
+		interval = agyIdleRetire
+	}
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	stop := make(chan struct{})
+	agyReaperRunning = true
+	agyReaperStop = stop
+	go agyIdleReaperLoop(stop, interval)
+}
+
+func agyIdleReaperLoop(stop chan struct{}, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			agyPoolMu.Lock()
+			if agyReaperStop != stop {
+				agyPoolMu.Unlock()
+				return
+			}
+			toKill := reapIdleAgyLocked(time.Now())
+			empty := len(agyPoolSlots) == 0
+			if empty {
+				agyReaperRunning = false
+				agyReaperStop = nil
+			}
+			agyPoolMu.Unlock()
+			for _, proc := range toKill {
+				proc.Kill()
+			}
+			if empty {
+				return
+			}
+		}
+	}
+}
 
 func getAgyPoolSlot(slotKey string) *agyPoolSlot {
 	var toKill []*agyProcess
@@ -209,32 +323,33 @@ func getAgyPoolSlot(slotKey string) *agyPoolSlot {
 		return slot
 	}
 
-	// Evict idle processes first, then LRU non-busy process if at cap.
+	// Evict idle processes and abandoned empty slots first, then LRU non-busy process if at cap.
 	now := time.Now()
-	for k, s := range agyPoolSlots {
-		if s.mu.TryLock() {
-			if s.proc != nil && now.Sub(s.proc.lastUsed) > agyIdleRetire {
-				toKill = append(toKill, s.proc)
-				s.proc = nil
-				delete(agyPoolSlots, k)
-			}
-			s.mu.Unlock()
-		}
-	}
+	toKill = append(toKill, reapIdleAgyLocked(now)...)
 	for len(agyPoolSlots) >= maxProcs {
 		var oldestKey string
 		var oldestTime time.Time
 		var oldestSlot *agyPoolSlot
 		for k, s := range agyPoolSlots {
 			if s.mu.TryLock() {
-				t := time.Time{}
 				if s.proc != nil {
-					t = s.proc.lastUsed
-				}
-				if oldestSlot == nil || t.Before(oldestTime) {
-					oldestKey = k
-					oldestTime = t
-					oldestSlot = s
+					t := s.proc.lastUsed
+					if t.IsZero() {
+						t = s.lastUsed
+					}
+					if oldestSlot == nil || t.Before(oldestTime) {
+						oldestKey = k
+						oldestTime = t
+						oldestSlot = s
+					}
+				} else if s.abandoned || (!s.lastUsed.IsZero() && now.Sub(s.lastUsed) > agyIdleRetire) {
+					// Never treat a brand-new unlocked slot (proc==nil, abandoned==false) as an
+					// immediate LRU eviction target; only reap abandoned or expired empty slots.
+					if oldestSlot == nil || s.lastUsed.Before(oldestTime) {
+						oldestKey = k
+						oldestTime = s.lastUsed
+						oldestSlot = s
+					}
 				}
 				s.mu.Unlock()
 			}
@@ -247,6 +362,7 @@ func getAgyPoolSlot(slotKey string) *agyPoolSlot {
 				toKill = append(toKill, oldestSlot.proc)
 				oldestSlot.proc = nil
 			}
+			oldestSlot.evicted = true
 			delete(agyPoolSlots, oldestKey)
 			oldestSlot.mu.Unlock()
 		} else {
@@ -254,8 +370,9 @@ func getAgyPoolSlot(slotKey string) *agyPoolSlot {
 		}
 	}
 
-	slot := &agyPoolSlot{}
+	slot := &agyPoolSlot{lastUsed: now}
 	agyPoolSlots[slotKey] = slot
+	ensureAgyReaperLocked()
 	agyPoolMu.Unlock()
 
 	for _, proc := range toKill {
@@ -272,10 +389,57 @@ func ShutdownAntigravityPool() {
 		slots = append(slots, s)
 		delete(agyPoolSlots, k)
 	}
+	if agyReaperRunning && agyReaperStop != nil {
+		close(agyReaperStop)
+		agyReaperStop = nil
+		agyReaperRunning = false
+	}
 	agyPoolMu.Unlock()
 
 	for _, s := range slots {
+		s.beginShutdown()
+	}
+	for _, s := range slots {
 		s.mu.Lock()
+		s.evicted = true
+		if s.proc != nil {
+			s.proc.Kill()
+			s.proc = nil
+		}
+		s.mu.Unlock()
+	}
+}
+
+// ShutdownAntigravitySession terminates any pooled `agy acp` subprocess bound
+// to sessionID (used by one-shot callers such as TestConnection so ephemeral
+// sessions do not linger in the pool).
+func ShutdownAntigravitySession(sessionID string) {
+	sid := strings.TrimSpace(sessionID)
+	if sid == "" {
+		return
+	}
+	suffix := ":" + sid
+	agyPoolMu.Lock()
+	var slots []*agyPoolSlot
+	for k, s := range agyPoolSlots {
+		if strings.HasSuffix(k, suffix) {
+			slots = append(slots, s)
+			delete(agyPoolSlots, k)
+		}
+	}
+	if len(agyPoolSlots) == 0 && agyReaperRunning && agyReaperStop != nil {
+		close(agyReaperStop)
+		agyReaperStop = nil
+		agyReaperRunning = false
+	}
+	agyPoolMu.Unlock()
+
+	for _, s := range slots {
+		s.beginShutdown()
+	}
+	for _, s := range slots {
+		s.mu.Lock()
+		s.evicted = true
 		if s.proc != nil {
 			s.proc.Kill()
 			s.proc = nil
@@ -303,7 +467,11 @@ func ShutdownAntigravityAccount(accountKey string) {
 	agyPoolMu.Unlock()
 
 	for _, s := range slots {
+		s.beginShutdown()
+	}
+	for _, s := range slots {
 		s.mu.Lock()
+		s.evicted = true
 		if s.proc != nil {
 			s.proc.Kill()
 			s.proc = nil
@@ -385,28 +553,71 @@ func (p *antigravityProvider) Stream(ctx context.Context, req CompletionRequest)
 		systemPrompt := joinSystem(req.System)
 		toolsKey := agyToolsFingerprint(req.Tools)
 		systemHash := agyFNV1a([]byte(systemPrompt))
-		sessionKey := strings.TrimSpace(req.PromptCacheKey)
+		sessionKey := strings.TrimSpace(req.SessionID)
 		if sessionKey == "" {
-			sessionKey = p.defaultSessionKey
+			if pk := strings.TrimSpace(req.PromptCacheKey); pk != "" {
+				// PromptCacheKey is often shared across concurrent workers as a
+				// prefix-cache hint; incorporate systemHash so distinct intents
+				// never collide on the same stateful agy acp process slot.
+				sessionKey = fmt.Sprintf("%s:%x", pk, systemHash)
+			} else {
+				sessionKey = fmt.Sprintf("%s:%x", p.defaultSessionKey, systemHash)
+			}
 		}
 		slotKey := accountKey + ":" + sessionKey
-		slot := getAgyPoolSlot(slotKey)
-		slot.mu.Lock()
-		defer slot.mu.Unlock()
+		var slot *agyPoolSlot
+		for {
+			slot = getAgyPoolSlot(slotKey)
+			slot.mu.Lock()
+			if !slot.evicted {
+				break
+			}
+			slot.mu.Unlock()
+		}
+		slot.lastUsed = time.Now()
+		slot.abandoned = false
+		turnCtx, cancelTurn := context.WithCancel(ctx)
+		if !slot.setCancel(cancelTurn) {
+			if slot.proc != nil {
+				slot.proc.Kill()
+				slot.proc = nil
+			}
+			slot.abandoned = true
+			slot.mu.Unlock()
+			yield(StreamEvent{}, turnCtx.Err())
+			return
+		}
+		defer func() {
+			slot.clearCancel()
+			cancelTurn()
+			now := time.Now()
+			slot.lastUsed = now
+			if slot.proc != nil {
+				slot.proc.lastUsed = now
+			}
+			slot.abandoned = slot.proc == nil
+			slot.mu.Unlock()
+		}()
+
+		var followUpMsgs []Message
+		canContinue := false
+		if slot.proc != nil && slot.proc.activePromptID == 0 && slot.proc.deliveredMessages > 0 {
+			followUpMsgs, canContinue = agyFollowUpDelta(req.Messages, slot.proc.deliveredHashes)
+		}
 
 		needsRestart := slot.proc == nil ||
 			slot.proc.toolsKey != toolsKey ||
 			slot.proc.systemHash != systemHash ||
 			slot.proc.credentialVersion != credVersion ||
 			(slot.proc.activePromptID != 0 && !agyHasMatchingParkedResults(slot.proc, req.Messages)) ||
-			(slot.proc.activePromptID == 0 && slot.proc.deliveredMessages > 0 && len(req.Messages) <= slot.proc.deliveredMessages)
+			(slot.proc.activePromptID == 0 && slot.proc.deliveredMessages > 0 && !canContinue)
 
 		if needsRestart {
 			if slot.proc != nil {
 				slot.proc.Kill()
 				slot.proc = nil
 			}
-			binary, berr := ResolveAgyBinary(ctx, p.httpClient())
+			binary, berr := ResolveAgyBinary(turnCtx, p.httpClient())
 			if berr != nil {
 				yield(StreamEvent{}, berr)
 				return
@@ -415,7 +626,7 @@ func (p *antigravityProvider) Stream(ctx context.Context, req CompletionRequest)
 			if cwd == "" {
 				cwd = geminiDir
 			}
-			proc, serr := spawnAgyProcess(ctx, binary, geminiDir, cwd, systemPrompt, req.Tools, toolsKey, systemHash, credVersion)
+			proc, serr := spawnAgyProcess(turnCtx, binary, geminiDir, cwd, systemPrompt, req.Tools, toolsKey, systemHash, credVersion)
 			if serr != nil {
 				yield(StreamEvent{}, serr)
 				return
@@ -443,7 +654,7 @@ func (p *antigravityProvider) Stream(ctx context.Context, req CompletionRequest)
 		}
 
 		if proc.activePromptID == 0 {
-			if cerr := configureAgySession(ctx, proc, modelID, effort); cerr != nil {
+			if cerr := configureAgySession(turnCtx, proc, modelID, effort); cerr != nil {
 				proc.Kill()
 				slot.proc = nil
 				yield(StreamEvent{}, cerr)
@@ -454,13 +665,13 @@ func (p *antigravityProvider) Stream(ctx context.Context, req CompletionRequest)
 		if proc.activePromptID != 0 {
 			agyDeliverParkedToolResults(proc, req.Messages)
 			proc.deliveredMessages = len(req.Messages)
+			proc.deliveredHashes = agyHashMessages(req.Messages)
 		} else {
 			var promptText string
 			if proc.deliveredMessages == 0 {
 				promptText = agyFormatTranscript(req.Messages)
 			} else {
-				start := min(proc.deliveredMessages, len(req.Messages))
-				promptText = agyFormatTranscript(req.Messages[start:])
+				promptText = agyFormatTranscript(followUpMsgs)
 			}
 			proc.nextID++
 			promptID := proc.nextID
@@ -482,9 +693,10 @@ func (p *antigravityProvider) Stream(ctx context.Context, req CompletionRequest)
 			}
 			proc.activePromptID = promptID
 			proc.deliveredMessages = len(req.Messages)
+			proc.deliveredHashes = agyHashMessages(req.Messages)
 		}
 
-		if aborted, err := agyDriveTurn(ctx, proc, yield); err != nil {
+		if aborted, err := agyDriveTurn(turnCtx, proc, yield); err != nil {
 			proc.Kill()
 			slot.proc = nil
 			yield(StreamEvent{}, err)
@@ -545,8 +757,17 @@ func spawnAgyProcess(
 	go func() { _, _ = io.Copy(io.Discard, stderr) }()
 
 	msgCh := make(chan agyACPMessage, 128)
+	done := make(chan struct{})
 	go func() {
 		defer close(msgCh)
+		send := func(m agyACPMessage) bool {
+			select {
+			case msgCh <- m:
+				return true
+			case <-done:
+				return false
+			}
+		}
 		sc := bufio.NewScanner(stdout)
 		sc.Buffer(make([]byte, 64*1024), 8*1024*1024)
 		for sc.Scan() {
@@ -567,24 +788,31 @@ func spawnAgyProcess(
 			hasID := len(raw.ID) > 0 && string(raw.ID) != "null"
 			if raw.Method != "" {
 				if hasID {
-					msgCh <- agyACPMessage{kind: agyMsgServerRequest, rawID: raw.ID, method: raw.Method}
+					if !send(agyACPMessage{kind: agyMsgServerRequest, rawID: raw.ID, method: raw.Method}) {
+						return
+					}
 				} else {
-					msgCh <- agyACPMessage{kind: agyMsgNotification, method: raw.Method, params: raw.Params}
+					if !send(agyACPMessage{kind: agyMsgNotification, method: raw.Method, params: raw.Params}) {
+						return
+					}
 				}
 			} else if hasID {
 				var idNum uint64
 				if err := json.Unmarshal(raw.ID, &idNum); err == nil {
-					msgCh <- agyACPMessage{kind: agyMsgResponse, id: idNum, result: raw.Result, errObj: raw.Error}
+					if !send(agyACPMessage{kind: agyMsgResponse, id: idNum, result: raw.Result, errObj: raw.Error}) {
+						return
+					}
 				}
 			}
 		}
-		msgCh <- agyACPMessage{kind: agyMsgEOF}
+		_ = send(agyACPMessage{kind: agyMsgEOF})
 	}()
 
 	proc := &agyProcess{
 		cmd:               cmd,
 		stdin:             stdin,
 		msgCh:             msgCh,
+		done:              done,
 		bridge:            bridge,
 		toolsKey:          toolsKey,
 		systemHash:        systemHash,
@@ -640,11 +868,13 @@ func configureAgySession(ctx context.Context, proc *agyProcess, modelID, effort 
 		proc.configuredModel = agyModel
 	}
 	if agyModel == modelID && effort != "" && proc.configuredEffort != effort {
-		_, _ = proc.rpc(ctx, "session/set_config_option", map[string]any{
+		if _, err := proc.rpc(ctx, "session/set_config_option", map[string]any{
 			"sessionId": proc.sessionID,
 			"configId":  "thought_level",
 			"value":     effort,
-		})
+		}); err != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		proc.configuredEffort = effort
 	}
 	return nil
@@ -656,6 +886,9 @@ func agyDriveTurn(ctx context.Context, proc *agyProcess, yield func(StreamEvent,
 	sawToolCall := false
 	var toolIndex int
 	var textTail strings.Builder
+	totalTextLen := 0
+	bufferingBanner := true
+	var pendingBanner strings.Builder
 
 	emit := func(ev StreamEvent) bool {
 		if !started {
@@ -665,6 +898,16 @@ func agyDriveTurn(ctx context.Context, proc *agyProcess, yield func(StreamEvent,
 			}
 		}
 		return yield(ev, nil)
+	}
+
+	flushBanner := func() bool {
+		bufferingBanner = false
+		if pendingBanner.Len() == 0 {
+			return true
+		}
+		txt := pendingBanner.String()
+		pendingBanner.Reset()
+		return emit(StreamEvent{Type: SETextDelta, Text: txt})
 	}
 
 	idleTimer := time.NewTimer(agyEventIdleTimeout)
@@ -696,6 +939,9 @@ func agyDriveTurn(ctx context.Context, proc *agyProcess, yield func(StreamEvent,
 
 		case parked := <-proc.bridge.callCh:
 			idleTimer.Reset(agyEventIdleTimeout)
+			if !flushBanner() {
+				return true, nil
+			}
 			args := strings.TrimSpace(string(parked.Arguments))
 			if args == "" {
 				args = "{}"
@@ -747,17 +993,21 @@ func agyDriveTurn(ctx context.Context, proc *agyProcess, yield func(StreamEvent,
 						return true, nil
 					}
 				case "agent_message_chunk":
-					if qerr := agyQuotaNoticeError(text); qerr != nil {
-						return false, qerr
+					totalTextLen += len(text)
+					if textTail.Len() < 2048 {
+						textTail.WriteString(text)
 					}
-					textTail.WriteString(text)
-					if textTail.Len() > 2048 {
-						s := textTail.String()
-						textTail.Reset()
-						textTail.WriteString(s[len(s)-1024:])
-					}
-					if !emit(StreamEvent{Type: SETextDelta, Text: text}) {
-						return true, nil
+					if bufferingBanner && !sawToolCall {
+						pendingBanner.WriteString(text)
+						if totalTextLen > 600 || !agyCouldBeQuotaBannerPrefix(pendingBanner.String()) {
+							if !flushBanner() {
+								return true, nil
+							}
+						}
+					} else {
+						if !emit(StreamEvent{Type: SETextDelta, Text: text}) {
+							return true, nil
+						}
 					}
 				}
 			case agyMsgResponse:
@@ -783,8 +1033,11 @@ func agyDriveTurn(ctx context.Context, proc *agyProcess, yield func(StreamEvent,
 						Body:       e.Message,
 					}
 				}
-				if qerr := agyQuotaNoticeError(textTail.String()); qerr != nil {
+				if qerr := agyStandaloneQuotaNoticeError(textTail.String(), totalTextLen, sawToolCall); qerr != nil {
 					return false, qerr
+				}
+				if !flushBanner() {
+					return true, nil
 				}
 				stopReason := "end_turn"
 				if sawToolCall {
@@ -819,6 +1072,53 @@ func agyQuotaNoticeError(text string) error {
 		}
 	}
 	return nil
+}
+
+var agyQuotaBannerPrefixes = []string{
+	"api error:",
+	"error:",
+	"resource_exhausted",
+	"quota reached",
+	"you have reached",
+}
+
+// agyCouldBeQuotaBannerPrefix returns true while buffered leading text could
+// still become one of agyStandaloneQuotaNoticeError's standalone quota banners.
+func agyCouldBeQuotaBannerPrefix(text string) bool {
+	trimmed := strings.TrimLeftFunc(text, unicode.IsSpace)
+	if trimmed == "" {
+		return true
+	}
+	low := strings.ToLower(trimmed)
+	for _, prefix := range agyQuotaBannerPrefixes {
+		if strings.HasPrefix(prefix, low) || strings.HasPrefix(low, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// agyStandaloneQuotaNoticeError classifies assistant text as an `agy` quota
+// banner only when no tool calls occurred and the complete response is a short
+// standalone error notice — preventing legitimate prose discussing HTTP 429 or
+// RESOURCE_EXHAUSTED from aborting turns.
+func agyStandaloneQuotaNoticeError(text string, totalLen int, sawToolCall bool) error {
+	if sawToolCall || totalLen == 0 || totalLen > 600 {
+		return nil
+	}
+	trimmed := strings.TrimSpace(text)
+	low := strings.ToLower(trimmed)
+	isBanner := false
+	for _, prefix := range agyQuotaBannerPrefixes {
+		if strings.HasPrefix(low, prefix) {
+			isBanner = true
+			break
+		}
+	}
+	if !isBanner {
+		return nil
+	}
+	return agyQuotaNoticeError(trimmed)
 }
 
 func agyExtractSessionUpdate(params json.RawMessage) (kind, text string) {
@@ -900,18 +1200,86 @@ func agyExtractConfigOptionValues(payload json.RawMessage, configID string) []st
 	return nil
 }
 
+func agyMessageHash(m Message) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(m.Role))
+	_, _ = h.Write([]byte{0})
+	for _, b := range m.Content {
+		_, _ = h.Write([]byte(b.Type))
+		_, _ = h.Write([]byte{1})
+		_, _ = h.Write([]byte(b.Text))
+		_, _ = h.Write([]byte{1})
+		_, _ = h.Write([]byte(b.ID))
+		_, _ = h.Write([]byte{1})
+		_, _ = h.Write([]byte(b.Name))
+		_, _ = h.Write([]byte{1})
+		_, _ = h.Write(b.Input)
+		_, _ = h.Write([]byte{1})
+		_, _ = h.Write([]byte(b.ToolUseID))
+		if b.IsError {
+			_, _ = h.Write([]byte{2})
+		} else {
+			_, _ = h.Write([]byte{3})
+		}
+		for _, sub := range b.Content {
+			_, _ = h.Write([]byte(sub.Type))
+			_, _ = h.Write([]byte{4})
+			_, _ = h.Write([]byte(sub.Text))
+			_, _ = h.Write([]byte{4})
+		}
+	}
+	return h.Sum64()
+}
+
+func agyHashMessages(msgs []Message) []uint64 {
+	out := make([]uint64, len(msgs))
+	for i, m := range msgs {
+		out[i] = agyMessageHash(m)
+	}
+	return out
+}
+
+// agyFollowUpDelta verifies msgs is a strict continuation of deliveredHashes
+// (catching compaction or a prepended/changed SystemReminder at index 0) and
+// returns the unsent follow-up slice while skipping leading assistant message(s)
+// already generated inside the live ACP session.
+func agyFollowUpDelta(msgs []Message, deliveredHashes []uint64) ([]Message, bool) {
+	if len(deliveredHashes) == 0 || len(msgs) <= len(deliveredHashes) {
+		return nil, false
+	}
+	for i, want := range deliveredHashes {
+		if agyMessageHash(msgs[i]) != want {
+			return nil, false
+		}
+	}
+	start := len(deliveredHashes)
+	for start < len(msgs) && msgs[start].Role == RoleAssistant {
+		start++
+	}
+	if start >= len(msgs) {
+		return nil, false
+	}
+	return msgs[start:], true
+}
+
+func agyTrailingUserMessages(messages []Message) []Message {
+	start := len(messages)
+	for start > 0 && messages[start-1].Role == RoleUser {
+		start--
+	}
+	return messages[start:]
+}
+
 func agyHasMatchingParkedResults(proc *agyProcess, messages []Message) bool {
 	if len(proc.parked) == 0 || len(messages) == 0 {
 		return false
 	}
-	last := messages[len(messages)-1]
-	if last.Role != RoleUser {
-		return false
-	}
-	for _, b := range last.Content {
-		if b.Type == BlockToolResult {
-			if _, ok := proc.parked[b.ToolUseID]; ok {
-				return true
+	for _, msg := range agyTrailingUserMessages(messages) {
+		for _, b := range msg.Content {
+			if b.Type == BlockToolResult {
+				if _, ok := proc.parked[b.ToolUseID]; ok {
+					return true
+				}
 			}
 		}
 	}
@@ -919,13 +1287,16 @@ func agyHasMatchingParkedResults(proc *agyProcess, messages []Message) bool {
 }
 
 func agyDeliverParkedToolResults(proc *agyProcess, messages []Message) {
-	if len(messages) > 0 {
-		last := messages[len(messages)-1]
-		if last.Role == RoleUser {
-			for _, b := range last.Content {
-				if b.Type != BlockToolResult {
-					continue
-				}
+	type parkedDelivery struct {
+		ch  chan agyMCPToolOutput
+		out agyMCPToolOutput
+	}
+	var deliveries []parkedDelivery
+	var extraUserText []string
+	for _, msg := range agyTrailingUserMessages(messages) {
+		for _, b := range msg.Content {
+			switch b.Type {
+			case BlockToolResult:
 				if ch, ok := proc.parked[b.ToolUseID]; ok {
 					delete(proc.parked, b.ToolUseID)
 					var sb strings.Builder
@@ -934,10 +1305,29 @@ func agyDeliverParkedToolResults(proc *agyProcess, messages []Message) {
 							sb.WriteString(tb.Text)
 						}
 					}
-					ch <- agyMCPToolOutput{Text: sb.String(), IsError: b.IsError}
+					deliveries = append(deliveries, parkedDelivery{
+						ch:  ch,
+						out: agyMCPToolOutput{Text: sb.String(), IsError: b.IsError},
+					})
+				}
+			case BlockText:
+				if t := strings.TrimSpace(b.Text); t != "" {
+					extraUserText = append(extraUserText, t)
 				}
 			}
 		}
+	}
+	if len(deliveries) > 0 && len(extraUserText) > 0 {
+		last := &deliveries[len(deliveries)-1]
+		suffix := strings.Join(extraUserText, "\n\n")
+		if strings.TrimSpace(last.out.Text) != "" {
+			last.out.Text = last.out.Text + "\n\n" + suffix
+		} else {
+			last.out.Text = suffix
+		}
+	}
+	for _, d := range deliveries {
+		d.ch <- d.out
 	}
 	for k, ch := range proc.parked {
 		delete(proc.parked, k)
@@ -984,8 +1374,21 @@ func agyFormatTranscript(messages []Message) string {
 				}
 			}
 		case RoleAssistant:
+			var asstParts []string
 			if txt := strings.TrimSpace(m.Text()); txt != "" {
-				parts = append(parts, "[previous assistant]\n"+txt)
+				asstParts = append(asstParts, txt)
+			}
+			for _, b := range m.Content {
+				if b.Type == BlockToolUse {
+					args := strings.TrimSpace(string(b.Input))
+					if args == "" {
+						args = "{}"
+					}
+					asstParts = append(asstParts, fmt.Sprintf("[tool call: %s] %s", b.Name, args))
+				}
+			}
+			if len(asstParts) > 0 {
+				parts = append(parts, "[previous assistant]\n"+strings.Join(asstParts, "\n"))
 			}
 		}
 	}
@@ -1000,8 +1403,13 @@ func writeAgyBridgeAgent(geminiDir string) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return fmt.Errorf("create bridge agent dir: %w", err)
 	}
-	if err := os.WriteFile(p, []byte(agyBridgeMD), 0o644); err != nil {
+	tmp := fmt.Sprintf("%s.tmp-%d-%d-%d", p, os.Getpid(), time.Now().UnixNano(), agyStageNonce.Add(1))
+	if err := os.WriteFile(tmp, []byte(agyBridgeMD), 0o644); err != nil {
 		return fmt.Errorf("write bridge agent definition: %w", err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("stage bridge agent definition: %w", err)
 	}
 	return nil
 }

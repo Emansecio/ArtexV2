@@ -38,7 +38,8 @@ mcp = _MCPServer(
     ),
 )
 
-_init_lock = threading.Lock()
+# RLock is required because _get_retriever() calls _get_store() while holding _init_lock.
+_init_lock = threading.RLock()
 _retriever: Optional[HybridRetriever] = None
 _store: Optional[KnowledgeStore] = None
 
@@ -50,8 +51,12 @@ def _get_store() -> KnowledgeStore:
     with _init_lock:
         if _store is None:
             db_file = resolve_data_dir() / "kb.sqlite"
-            # Open strictly read-only when DB exists so concurrent secrag-ingest never causes write locks.
-            _store = KnowledgeStore(read_only=db_file.exists())
+            if not db_file.exists():
+                # Bootstrap empty schema once, then close and reopen strictly read-only
+                # so every anyio worker thread uses its own TLS SQLite connection cleanly.
+                init_store = KnowledgeStore(read_only=False)
+                init_store.close()
+            _store = KnowledgeStore(read_only=True)
     return _store
 
 
@@ -67,6 +72,38 @@ def _get_retriever() -> HybridRetriever:
                 reranker=LocalReranker(),
             )
     return _retriever
+
+
+def _start_background_warmup() -> None:
+    """Pre-warm SQLite metadata cache, USearch mmap, and ONNX models in a daemon
+    thread after MCP startup so the first agent kb_search hits warm caches (~330ms)
+    instead of paying a ~3.3s cold start, without delaying initialize/tools/list."""
+    if os.environ.get("SECRAG_DISABLE_WARMUP", "").strip().lower() in ("1", "true", "yes"):
+        return
+    db_file = resolve_data_dir() / "kb.sqlite"
+    if not db_file.exists():
+        return
+
+    def _run() -> None:
+        try:
+            retr = _get_retriever()
+            idx, sig = retr.store.get_readonly_vector_index_with_sig()
+            if idx is not None:
+                retr.store._get_meta_cache(sig)
+            retr.embedder._ensure_fastembed()
+            retr.reranker._ensure_loaded()
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, name="secrag-warmup", daemon=True).start()
+
+
+VALID_SOURCES = {
+    "hacktricks", "hacktricks-cloud", "payloads", "owasp", "privesc-bins",
+    "mitre-attack", "atomic-red-team", "nuclei", "cisa-kev",
+    "bugbounty-writeups", "poc-in-github", "sigma-rules", "exploitdb",
+    "cvelist-v5", "primus-seed",
+}
 
 
 @mcp.tool(annotations=READONLY_ANNOTATIONS)
@@ -90,11 +127,17 @@ def kb_search(
             f"Invalid category '{category}'. Valid categories: "
             + ", ".join(sorted(VALID_CATEGORIES))
         )
+    src = source.strip().lower()
+    if src and src not in VALID_SOURCES:
+        return (
+            f"Invalid source '{source}'. Valid sources: "
+            + ", ".join(sorted(VALID_SOURCES))
+        )
 
     res = _get_retriever().search(
         query=query,
         category=cat or None,
-        source=source.strip().lower() or None,
+        source=src or None,
         top_k=max(1, min(int(top_k or 5), 10)),
     )
     hits = res.get("results") or []
@@ -136,6 +179,11 @@ def kb_read_section(doc_id: int, section_id: int = 0) -> str:
         f"# {data['title']}",
         f"- source: `{data['source']}` | category: `{data['category']}` | path: `{data['path']}`",
     ]
+    if data.get("section_not_found") is not None:
+        lines.append(
+            f"- note: `section_id={data['section_not_found']}` was not found in `doc_id={data['doc_id']}`; "
+            "showing document overview and available sections below."
+        )
     if data.get("breadcrumb"):
         lines.append(f"- section: {data['breadcrumb']} (`section_id={data.get('section_id')}`)")
     if data.get("cves"):
@@ -161,6 +209,8 @@ def kb_lookup_cve(cve_id: str) -> str:
 
     Prefer this tool whenever you encounter a concrete CVE identifier or want to check whether a CVE is in CISA KEV or has a Nuclei template / PoC.
     """
+    if not cve_id or not cve_id.strip():
+        return "Please provide a valid CVE identifier (e.g. 'CVE-2024-3094')."
     res = _get_store().lookup_cve(cve_id)
     matches = res.get("matches") or []
     if not matches:
@@ -224,13 +274,15 @@ def main() -> None:
     if args.data_dir:
         os.environ["SECRAG_DATA_DIR"] = args.data_dir
 
+    _start_background_warmup()
+
     if args.transport == "streamable-http":
-        if hasattr(mcp, "settings"):
+        if hasattr(mcp, "settings") and hasattr(mcp.settings, "host"):
             mcp.settings.host = args.host
             mcp.settings.port = args.port
             mcp.run(transport="streamable-http")
         else:
-            mcp.run(transport="streamable-http")
+            mcp.run(transport="streamable-http", host=args.host, port=args.port)
     else:
         mcp.run(transport="stdio")
 

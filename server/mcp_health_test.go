@@ -47,6 +47,17 @@ func TestMCPHealthStateTransitions(t *testing.T) {
 	if found.LastConnectErr != nil {
 		t.Fatalf("expected the error cleared on success, got %q", *found.LastConnectErr)
 	}
+
+	// Immediate health updates (used by discoverAndCacheMCP) must stay in sync with
+	// mcpHealthCache so a subsequent throttled update within 60s is not skipped.
+	invalidateMCPHealthCache(id)
+	updateMCPHealthThrottled(pg, id, false, "timeout")
+	updateMCPHealthImmediate(pg, id, true, "")
+	updateMCPHealthThrottled(pg, id, false, "timeout")
+	found = listMCPByName(t, pg, "health-test")
+	if found.LastConnectOK == nil || *found.LastConnectOK {
+		t.Fatalf("expected throttled false after immediate true to update DB, got %+v", found.LastConnectOK)
+	}
 }
 
 func listMCPByName(t *testing.T, pg *db.DB, name string) *db.MCPServer {

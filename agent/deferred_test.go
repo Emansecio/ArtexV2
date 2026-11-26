@@ -60,11 +60,12 @@ func TestSeedUnlockFromHistory(t *testing.T) {
 			{Type: llm.BlockToolUse, Name: "Bash", Input: json.RawMessage(`{}`)}, // ignored
 			skillCall("recon"),
 		}},
+		llm.SkillInvocationMessage("scopesentry", "/skills/scopesentry", "use scopesentry"),
 	}
 	var got []string
 	seedUnlockFromHistory(msgs, func(name string) { got = append(got, name) })
-	if strings.Join(got, ",") != "browsing,recon" {
-		t.Fatalf("unlocked=%v want [browsing recon]", got)
+	if strings.Join(got, ",") != "browsing,recon,scopesentry" {
+		t.Fatalf("unlocked=%v want [browsing recon scopesentry]", got)
 	}
 	seedUnlockFromHistory(msgs, nil) // nil → no-op, no panic
 }
@@ -92,7 +93,7 @@ func TestKnowledgeBaseGuidance(t *testing.T) {
 	dummyNoKB := []actool.CoreTool{
 		actool.Build(actool.Spec{Name: "Bash", Description: "shell"}),
 	}
-	if got := knowledgeBaseGuidance(dummyNoKB); got != "" {
+	if got := knowledgeBaseGuidance(dummyNoKB, nil); got != "" {
 		t.Fatalf("expected empty guidance without secrag tool, got %q", got)
 	}
 
@@ -100,7 +101,10 @@ func TestKnowledgeBaseGuidance(t *testing.T) {
 		Name:        "mcp__secrag__kb_search",
 		Description: "search kb",
 	}))
-	got := knowledgeBaseGuidance(dummyWithKB)
+	if got := knowledgeBaseGuidance(dummyWithKB, []string{"mcp__secrag__kb_search"}); got != "" {
+		t.Fatalf("expected empty guidance when secrag is deferred/skill-gated, got %q", got)
+	}
+	got := knowledgeBaseGuidance(dummyWithKB, nil)
 	if !strings.Contains(got, "<knowledge-base-guidance>") || !strings.Contains(got, "mcp__secrag__kb_lookup_cve") {
 		t.Fatalf("expected knowledge-base guidance block, got:\n%s", got)
 	}

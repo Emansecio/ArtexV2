@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/norma/llm"
 )
@@ -217,5 +220,286 @@ func TestDetectTestLLMSuggestedFix(t *testing.T) {
 	}
 	if nilFix := detectTestLLMSuggestedFix("anthropic", "", "unsupported_parameter max_completion_tokens"); nilFix != nil {
 		t.Fatalf("expected no suggestion for non-openai provider, got %v", nilFix)
+	}
+}
+
+func TestInvalidateModelCatalogDeletesDiskCacheAndRequiresOAuth(t *testing.T) {
+	dir := t.TempDir()
+	s := &Server{dataDir: dir}
+	s.putCachedModelCatalog("antigravity-cli", []string{"gemini-4-carbon"}, []modelDetail{{ID: "gemini-4-carbon"}})
+	s.writeDiskProviderCatalog("antigravity-cli", []string{"gemini-4-carbon"}, []modelDetail{{ID: "gemini-4-carbon"}})
+
+	if _, _, _, ok := s.readDiskProviderCatalog("antigravity-cli"); !ok {
+		t.Fatal("expected disk catalog before invalidation")
+	}
+
+	s.invalidateModelCatalogCache("antigravity-cli")
+
+	if _, _, ok := s.getCachedModelCatalog("antigravity-cli"); ok {
+		t.Fatal("expected RAM catalog cleared after invalidation")
+	}
+	if _, _, _, ok := s.readDiskProviderCatalog("antigravity-cli"); ok {
+		t.Fatal("expected disk catalog deleted after invalidation")
+	}
+
+	// Re-seed disk cache and verify signed-out pgListDevinOrAgyModels refuses stale cache.
+	s.writeDiskProviderCatalog("antigravity-cli", []string{"gemini-4-carbon"}, []modelDetail{{ID: "gemini-4-carbon"}})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/llm/models", nil)
+	s.pgListDevinOrAgyModels(rec, req, "antigravity-cli", "", "", false)
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["ok"] != false {
+		t.Fatalf("expected signed-out antigravity-cli models request to fail, got %v", body)
+	}
+}
+
+func TestModelRegistryOllamaZeroPricingAndCatalogGenGuard(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"deepseek": {
+				"models": {
+					"deepseek-r1": {
+						"id": "deepseek-r1",
+						"name": "DeepSeek R1",
+						"reasoning": true,
+						"limit": {"context": 128000, "output": 8192},
+						"cost": {"input": 0.55, "output": 2.19, "cache_read": 0.14, "cache_write": 0.55}
+					}
+				}
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	reg := newModelRegistry(t.TempDir(), srv.URL)
+	if !reg.Refresh(context.Background(), false) {
+		t.Fatal("expected refresh to succeed")
+	}
+	d, ok := reg.Lookup("ollama", "deepseek-r1:14b")
+	if !ok {
+		t.Fatal("expected ollama lookup match for deepseek-r1:14b")
+	}
+	if d.PriceInputPerM != 0 || d.PriceOutputPerM != 0 || d.PriceCacheReadPerM != 0 || d.PriceCacheWritePerM != 0 {
+		t.Fatalf("ollama models must have zero pricing, got %+v", d)
+	}
+
+	// Generation guard prevents an in-flight refresh from resurrecting a catalog after invalidation.
+	s := &Server{dataDir: t.TempDir()}
+	gen0 := s.modelCatalogGeneration("antigravity-cli")
+	s.invalidateModelCatalogCache("antigravity-cli")
+	if s.commitModelCatalogIfCurrent("antigravity-cli", gen0, "", []string{"stale-model"}, []modelDetail{{ID: "stale-model"}}, true) {
+		t.Fatal("stale generation commit must be rejected")
+	}
+	if _, _, ok := s.getCachedModelCatalog("antigravity-cli"); ok {
+		t.Fatal("stale generation must not populate RAM cache")
+	}
+	if _, _, _, ok := s.readDiskProviderCatalog("antigravity-cli"); ok {
+		t.Fatal("stale generation must not populate disk cache")
+	}
+}
+
+func TestModelRegistryConcurrentRefreshSingleflightAndFailureStatus(t *testing.T) {
+	// 1. Concurrent non-forced Refresh calls during an in-flight fetch must join
+	// singleflight (no backoff bypass, no data race on r.snap) and see the loaded snapshot.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"openai": {
+				"models": {
+					"gpt-6.2-astra": {
+						"id": "gpt-6.2-astra",
+						"name": "GPT-6.2 Astra",
+						"limit": {"context": 1000000, "output": 128000}
+					}
+				}
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	reg := newModelRegistry(t.TempDir(), srv.URL)
+	var wg sync.WaitGroup
+	results := make([]bool, 4)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results[0] = reg.Refresh(context.Background(), false)
+	}()
+
+	<-started
+	for i := 1; i < len(results); i++ {
+		idx := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[idx] = reg.Refresh(context.Background(), false)
+		}()
+	}
+
+	// Give concurrent waiters time to enter Refresh while the HTTP call is still blocked.
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if hits.Load() != 1 {
+		t.Fatalf("expected singleflight to coalesce into 1 HTTP request, got %d", hits.Load())
+	}
+	for i, ok := range results {
+		if !ok {
+			t.Fatalf("expected caller %d to observe refreshed snapshot (true), got false", i)
+		}
+	}
+	if _, ok := reg.Lookup("openai", "gpt-6.2-astra"); !ok {
+		t.Fatal("expected gpt-6.2-astra to be present after singleflight refresh")
+	}
+
+	// 2. When an in-flight refresh fails and r.snap remains nil, singleflight waiters
+	// and subsequent backoff callers must all return false (not true).
+	failStarted := make(chan struct{})
+	failRelease := make(chan struct{})
+	var failHits atomic.Int32
+	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failHits.Add(1) == 1 {
+			close(failStarted)
+			<-failRelease
+		}
+		http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+	}))
+	defer failSrv.Close()
+
+	failReg := newModelRegistry(t.TempDir(), failSrv.URL)
+	var failWG sync.WaitGroup
+	failResults := make([]bool, 3)
+
+	failWG.Add(1)
+	go func() {
+		defer failWG.Done()
+		failResults[0] = failReg.Refresh(context.Background(), false)
+	}()
+
+	<-failStarted
+	for i := 1; i < len(failResults); i++ {
+		idx := i
+		failWG.Add(1)
+		go func() {
+			defer failWG.Done()
+			failResults[idx] = failReg.Refresh(context.Background(), false)
+		}()
+	}
+
+	time.Sleep(25 * time.Millisecond)
+	close(failRelease)
+	failWG.Wait()
+
+	if failHits.Load() != 1 {
+		t.Fatalf("expected 1 failed HTTP attempt, got %d", failHits.Load())
+	}
+	for i, ok := range failResults {
+		if ok {
+			t.Fatalf("expected failed singleflight caller %d to return false, got true", i)
+		}
+	}
+	// Backoff branch after failed attempt must also return false without hitting network.
+	if failReg.Refresh(context.Background(), false) {
+		t.Fatal("expected backoff refresh with nil snap to return false")
+	}
+	if failHits.Load() != 1 {
+		t.Fatalf("expected backoff to suppress retry, got %d hits", failHits.Load())
+	}
+}
+
+func TestModelsDevCanonicalVendorBeatsOpenRouterAndFreeVariant(t *testing.T) {
+	// Include both a canonical vendor ("deepseek") and "openrouter" with both paid
+	// and :free variants colliding on normID, plus an OpenRouter-only model with
+	// paid + :free variants. Run 20 parses to verify determinism against Go's random
+	// map iteration order.
+	doc := []byte(`{
+		"deepseek": {
+			"models": {
+				"deepseek-r1": {
+					"id": "deepseek-r1",
+					"name": "DeepSeek R1",
+					"limit": {"context": 128000, "output": 16384},
+					"cost": {"input": 0.55, "output": 2.19}
+				}
+			}
+		},
+		"openrouter": {
+			"models": {
+				"deepseek/deepseek-r1:free": {
+					"id": "deepseek/deepseek-r1:free",
+					"name": "DeepSeek: R1 (free)",
+					"limit": {"context": 64000, "output": 8192},
+					"cost": {"input": 0, "output": 0}
+				},
+				"deepseek/deepseek-r1": {
+					"id": "deepseek/deepseek-r1",
+					"name": "DeepSeek: R1",
+					"limit": {"context": 128000, "output": 16384},
+					"cost": {"input": 0.55, "output": 2.19}
+				},
+				"acme/or-only-model:free": {
+					"id": "acme/or-only-model:free",
+					"name": "Acme Model (free)",
+					"limit": {"context": 32000, "output": 4096},
+					"cost": {"input": 0, "output": 0}
+				},
+				"acme/or-only-model:beta": {
+					"id": "acme/or-only-model:beta",
+					"name": "Acme Model Beta",
+					"limit": {"context": 64000, "output": 8192},
+					"cost": {"input": 0.5, "output": 1.5}
+				},
+				"acme/or-only-model": {
+					"id": "acme/or-only-model",
+					"name": "Acme Model",
+					"limit": {"context": 200000, "output": 32768},
+					"cost": {"input": 1.0, "output": 3.0}
+				}
+			}
+		}
+	}`)
+
+	for iter := 0; iter < 20; iter++ {
+		snap, err := parseModelsDevDocument(doc)
+		if err != nil {
+			t.Fatalf("parseModelsDevDocument: %v", err)
+		}
+		reg := &modelRegistry{snap: snap, diskLoaded: true}
+
+		// Bare ID on openai-compatible provider must resolve canonical deepseek (not openrouter :free).
+		d, ok := reg.Lookup("openai", "deepseek-r1")
+		if !ok {
+			t.Fatal("expected deepseek-r1 lookup to succeed")
+		}
+		if d.Label != "DeepSeek R1" || d.PriceInputPerM != 0.55 || d.ContextWindow != 128000 {
+			t.Fatalf("iter %d: expected canonical deepseek entry, got %+v", iter, d)
+		}
+
+		// OpenRouter-only model must deterministically pick unsuffixed paid entry over :free/:beta.
+		orOnly, ok := reg.Lookup("openai", "or-only-model")
+		if !ok {
+			t.Fatal("expected or-only-model lookup to succeed via snap.Global")
+		}
+		if orOnly.Label != "Acme Model" || orOnly.PriceInputPerM != 1.0 || orOnly.ContextWindow != 200000 {
+			t.Fatalf("iter %d: expected unsuffixed paid openrouter entry, got %+v", iter, orOnly)
+		}
+
+		// Explicit openrouter/ByProvider normalized key must also pick paid entry over :free.
+		if got := snap.ByProvider["openrouter"]["or-only-model"]; got.PriceInputPerM != 1.0 || got.Name != "Acme Model" {
+			t.Fatalf("iter %d: expected paid entry in ByProvider[openrouter], got %+v", iter, got)
+		}
 	}
 }

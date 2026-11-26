@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import math
+import threading
 import time
 from typing import Optional
 
 from .embeddings import LocalEmbedder, LocalReranker
-from .storage import KnowledgeStore, extract_cves, extract_mitre_ids
+from .storage import CacheSignature, KnowledgeStore, extract_cves, extract_mitre_ids
 
 RRF_K = 60
+SEARCH_CACHE_MAX = 128
 VALID_CATEGORIES = {
     "web", "api", "cloud", "ad", "privesc", "mobile", "network",
     "binary", "cve", "mitre", "detection", "exploits", "writeups", "threat-intel", "general",
@@ -28,6 +31,9 @@ class HybridRetriever:
         self.store = store
         self.embedder = embedder or LocalEmbedder()
         self.reranker = reranker or LocalReranker()
+        self._cache_lock = threading.Lock()
+        self._cache_sig: Optional[CacheSignature] = None
+        self._cache: OrderedDict[tuple, dict] = OrderedDict()
 
     def search(
         self,
@@ -48,18 +54,35 @@ class HybridRetriever:
         cat = category.strip().lower() if category and category.strip() else None
         src = source.strip().lower() if source and source.strip() else None
 
+        cache_key = (q.lower(), cat, src, top_k, bool(use_reranker and self.reranker.enabled), max_per_doc)
+        sig = self.store.cache_signature()
+        with self._cache_lock:
+            if self._cache_sig != sig:
+                self._cache.clear()
+                self._cache_sig = sig
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                self._cache.move_to_end(cache_key)
+                out = dict(cached)
+                out["results"] = list(cached["results"])
+                out["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                out["cached"] = True
+                return out
+
         # Stage 1a: Lexical BM25 via FTS5
         fts_hits = self.store.fts_search(q, category=cat, source=src, limit=40)
 
         # Stage 1b: Dense Vector via USearch HNSW (only if vector index exists)
         vec_hits: list[tuple[int, float]] = []
-        vec_available = self.store.get_readonly_vector_index() is not None
-        if vec_available:
-            try:
+        degraded = False
+        try:
+            vec_available = self.store.get_readonly_vector_index() is not None
+            if vec_available:
                 q_vec = self.embedder.embed_query(q)
                 vec_hits = self.store.vector_search(q_vec, category=cat, source=src, limit=40)
-            except Exception:
-                vec_hits = []
+        except Exception:
+            vec_hits = []
+            degraded = True
 
         # Stage 2: Reciprocal Rank Fusion (RRF)
         rrf_scores: dict[int, float] = {}
@@ -78,23 +101,46 @@ class HybridRetriever:
                 "mode": "hybrid" if vec_hits else "fts5",
             }
 
-        # Pull top 16 fused candidates for fast sub-second cross-encoder reranking
-        fused_ids = [
-            cid for cid, _ in sorted(rrf_scores.items(), key=lambda kv: kv[1], reverse=True)[:16]
+        # Pull top adaptive fused candidates (10 for default top_k=5, up to 16 for larger top_k)
+        # for fast ~330 ms cross-encoder reranking. Pre-diversify before slicing rerank_k so a
+        # single long document (e.g. a 20-chunk HackTricks page) cannot consume all reranker
+        # slots and collapse top_k=5 down to 2 results after deduplication.
+        rerank_k = min(16, max(10, top_k * 2))
+        sorted_ids = [
+            cid for cid, _ in sorted(rrf_scores.items(), key=lambda kv: kv[1], reverse=True)
         ]
-        chunks = self.store.get_chunks_by_ids(fused_ids)
+        chunks = self.store.get_chunks_by_ids(sorted_ids)
 
         q_cves = set(extract_cves(q))
         q_mitre = set(extract_mitre_ids(q))
 
-        candidates = [chunks[cid] for cid in fused_ids if cid in chunks]
+        candidates = []
+        pre_per_doc: dict[int, int] = {}
+        pre_seen_sections: set[int] = set()
+        for cid in sorted_ids:
+            ch = chunks.get(cid)
+            if ch is None:
+                continue
+            if ch.section_id in pre_seen_sections:
+                continue
+            if pre_per_doc.get(ch.doc_id, 0) >= max_per_doc:
+                continue
+            pre_seen_sections.add(ch.section_id)
+            pre_per_doc[ch.doc_id] = pre_per_doc.get(ch.doc_id, 0) + 1
+            candidates.append(ch)
+            if len(candidates) >= rerank_k:
+                break
 
         # Stage 3: Cross-Encoder Reranking (multilingual PT-BR + EN)
         reranked = False
         scores: list[float]
         if use_reranker and self.reranker.enabled and len(candidates) > 1:
             passages = [f"{c.breadcrumb}\n{c.content}" for c in candidates]
-            ce_scores = self.reranker.score(q, passages)
+            try:
+                ce_scores = self.reranker.score(q, passages)
+            except Exception:
+                ce_scores = None
+                degraded = True
             if ce_scores is not None and len(ce_scores) == len(candidates):
                 # Normalize raw logits via sigmoid and add small exact-ID boost
                 scores = []
@@ -107,9 +153,18 @@ class HybridRetriever:
                     scores.append(norm_s)
                 reranked = True
             else:
+                if not getattr(self.reranker, "_failed", False):
+                    degraded = True
                 scores = [rrf_scores[c.chunk_id] for c in candidates]
         else:
-            scores = [rrf_scores[c.chunk_id] for c in candidates]
+            scores = []
+            for c in candidates:
+                sc = rrf_scores[c.chunk_id]
+                if q_cves and any(cve in c.cves for cve in q_cves):
+                    sc += 0.02
+                if q_mitre and any(mid in c.tags or mid in c.breadcrumb for mid in q_mitre):
+                    sc += 0.01
+                scores.append(sc)
 
         ranked_pairs = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
 
@@ -150,7 +205,7 @@ class HybridRetriever:
         mode = "hybrid+rerank" if (vec_hits and reranked) else (
             "hybrid" if vec_hits else ("fts5+rerank" if reranked else "fts5")
         )
-        return {
+        payload = {
             "query": q,
             "category": cat,
             "source": src,
@@ -158,3 +213,11 @@ class HybridRetriever:
             "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
             "results": results,
         }
+        if not degraded:
+            with self._cache_lock:
+                if self._cache_sig == sig:
+                    self._cache[cache_key] = payload
+                    self._cache.move_to_end(cache_key)
+                    while len(self._cache) > SEARCH_CACHE_MAX:
+                        self._cache.popitem(last=False)
+        return payload

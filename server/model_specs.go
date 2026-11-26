@@ -365,11 +365,9 @@ func mergeModelDetailFallback(dst *modelDetail, src modelDetail) {
 	}
 	if len(dst.ReasoningLevels) == 0 && len(src.ReasoningLevels) > 0 {
 		dst.ReasoningLevels = append([]string(nil), src.ReasoningLevels...)
-		if dst.DefaultReasoningEffort == "" {
-			dst.DefaultReasoningEffort = src.DefaultReasoningEffort
-		}
 	}
-	if dst.DefaultReasoningEffort == "" && src.DefaultReasoningEffort != "" {
+	if dst.DefaultReasoningEffort == "" && src.DefaultReasoningEffort != "" &&
+		len(dst.ReasoningLevels) > 0 && containsStr(dst.ReasoningLevels, src.DefaultReasoningEffort) {
 		dst.DefaultReasoningEffort = src.DefaultReasoningEffort
 	}
 	if dst.ThinkingType == "" && src.ThinkingType != "" {
@@ -850,11 +848,18 @@ func (s *Server) pgLookupModelSpec(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) probeSingleOllamaSpec(ctx context.Context, rawBaseURL, rawProxy, rawAPIKey string, profileID *int64, modelID string) (int, bool) {
-	if isMaskedSecret(rawProxy) {
+	needProxy := isMaskedSecret(rawProxy)
+	needKey := strings.TrimSpace(rawAPIKey) == ""
+	if needProxy {
 		rawProxy = ""
-		if profileID != nil && s.m != nil && s.m.pg != nil {
-			if p, err := s.m.pg.ProfileByID(*profileID); err == nil && p != nil {
+	}
+	if (needProxy || needKey) && profileID != nil && s.m != nil && s.m.pg != nil {
+		if p, err := s.m.pg.ProfileByID(*profileID); err == nil && p != nil {
+			if needProxy {
 				rawProxy = p.Proxy
+			}
+			if needKey && sameLLMEndpoint("ollama", rawBaseURL, p.Format, p.BaseURL) {
+				rawAPIKey = p.APIKey
 			}
 		}
 	}

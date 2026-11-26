@@ -1057,6 +1057,32 @@ func canonicalMCPArgs(raw json.RawMessage) string {
 	return string(out)
 }
 
+// canonicalMCPEnv normalizes env JSON for comparison; empty means {} as in SaveMCP.
+func canonicalMCPEnv(raw json.RawMessage) string {
+	var v any
+	if len(raw) == 0 || string(raw) == "null" {
+		return "{}"
+	}
+	if json.Unmarshal(raw, &v) != nil {
+		return string(raw)
+	}
+	out, _ := json.Marshal(v)
+	return string(out)
+}
+
+func mcpConfigChanged(prev, next *db.MCPServer) bool {
+	if prev == nil || next == nil {
+		return false
+	}
+	return prev.Name != next.Name ||
+		prev.Transport != next.Transport ||
+		prev.Command != next.Command ||
+		prev.URL != next.URL ||
+		prev.Insecure != next.Insecure ||
+		canonicalMCPArgs(prev.Args) != canonicalMCPArgs(next.Args) ||
+		canonicalMCPEnv(prev.Env) != canonicalMCPEnv(next.Env)
+}
+
 func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
@@ -1068,26 +1094,48 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isNew := m.ID == 0
+	var prev *db.MCPServer
+	if !isNew {
+		if all, lerr := pg.ListMCP(); lerr == nil {
+			for _, cur := range all {
+				if cur.ID == m.ID {
+					prev = cur
+					break
+				}
+			}
+		}
+	}
 	if err := unmaskMCPEnv(pg, &m); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	hadCachedTools := prev != nil && len(prev.Tools) > 0
+	prevFailed := prev != nil && prev.LastConnectOK != nil && !*prev.LastConnectOK
+	configChanged := mcpConfigChanged(prev, &m)
 	id, err := pg.SaveMCP(&m)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	s.mcpPool.Invalidate(id)
-	// On initial add, auto-discover + cache the tool list so the UI shows it right
-	// away (bounded so a slow/broken server can't hang the request). Skipped on
-	// plain updates (e.g. enable toggles) to avoid re-spawning the server each time.
-	if isNew && m.Enabled {
+	invalidateMCPHealthCache(id)
+	// On initial add, config/name/env/insecure change, previous failed health, or
+	// when enabling/saving an existing server whose tool cache is still empty
+	// (e.g. built-in browser or secrag MCP), auto-discover + cache the tool list so
+	// the UI shows fresh tools/status right away (bounded so a slow/broken server
+	// can't hang the request).
+	if m.Enabled && (isNew || !hadCachedTools || configChanged || prevFailed) {
 		m.ID = id
+		if configChanged {
+			_ = pg.SaveMCPTools(id, nil)
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 		if derr := s.discoverAndCacheMCP(ctx, &m); derr != nil {
-			log.Printf("[mcp] tool discovery after adding %s failed: %v", m.Name, derr)
+			log.Printf("[mcp] tool discovery after saving %s failed: %v", m.Name, derr)
 		}
 		cancel()
+	} else if !m.Enabled && configChanged {
+		_ = pg.SaveMCPTools(id, nil)
 	}
 	writeJSON(w, 200, map[string]any{"id": id})
 }
@@ -1103,6 +1151,7 @@ func (s *Server) pgDeleteMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mcpPool.Invalidate(id)
+	invalidateMCPHealthCache(id)
 	writeJSON(w, 200, map[string]any{"deleted": id})
 }
 
@@ -1131,6 +1180,7 @@ func (s *Server) pgRefreshMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mcpPool.Invalidate(id)
+	invalidateMCPHealthCache(id)
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 	if err := s.discoverAndCacheMCP(ctx, target); err != nil {
@@ -2167,10 +2217,21 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		}
 		p.Proxy = stored.Proxy
 	}
+	targetCfg := agent.ConfigFrom(p.Format, "", p.BaseURL, "", "")
+	if targetCfg.OAuthProvider() != "" {
+		// OAuth profiles authenticate via oauth.Manager and never use a static
+		// API key; drop any caller-supplied secret and clear any key left over
+		// from a previous provider.
+		p.APIKey = ""
+		p.APIKeyHint = ""
+		p.ClearAPIKey = true
+	}
 	// Updating an existing profile with a blank api_key preserves the stored
 	// write-only key in PostgreSQL. Only allow that when the endpoint matches
 	// the one the key was saved for, so changing provider/base_url cannot rebind
-	// the secret to a different host.
+	// the secret to a different host. When switching to a keyless/OAuth format
+	// (!NeedsAPIKey), allow the update without requiring a new key and clear
+	// the previous endpoint's stored key instead of retaining it.
 	if p.ID != 0 && p.APIKey == "" {
 		if stored == nil {
 			var err error
@@ -2182,8 +2243,12 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		}
 		if stored != nil && strings.TrimSpace(stored.APIKey) != "" &&
 			!sameLLMEndpoint(p.Format, p.BaseURL, stored.Format, stored.BaseURL) {
-			writeErr(w, 400, "the saved API key is only valid for its original endpoint; re-enter api_key when changing provider or base_url")
-			return
+			if targetCfg.NeedsAPIKey() {
+				writeErr(w, 400, "the saved API key is only valid for its original endpoint; re-enter api_key when changing provider or base_url")
+				return
+			}
+			p.APIKeyHint = ""
+			p.ClearAPIKey = true
 		}
 	}
 	if p.ContextWindowK < 0 {
@@ -2211,7 +2276,7 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.UserAgent = ua
-	if cfg := agent.ConfigFrom(p.Format, "", p.BaseURL, "", ""); cfg.OAuthProvider() != "" &&
+	if targetCfg.OAuthProvider() != "" &&
 		strings.TrimSpace(p.BaseURL) != "" && !sameLLMEndpoint(p.Format, p.BaseURL, p.Format, "") {
 		writeErr(w, 400, "OAuth credentials are only sent to the canonical provider endpoint; custom base_url is not allowed")
 		return
@@ -2223,17 +2288,19 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		if p.ID != 0 && stored == nil {
 			stored, _ = pg.ProfileByID(p.ID)
 		}
-		if stored != nil && strings.EqualFold(stored.Model, p.Model) &&
+		if stored != nil && stored.Format == p.Format && strings.EqualFold(stored.Model, p.Model) &&
 			(stored.PriceInputPerM > 0 || stored.PriceOutputPerM > 0 || stored.PriceCacheReadPerM > 0 || stored.PriceCacheWritePerM > 0) {
 			p.PriceInputPerM = stored.PriceInputPerM
 			p.PriceOutputPerM = stored.PriceOutputPerM
 			p.PriceCacheReadPerM = stored.PriceCacheReadPerM
 			p.PriceCacheWritePerM = stored.PriceCacheWritePerM
-		} else if det, ok := s.lookupBestModelDetail(p.Format, p.Model); ok && (det.PriceInputPerM > 0 || det.PriceOutputPerM > 0) {
-			p.PriceInputPerM = det.PriceInputPerM
-			p.PriceOutputPerM = det.PriceOutputPerM
-			p.PriceCacheReadPerM = det.PriceCacheReadPerM
-			p.PriceCacheWritePerM = det.PriceCacheWritePerM
+		} else if p.Format != "ollama" {
+			if det, ok := s.lookupBestModelDetail(p.Format, p.Model); ok && (det.PriceInputPerM > 0 || det.PriceOutputPerM > 0) {
+				p.PriceInputPerM = det.PriceInputPerM
+				p.PriceOutputPerM = det.PriceOutputPerM
+				p.PriceCacheReadPerM = det.PriceCacheReadPerM
+				p.PriceCacheWritePerM = det.PriceCacheWritePerM
+			}
 		}
 	}
 	id, err := pg.SaveProfile(&p)
@@ -2642,12 +2709,53 @@ func (s *Server) putCachedModelCatalog(provider string, models []string, details
 	}
 }
 
-func (s *Server) invalidateModelCatalogCache(provider string) {
+func (s *Server) modelCatalogGeneration(provider string) uint64 {
 	s.modelCatalogMu.Lock()
 	defer s.modelCatalogMu.Unlock()
+	if s.modelCatalogGen == nil {
+		return 0
+	}
+	return s.modelCatalogGen[provider]
+}
+
+func (s *Server) commitModelCatalogIfCurrent(provider string, expectedGen uint64, oauthProv string, models []string, details []modelDetail, persistDisk bool) bool {
+	if oauthProv != "" && !s.ensureOAuth().IsConnected(oauthProv) {
+		return false
+	}
+	s.modelCatalogMu.Lock()
+	defer s.modelCatalogMu.Unlock()
+	var curGen uint64
+	if s.modelCatalogGen != nil {
+		curGen = s.modelCatalogGen[provider]
+	}
+	if curGen != expectedGen {
+		return false
+	}
+	if s.modelCatalogCache == nil {
+		s.modelCatalogCache = map[string]cachedModelCatalog{}
+	}
+	s.modelCatalogCache[provider] = cachedModelCatalog{
+		models:    append([]string(nil), models...),
+		details:   append([]modelDetail(nil), details...),
+		expiresAt: time.Now().Add(modelCatalogCacheTTL),
+	}
+	if persistDisk {
+		s.writeDiskProviderCatalog(provider, models, details)
+	}
+	return true
+}
+
+func (s *Server) invalidateModelCatalogCache(provider string) {
+	s.modelCatalogMu.Lock()
+	if s.modelCatalogGen == nil {
+		s.modelCatalogGen = map[string]uint64{}
+	}
+	s.modelCatalogGen[provider]++
 	if s.modelCatalogCache != nil {
 		delete(s.modelCatalogCache, provider)
 	}
+	s.deleteDiskProviderCatalog(provider)
+	s.modelCatalogMu.Unlock()
 }
 
 func (s *Server) tryBeginCatalogRefresh(provider string) bool {
@@ -2674,6 +2782,14 @@ func (s *Server) pgListDevinOrAgyModels(w http.ResponseWriter, r *http.Request, 
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "OAuth credentials are only sent to the canonical provider endpoint; custom base_url is not allowed"})
 		return
 	}
+	oauthProv := oauth.ProviderAntigravity
+	if provider == "devin" {
+		oauthProv = oauth.ProviderDevin
+	}
+	if !s.ensureOAuth().IsConnected(oauthProv) {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": "OAuth account is not signed in; click Sign in first"})
+		return
+	}
 	reg := s.ensureModelRegistry()
 	if reg != nil {
 		reg.TriggerBackgroundRefresh(s.ctx)
@@ -2683,9 +2799,11 @@ func (s *Server) pgListDevinOrAgyModels(w http.ResponseWriter, r *http.Request, 
 			writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details, "cache_source": "memory"})
 			return
 		}
+		diskGen := s.modelCatalogGeneration(provider)
 		if models, details, updatedAt, ok := s.readDiskProviderCatalog(provider); ok {
-			s.putCachedModelCatalog(provider, models, details)
+			s.commitModelCatalogIfCurrent(provider, diskGen, oauthProv, models, details, false)
 			if time.Since(updatedAt) > diskCatalogStaleAfter && s.tryBeginCatalogRefresh(provider) {
+				bgGen := s.modelCatalogGeneration(provider)
 				go func() {
 					defer s.endCatalogRefresh(provider)
 					bgCtx := s.ctx
@@ -2694,7 +2812,7 @@ func (s *Server) pgListDevinOrAgyModels(w http.ResponseWriter, r *http.Request, 
 					}
 					ctx, cancel := context.WithTimeout(bgCtx, 30*time.Second)
 					defer cancel()
-					_, _, _, _ = s.fetchDevinOrAgyLive(ctx, provider, rawProxy, reg)
+					_, _, _, _ = s.fetchDevinOrAgyLive(ctx, provider, rawProxy, reg, bgGen)
 				}()
 			}
 			writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details, "cache_source": "disk"})
@@ -2702,7 +2820,8 @@ func (s *Server) pgListDevinOrAgyModels(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	models, details, liveOK, errMsg := s.fetchDevinOrAgyLive(r.Context(), provider, rawProxy, reg)
+	startGen := s.modelCatalogGeneration(provider)
+	models, details, liveOK, errMsg := s.fetchDevinOrAgyLive(r.Context(), provider, rawProxy, reg, startGen)
 	if errMsg != "" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": errMsg})
 		return
@@ -2714,7 +2833,7 @@ func (s *Server) pgListDevinOrAgyModels(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, 200, map[string]any{"ok": true, "models": models, "model_details": details, "cache_source": src})
 }
 
-func (s *Server) fetchDevinOrAgyLive(ctx context.Context, provider, rawProxy string, reg *modelRegistry) ([]string, []modelDetail, bool, string) {
+func (s *Server) fetchDevinOrAgyLive(ctx context.Context, provider, rawProxy string, reg *modelRegistry, expectedGen uint64) ([]string, []modelDetail, bool, string) {
 	var client *http.Client
 	if p := strings.TrimSpace(rawProxy); p != "" {
 		guard := newModelURLGuard(s)
@@ -2763,12 +2882,22 @@ func (s *Server) fetchDevinOrAgyLive(ctx context.Context, provider, rawProxy str
 					mergeModelDetailFallback(&d, md)
 				}
 			}
+			if known, ok := lookupKnownModelSpec(provider, e.ID); ok {
+				mergeModelDetailFallback(&d, known)
+			}
+			if len(d.ReasoningLevels) > 0 && d.DefaultReasoningEffort == "" {
+				for _, pref := range []string{"high", "medium", "low"} {
+					if containsStr(d.ReasoningLevels, pref) {
+						d.DefaultReasoningEffort = pref
+						break
+					}
+				}
+			}
 			models = append(models, e.ID)
 			details = append(details, d)
 		}
 		if err == nil && len(models) > 0 {
-			s.putCachedModelCatalog(provider, models, details)
-			s.writeDiskProviderCatalog(provider, models, details)
+			s.commitModelCatalogIfCurrent(provider, expectedGen, oauth.ProviderDevin, models, details, true)
 		}
 		return models, details, err == nil, ""
 	}
@@ -2786,14 +2915,15 @@ func (s *Server) fetchDevinOrAgyLive(ctx context.Context, provider, rawProxy str
 		AccountID: cred.IDToken,
 	}
 	entries, probeErr := llm.ProbeAntigravityModels(ctx, client, agyCred)
-	if probeErr != nil || len(entries) == 0 {
+	usedFallback := probeErr != nil || len(entries) == 0
+	if usedFallback {
 		entries = llm.AntigravityFallbackCatalog()
 	}
 	models := make([]string, 0, len(entries))
 	details := make([]modelDetail, 0, len(entries))
 	for _, e := range entries {
 		src := "api"
-		if probeErr != nil {
+		if usedFallback {
 			src = "known"
 		}
 		d := modelDetail{
@@ -2810,14 +2940,31 @@ func (s *Server) fetchDevinOrAgyLive(ctx context.Context, provider, rawProxy str
 				mergeModelDetailFallback(&d, md)
 			}
 		}
+		if known, ok := lookupKnownModelSpec(provider, e.ID); ok {
+			mergeModelDetailFallback(&d, known)
+		}
+		if len(d.ReasoningLevels) > 0 && d.DefaultReasoningEffort == "" {
+			for _, pref := range []string{"high", "medium", "low"} {
+				if containsStr(d.ReasoningLevels, pref) {
+					d.DefaultReasoningEffort = pref
+					break
+				}
+			}
+		}
+		if d.ContextWindow == 0 {
+			d.ContextWindow = 200_000
+			d.ContextWindowK = tokensToK(d.ContextWindow)
+		}
+		if d.MaxOutputTokens == 0 {
+			d.MaxOutputTokens = 64_000
+		}
 		models = append(models, e.ID)
 		details = append(details, d)
 	}
-	if probeErr == nil && len(models) > 0 {
-		s.putCachedModelCatalog(provider, models, details)
-		s.writeDiskProviderCatalog(provider, models, details)
+	if !usedFallback && len(models) > 0 {
+		s.commitModelCatalogIfCurrent(provider, expectedGen, oauth.ProviderAntigravity, models, details, true)
 	}
-	return models, details, probeErr == nil, ""
+	return models, details, !usedFallback, ""
 }
 
 // pgListModels fetches available models from the provider's API endpoint.
@@ -2977,7 +3124,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 		// Canonical OpenCode Go: prefer rich Console catalog (when authenticated) and Go inference endpoint
 		// (with a keyless fallback in case a stale/invalid key was entered while browsing models).
-		if provider == "opencode-go" && rawBaseURL == "" {
+		if provider == "opencode-go" && (rawBaseURL == "" || sameLLMEndpoint(provider, rawBaseURL, provider, "")) {
 			if apiKey != "" {
 				candidates = append(candidates,
 					candidate{url: "https://opencode.ai/console/api/v1/models", hdr: hdr},

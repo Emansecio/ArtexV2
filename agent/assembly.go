@@ -87,7 +87,7 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 	// Tool RAG (off by default): lexical projection of the bound list; only removes.
 	out = applyToolRAG(ctx, agentKey, out, def.Deferred, bm25Score)
 	out, def.FindingGuidance = findingWorkflowTools(agentKey, out)
-	def.KnowledgeBaseGuidance = knowledgeBaseGuidance(out)
+	def.KnowledgeBaseGuidance = knowledgeBaseGuidance(out, def.Deferred)
 	for i, t := range out {
 		out[i] = guardPanic(t)
 	}

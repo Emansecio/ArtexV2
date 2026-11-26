@@ -215,7 +215,8 @@ func (s *Server) seedFindingRetester() error {
 		return err
 	}
 	if done == "true" {
-		return nil
+		_ = tx.Rollback()
+		return s.m.pg.SeedRetesterDefaultVisibility()
 	}
 	var id int64
 	err = tx.QueryRow(`INSERT INTO agents(key,name,description,role,builtin,enabled)
@@ -241,7 +242,7 @@ func (s *Server) seedFindingRetester() error {
 		return err
 	}
 	s.m.pg.InvalidateSettingCache(flag)
-	return nil
+	return s.m.pg.SeedRetesterDefaultVisibility()
 }
 
 func (s *Server) finishRetest(id int64, status, reason string) {

@@ -137,8 +137,6 @@ func CollapseAdvertisedAgyModels(advertised []string) []AntigravityCatalogEntry 
 		entry := AntigravityCatalogEntry{
 			ID:              base,
 			DisplayName:     prettifyAgyModelID(base),
-			ContextWindow:   200_000,
-			MaxOutputTokens: 64_000,
 			ReasoningLevels: levels,
 		}
 		if hasKnown {

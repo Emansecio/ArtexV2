@@ -259,3 +259,278 @@ func TestParseSSECapsPayload(t *testing.T) {
 		t.Fatal("oversize SSE payload must fail")
 	}
 }
+
+func TestLegacySSEDisconnectWakesAllConcurrentWaitersAndClose(t *testing.T) {
+	dropSSE := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sse":
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			fmt.Fprint(w, "event: endpoint\ndata: /message\n\n")
+			flusher.Flush()
+			// Answer initialize on the SSE stream.
+			time.Sleep(20 * time.Millisecond)
+			fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}\n\n")
+			flusher.Flush()
+			<-dropSSE
+		case "/message":
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := NewSSE(ctx, "legacy", srv.URL+"/sse", nil, false)
+	if err != nil {
+		t.Fatalf("NewSSE: %v", err)
+	}
+	defer c.Close()
+
+	// Start 3 concurrent in-flight calls and drop the SSE stream.
+	errs := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		go func() {
+			_, cerr := c.Call(ctx, "slow", nil)
+			errs <- cerr
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(dropSSE)
+
+	for i := 0; i < 3; i++ {
+		select {
+		case cerr := <-errs:
+			if cerr == nil || !strings.Contains(cerr.Error(), "mcp sse stream:") {
+				t.Fatalf("waiter %d expected mcp sse stream error, got %v", i, cerr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("waiter %d hung after SSE disconnect", i)
+		}
+	}
+
+	// Subsequent call after disconnect must also fail fast.
+	start := time.Now()
+	if _, err := c.Call(ctx, "after_drop", nil); err == nil || time.Since(start) > time.Second {
+		t.Fatalf("post-disconnect call should fail fast: err=%v elapsed=%v", err, time.Since(start))
+	}
+}
+
+func TestStreamableHTTP404ClearsSessionAndCloseBounded(t *testing.T) {
+	blockDelete := make(chan struct{})
+	defer close(blockDelete)
+	var expired bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			select {
+			case <-blockDelete:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		var req rpcRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "sess-1")
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":"2025-11-25"}}`, req.ID)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			if expired {
+				http.Error(w, "session not found", http.StatusNotFound)
+				return
+			}
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}}`, req.ID)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New(context.Background(), "s", srv.URL, nil, false, 60)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	got, err := c.Call(context.Background(), "t", nil)
+	if err != nil || got != "a\nb" {
+		t.Fatalf("Call() = %q, %v; want %q", got, err, "a\nb")
+	}
+
+	// Simulate expired session returning 404.
+	expired = true
+	if _, err := c.Call(context.Background(), "t", nil); err == nil || !strings.Contains(err.Error(), "mcp http 404") {
+		t.Fatalf("expected mcp http 404 error, got %v", err)
+	}
+	c.mu.Lock()
+	sid, initd, exp := c.sessionID, c.initialized, c.sessionExpired
+	c.mu.Unlock()
+	if sid != "" || initd || !exp {
+		t.Fatalf("expected session cleared & sessionExpired set on 404, got sid=%q init=%v exp=%v", sid, initd, exp)
+	}
+
+	// Verify Close() with an active session and hung DELETE returns within bounded timeout (~3s), not 60s.
+	c2, err := New(context.Background(), "s", srv.URL, nil, false, 60)
+	if err != nil {
+		t.Fatalf("New c2: %v", err)
+	}
+	start := time.Now()
+	_ = c2.Close()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Close() took %v; expected bounded <=3s timeout", elapsed)
+	}
+}
+
+func TestStreamableHTTP404FailsFastForSubsequentCallsWithoutHeaderlessPOST(t *testing.T) {
+	var expired bool
+	var headerlessCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "sess-1")
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":"2025-11-25"}}`, req.ID)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			if r.Header.Get("Mcp-Session-Id") == "" {
+				headerlessCalls++
+				http.Error(w, "missing Mcp-Session-Id", http.StatusBadRequest)
+				return
+			}
+			if expired {
+				http.Error(w, "session not found", http.StatusNotFound)
+				return
+			}
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"content":[{"type":"text","text":"ok"}]}}`, req.ID)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New(context.Background(), "s", srv.URL, nil, false, 10)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	expired = true
+	if _, err := c.Call(context.Background(), "t", nil); err == nil || !strings.Contains(err.Error(), "session expired") {
+		t.Fatalf("first post-expiry call err = %v, want session expired", err)
+	}
+	// A sibling call arriving before pool eviction must fail fast with session expired
+	// and never send a headerless POST that would produce an unretried HTTP 400.
+	if _, err := c.Call(context.Background(), "t", nil); err == nil || !strings.Contains(err.Error(), "mcp http 404: session expired") {
+		t.Fatalf("second post-expiry call err = %v, want mcp http 404: session expired", err)
+	}
+	if headerlessCalls != 0 {
+		t.Fatalf("saw %d headerless POSTs after session expiry, want 0", headerlessCalls)
+	}
+}
+
+func TestInsecureTransportClonesDefaultTransportSettings(t *testing.T) {
+	tr := insecureTransport()
+	if tr.TLSClientConfig == nil || !tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("expected InsecureSkipVerify=true, got %+v", tr.TLSClientConfig)
+	}
+	if tr.Proxy == nil {
+		t.Fatal("expected Proxy function preserved from DefaultTransport")
+	}
+	if tr.TLSHandshakeTimeout <= 0 {
+		t.Fatalf("expected positive TLSHandshakeTimeout, got %v", tr.TLSHandshakeTimeout)
+	}
+	if tr.IdleConnTimeout <= 0 {
+		t.Fatalf("expected positive IdleConnTimeout, got %v", tr.IdleConnTimeout)
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Fatal("expected ForceAttemptHTTP2=true")
+	}
+	if def, ok := http.DefaultTransport.(*http.Transport); ok && def.TLSClientConfig != nil && def.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("insecureTransport must not mutate http.DefaultTransport")
+	}
+}
+
+func TestLegacySSERoundTripDrainsAndClosesPostBodyBeforeWaitingOnSSE(t *testing.T) {
+	sendReply := make(chan int, 2)
+	var postConns []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sse":
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			fmt.Fprint(w, "event: endpoint\ndata: /message\n\n")
+			flusher.Flush()
+			for id := range sendReply {
+				if id == 1 {
+					fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}\n\n")
+				} else {
+					fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok-%d\"}]}}\n\n", id, id)
+				}
+				flusher.Flush()
+			}
+		case "/message":
+			var req rpcRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			postConns = append(postConns, r.RemoteAddr)
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte("accepted"))
+			if req.Method == "initialize" {
+				sendReply <- req.ID
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer func() {
+		close(sendReply)
+		srv.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := NewSSE(ctx, "legacy", srv.URL+"/sse", nil, false)
+	if err != nil {
+		t.Fatalf("NewSSE: %v", err)
+	}
+	defer c.Close()
+
+	// Issue call 1 and wait briefly while it is blocked waiting for its SSE result.
+	// Because the POST response body was drained & closed immediately, a second
+	// concurrent POST can reuse the same keep-alive TCP connection instead of
+	// opening a brand-new connection while call 1 is in flight.
+	res1 := make(chan string, 1)
+	go func() {
+		got, _ := c.Call(ctx, "slow1", nil)
+		res1 <- got
+	}()
+	time.Sleep(40 * time.Millisecond)
+
+	res2 := make(chan string, 1)
+	go func() {
+		got, _ := c.Call(ctx, "slow2", nil)
+		res2 <- got
+	}()
+	time.Sleep(40 * time.Millisecond)
+
+	// Unblock both SSE replies (IDs 2 and 3 after initialize ID=1).
+	sendReply <- 2
+	sendReply <- 3
+	if got := <-res1; got != "ok-2" {
+		t.Fatalf("call 1 = %q, want ok-2", got)
+	}
+	if got := <-res2; got != "ok-3" {
+		t.Fatalf("call 2 = %q, want ok-3", got)
+	}
+	// All 4 POSTs (initialize, notifications/initialized, slow1, slow2) should have
+	// reused the exact same keep-alive client RemoteAddr.
+	if len(postConns) < 4 {
+		t.Fatalf("expected >=4 POSTs, got %d", len(postConns))
+	}
+	if postConns[len(postConns)-1] != postConns[len(postConns)-2] {
+		t.Fatalf("expected concurrent legacy SSE POSTs to reuse keep-alive connection, got remote addrs %v", postConns)
+	}
+}

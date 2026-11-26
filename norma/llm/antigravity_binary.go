@@ -21,8 +21,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
+
+var agyStageNonce atomic.Uint64
 
 const (
 	AgyDefaultBaseURL = "acp://antigravity-cli"
@@ -386,7 +390,7 @@ func StageAgyCredentials(cred AgyCredential, geminiDir string) error {
 	if err != nil {
 		return fmt.Errorf("serialize agy credential: %w", err)
 	}
-	tmp := fmt.Sprintf("%s.tmp-%d-%d", file, os.Getpid(), time.Now().UnixNano())
+	tmp := fmt.Sprintf("%s.tmp-%d-%d-%d", file, os.Getpid(), time.Now().UnixNano(), agyStageNonce.Add(1))
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("write agy credential: %w", err)
 	}
@@ -417,15 +421,33 @@ func agyReleasePath(binDir, version string) string {
 	return filepath.Join(binDir, version, name)
 }
 
+var (
+	agyInstallMu         sync.Mutex
+	agyBgMu              sync.Mutex
+	agyBgUpdateRunning   bool
+	agyLastBgAttemptFail time.Time
+)
+
+const agyBgRetryBackoff = 10 * time.Minute
+
+func agyDownloadHTTPClient(base *http.Client) *http.Client {
+	var tr http.RoundTripper
+	if base != nil && base.Transport != nil {
+		tr = base.Transport
+	}
+	return &http.Client{
+		Transport: tr,
+		Timeout:   5 * time.Minute,
+	}
+}
+
 // ResolveAgyBinary returns the path to `agy`, honoring ARTEX_AGY_PATH or
 // installing/reusing the SHA-512 verified release from storage.googleapis.com.
 func ResolveAgyBinary(ctx context.Context, client *http.Client) (string, error) {
 	if override := strings.TrimSpace(os.Getenv("ARTEX_AGY_PATH")); override != "" {
 		return override, nil
 	}
-	if client == nil {
-		client = &http.Client{Timeout: 300 * time.Second}
-	}
+	dlClient := agyDownloadHTTPClient(client)
 	binDir := filepath.Join(AgyRootDir(), "bin")
 	if raw, err := os.ReadFile(filepath.Join(binDir, "install.json")); err == nil {
 		var rec agyInstallRecord
@@ -433,20 +455,51 @@ func ResolveAgyBinary(ctx context.Context, client *http.Client) (string, error) 
 			binary := agyReleasePath(binDir, rec.Version)
 			if fi, err := os.Stat(binary); err == nil && !fi.IsDir() {
 				if time.Now().Unix()-rec.CheckedAt >= agyUpdateIntervalSec {
-					go func() {
-						bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-						defer cancel()
-						_, _ = installLatestAgy(bgCtx, client, binDir)
-					}()
+					agyBgMu.Lock()
+					shouldRun := !agyBgUpdateRunning && (agyLastBgAttemptFail.IsZero() || time.Since(agyLastBgAttemptFail) >= agyBgRetryBackoff)
+					if shouldRun {
+						agyBgUpdateRunning = true
+					}
+					agyBgMu.Unlock()
+					if shouldRun {
+						go func() {
+							bgCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+							defer cancel()
+							_, err := installLatestAgy(bgCtx, dlClient, binDir)
+							agyBgMu.Lock()
+							agyBgUpdateRunning = false
+							if err != nil {
+								agyLastBgAttemptFail = time.Now()
+							} else {
+								agyLastBgAttemptFail = time.Time{}
+							}
+							agyBgMu.Unlock()
+						}()
+					}
 				}
 				return binary, nil
 			}
 		}
 	}
-	return installLatestAgy(ctx, client, binDir)
+	return installLatestAgy(ctx, dlClient, binDir)
 }
 
 func installLatestAgy(ctx context.Context, client *http.Client, binDir string) (string, error) {
+	agyInstallMu.Lock()
+	defer agyInstallMu.Unlock()
+
+	// Re-check install.json after acquiring the lock so concurrent first-run
+	// callers reuse the binary installed by the winning goroutine.
+	if raw, err := os.ReadFile(filepath.Join(binDir, "install.json")); err == nil {
+		var rec agyInstallRecord
+		if json.Unmarshal(raw, &rec) == nil && rec.Version != "" && time.Now().Unix()-rec.CheckedAt < agyUpdateIntervalSec {
+			binary := agyReleasePath(binDir, rec.Version)
+			if fi, err := os.Stat(binary); err == nil && !fi.IsDir() {
+				return binary, nil
+			}
+		}
+	}
+
 	platform, err := AgyPlatformKey()
 	if err != nil {
 		return "", err

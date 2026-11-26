@@ -273,3 +273,143 @@ func TestOllamaFromEnvDoesNotInheritOpenAIKey(t *testing.T) {
 		t.Fatalf("ollama inherited a cloud key: %q", c.APIKey)
 	}
 }
+
+// Saved authenticated Ollama gateway profiles must inherit their stored write-only
+// API key in both /api/llm/test and /api/llm/model-spec (when the base URL matches),
+// while refusing to leak that stored key to a different base URL.
+func TestOllamaAuthenticatedProfileTestAndModelSpecInheritStoredKey(t *testing.T) {
+	skipWithoutDSN(t)
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Close() })
+	if m.pg == nil {
+		db.SkipNoPG(t)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
+	s.allowLoopbackModels = true
+
+	const secret = "ollama-gw-secret-token"
+	var gotChatAuth, gotShowAuth atomic.Value
+	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/chat/completions":
+			gotChatAuth.Store(r.Header.Get("Authorization"))
+			if r.Header.Get("Authorization") != "Bearer "+secret {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"1","object":"chat.completion","model":"llama3.2","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		case "/api/show":
+			gotShowAuth.Store(r.Header.Get("Authorization"))
+			if r.Header.Get("Authorization") != "Bearer "+secret {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"model_info":{"llama.context_length":131072}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(authServer.Close)
+
+	var otherChatAuth, otherShowAuth atomic.Value
+	otherServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/chat/completions":
+			otherChatAuth.Store(r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"1","object":"chat.completion","model":"llama3.2","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		case "/api/show":
+			otherShowAuth.Store(r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"model_info":{"llama.context_length":65536}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(otherServer.Close)
+
+	pid, err := m.pg.SaveProfile(&db.LLMProfile{
+		Name: "ollama-auth-gw", Format: "ollama", Model: "llama3.2",
+		BaseURL: authServer.URL, APIKey: secret,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.pg.Exec("DELETE FROM llm_profiles WHERE id=$1", pid) })
+
+	// 1. /api/llm/test with profile_id and blank api_key must send stored Bearer secret.
+	testBody, _ := json.Marshal(map[string]any{
+		"profile_id": pid, "provider": "ollama", "model": "llama3.2",
+		"base_url": authServer.URL, "api_key": "", "streaming": false,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/llm/test", bytes.NewReader(testBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.testLLM(rec, req)
+	var testResp struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &testResp)
+	if !testResp.OK {
+		t.Fatalf("testLLM on authenticated Ollama profile failed: %s (auth=%v)", testResp.Error, gotChatAuth.Load())
+	}
+	if a, _ := gotChatAuth.Load().(string); a != "Bearer "+secret {
+		t.Fatalf("testLLM Authorization=%q, want Bearer %s", a, secret)
+	}
+
+	// 2. /api/llm/test against a DIFFERENT base_url must NOT leak the stored secret.
+	otherTestBody, _ := json.Marshal(map[string]any{
+		"profile_id": pid, "provider": "ollama", "model": "llama3.2",
+		"base_url": otherServer.URL, "api_key": "", "streaming": false,
+	})
+	req2 := httptest.NewRequest(http.MethodPost, "/api/llm/test", bytes.NewReader(otherTestBody))
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	s.testLLM(rec2, req2)
+	if a, _ := otherChatAuth.Load().(string); a == "Bearer "+secret {
+		t.Fatalf("testLLM leaked stored Ollama secret to a different host: %q", a)
+	}
+
+	// 3. /api/llm/model-spec with profile_id and blank api_key must send stored Bearer secret to /api/show.
+	specBody, _ := json.Marshal(map[string]any{
+		"profile_id": pid, "provider": "ollama", "model": "custom-local-llama",
+		"base_url": authServer.URL, "api_key": "",
+	})
+	req3 := httptest.NewRequest(http.MethodPost, "/api/llm/model-spec", bytes.NewReader(specBody))
+	req3.Header.Set("Content-Type", "application/json")
+	rec3 := httptest.NewRecorder()
+	s.pgLookupModelSpec(rec3, req3)
+	var specResp struct {
+		OK     bool        `json:"ok"`
+		Found  bool        `json:"found"`
+		Detail modelDetail `json:"detail"`
+	}
+	_ = json.Unmarshal(rec3.Body.Bytes(), &specResp)
+	if !specResp.OK || !specResp.Found || specResp.Detail.ContextWindow != 131072 {
+		t.Fatalf("pgModelSpec failed to detect context from authenticated Ollama: %+v (body=%s)", specResp, rec3.Body.String())
+	}
+	if a, _ := gotShowAuth.Load().(string); a != "Bearer "+secret {
+		t.Fatalf("pgModelSpec /api/show Authorization=%q, want Bearer %s", a, secret)
+	}
+
+	// 4. /api/llm/model-spec against a DIFFERENT base_url must NOT leak the stored secret.
+	otherSpecBody, _ := json.Marshal(map[string]any{
+		"profile_id": pid, "provider": "ollama", "model": "custom-local-llama",
+		"base_url": otherServer.URL, "api_key": "",
+	})
+	req4 := httptest.NewRequest(http.MethodPost, "/api/llm/model-spec", bytes.NewReader(otherSpecBody))
+	req4.Header.Set("Content-Type", "application/json")
+	rec4 := httptest.NewRecorder()
+	s.pgLookupModelSpec(rec4, req4)
+	if a, _ := otherShowAuth.Load().(string); a == "Bearer "+secret {
+		t.Fatalf("pgModelSpec leaked stored Ollama secret to a different host: %q", a)
+	}
+}

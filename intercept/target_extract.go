@@ -20,7 +20,9 @@ const executeExtraTool = "ExecuteExtraTool"
 var noTargetTools = toolSet(
 	"web_search",
 	"Read", "Write", "Edit", "MultiEdit", "LS", "Glob", "Grep",
+	"Skill", "SearchExtraTools", "AskUserQuestion",
 	"TodoWrite", "sleep", "TaskOutput", "TaskStop", "TaskList",
+	"shell_read", "shell_close", "shell_list",
 	// exploration graph, assets, findings, goals (agent.ToolSet)
 	"graph_overview", "list_findings", "list_facts", "node_detail", "expand_digest",
 	"get_worker_output", "get_worker_trace", "search_all_worker_traces",
@@ -40,6 +42,9 @@ var noTargetTools = toolSet(
 	"ask_operator",
 	// recorded traffic
 	"traffic_search", "traffic_get", "traffic_blob", "traffic_messages",
+	// local offline cybersecurity knowledge base (secrag MCP — zero network I/O)
+	"mcp__secrag__kb_search", "mcp__secrag__kb_read_section",
+	"mcp__secrag__kb_lookup_cve", "mcp__secrag__kb_stats",
 )
 
 func toolSet(names ...string) map[string]bool {

@@ -10,8 +10,20 @@ import yaml
 from .storage import extract_cves, extract_mitre_ids
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
-FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
-FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+FENCE_RE = re.compile(r"^\s*(?:(?:[-*+]|\d+[.)])\s+|>\s*)*(`{3,}|~{3,})(.*)$")
+FRONTMATTER_RE = re.compile(r"^---[ \t]*\r?\n(.*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)", re.DOTALL)
+
+
+def _parse_fence_line(line: str) -> Optional[tuple[str, int, str]]:
+    """Parse a CommonMark-style fenced code delimiter line (including inside lists/blockquotes).
+
+    Returns (marker_char, fence_length, stripped_info_string) or None.
+    """
+    fm = FENCE_RE.match(line)
+    if not fm:
+        return None
+    seq = fm.group(1)
+    return seq[0], len(seq), fm.group(2).strip()
 
 TARGET_CHUNK_CHARS = 1500
 MAX_CHUNK_CHARS = 2200
@@ -45,25 +57,29 @@ def _split_section_to_chunks(content: str, target: int = TARGET_CHUNK_CHARS, har
     cur: list[str] = []
     in_fence = False
     fence_char = ""
+    fence_len = 0
 
     for line in text.splitlines():
-        fm = FENCE_RE.match(line)
-        if fm:
-            marker = fm.group(1)[0]
+        fence = _parse_fence_line(line)
+        if fence:
+            marker, flen, info = fence
             if not in_fence:
-                if cur:
-                    blocks.append("\n".join(cur).strip())
-                    cur = []
-                in_fence = True
-                fence_char = marker
-                cur.append(line)
-                continue
-            elif marker == fence_char:
+                if marker != "`" or "`" not in info:
+                    if cur:
+                        blocks.append("\n".join(cur).strip())
+                        cur = []
+                    in_fence = True
+                    fence_char = marker
+                    fence_len = flen
+                    cur.append(line)
+                    continue
+            elif marker == fence_char and flen >= fence_len and info == "":
                 cur.append(line)
                 blocks.append("\n".join(cur).strip())
                 cur = []
                 in_fence = False
                 fence_char = ""
+                fence_len = 0
                 continue
 
         if in_fence:
@@ -128,6 +144,7 @@ def chunk_markdown(
     *,
     doc_title: str,
     root_breadcrumb: str = "",
+    min_section_chars: int = 25,
 ) -> list[tuple[str, str, str, list[str]]]:
     """Parse Markdown into heading-aware sections and code-safe chunks.
 
@@ -146,19 +163,25 @@ def chunk_markdown(
 
     in_fence = False
     fence_char = ""
+    fence_len = 0
 
     for line in body.splitlines():
-        fm = FENCE_RE.match(line)
-        if fm:
-            marker = fm.group(1)[0]
+        fence = _parse_fence_line(line)
+        if fence:
+            marker, flen, info = fence
             if not in_fence:
-                in_fence = True
-                fence_char = marker
-            elif marker == fence_char:
+                if marker != "`" or "`" not in info:
+                    in_fence = True
+                    fence_char = marker
+                    fence_len = flen
+                    cur_lines.append(line)
+                    continue
+            elif marker == fence_char and flen >= fence_len and info == "":
                 in_fence = False
                 fence_char = ""
-            cur_lines.append(line)
-            continue
+                fence_len = 0
+                cur_lines.append(line)
+                continue
 
         if not in_fence:
             hm = HEADING_RE.match(line)
@@ -191,7 +214,7 @@ def chunk_markdown(
     out: list[tuple[str, str, str, list[str]]] = []
     for heading, breadcrumb, lines in sections_raw:
         sec_text = "\n".join(lines).strip()
-        if len(sec_text) < 25:
+        if len(sec_text) < min_section_chars:
             continue
         chunks = _split_section_to_chunks(sec_text)
         if chunks:
@@ -199,8 +222,88 @@ def chunk_markdown(
     return out
 
 
+_NORM_SEP_RE = re.compile(r"[\s_\-]+")
+
+
+def _tok_re(*tokens: str) -> re.Pattern[str]:
+    alt = "|".join(tokens)
+    return re.compile(rf"(?<![a-z0-9])(?:{alt})(?![a-z0-9])")
+
+
+_CATEGORY_RULES: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "cloud",
+        _tok_re(
+            "cloud", "aws", "azure", "gcp", "kubernetes", "k8s", "docker",
+            "terraform", "ci-cd", "cicd", "helm", "eks", "aks", "gke",
+        ),
+    ),
+    (
+        "ad",
+        _tok_re(
+            "active-directory", "kerberos", "ldap(?!-injection)", "ntlm",
+            "bloodhound", "adcs", "windows-active", "domain-controller",
+            "dcsync", "kerberoast", "asreproast",
+        ),
+    ),
+    (
+        "privesc",
+        _tok_re(
+            "privesc", "privilege-escalation", "linux-hardening",
+            "windows-local", "suid",
+        ),
+    ),
+    (
+        "mobile",
+        _tok_re("mobile", "android", "ios", "apk", "ipa", "mastg", "frida"),
+    ),
+    (
+        "api",
+        _tok_re(
+            "api", "graphql", "rest", "jwt", "json-web-token", "oauth",
+            "oidc", "grpc", "websocket", "swagger", "openapi",
+        ),
+    ),
+    (
+        "web",
+        _tok_re(
+            "pentesting-web", "xss", "cross-site-scripting", "sqli",
+            "sql-injection", "nosql-injection", "ssrf", "xxe",
+            "xml-external-entity", "ssti", "template-injection", "csrf",
+            "request-forgery", "idor", "direct-object-references",
+            "file-inclusion", "lfi", "rfi", "command-injection",
+            "request-smuggling", "http-smuggling", "upload-insecure-files",
+            "file-upload", "prototype-pollution", "open-redirect", "cors",
+            "crlf", "directory-traversal", "path-traversal",
+            "deserialization", "waf", "wstg", "cheatsheet", "web",
+            "ldap-injection", "xpath-injection", "ssi-injection",
+            "xslt-injection", "csv-injection", "clickjacking",
+            "cache-poisoning", "host-header", "race-condition",
+            "account-takeover", "saml", "type-juggling", "mass-assignment",
+            "business-logic", "tabnabbing", "dom-clobbering", "postmessage",
+            "css-injection", "latex-injection", "prompt-injection", "csti",
+            "verb-tampering", "dependency-confusion",
+        ),
+    ),
+    (
+        "binary",
+        _tok_re(
+            "binary", "pwn", "reversing", "reverse-engineering", "rop",
+            "heap", "shellcode", "malware", "buffer-overflow",
+        ),
+    ),
+    (
+        "network",
+        _tok_re(
+            "network", "pentesting-network", "smb", "ssh", "ftp", "smtp",
+            "snmp", "dns", "pivoting", "tunnel", "tunneling",
+        ),
+    ),
+]
+
+
 def infer_category_from_path(source: str, rel_path: str) -> str:
-    p = rel_path.lower()
+    p = rel_path.lower().replace("\\", "/")
     if source in ("hacktricks-cloud",):
         return "cloud"
     if source in ("cisa-kev", "cvelist-v5"):
@@ -224,22 +327,10 @@ def infer_category_from_path(source: str, rel_path: str) -> str:
     if source in ("poc-in-github",):
         return "exploits"
 
-    if any(k in p for k in ("cloud", "aws", "azure", "gcp", "kubernetes", "k8s", "docker", "terraform", "ci-cd")):
-        return "cloud"
-    if any(k in p for k in ("active-directory", "active_directory", "kerberos", "ldap", "ntlm", "bloodhound", "adcs", "windows-active")):
-        return "ad"
-    if any(k in p for k in ("privesc", "privilege-escalation", "privilege_escalation", "linux-hardening", "windows-local")):
-        return "privesc"
-    if any(k in p for k in ("mobile", "android", "ios", "apk", "ipa", "mastg", "frida")):
-        return "mobile"
-    if any(k in p for k in ("api", "graphql", "rest", "jwt", "oauth", "oidc", "grpc", "websocket")):
-        return "api"
-    if any(k in p for k in ("pentesting-web", "xss", "sqli", "sql-injection", "ssrf", "xxe", "ssti", "csrf", "idor", "deserialization", "waf", "wstg", "cheatsheet", "web")):
-        return "web"
-    if any(k in p for k in ("binary", "pwn", "reversing", "rop", "heap", "shellcode", "malware")):
-        return "binary"
-    if any(k in p for k in ("network", "pentesting-network", "smb", "ssh", "ftp", "smtp", "snmp", "dns", "pivoting", "tunnel")):
-        return "network"
+    norm = _NORM_SEP_RE.sub("-", p)
+    for category, pattern in _CATEGORY_RULES:
+        if pattern.search(norm):
+            return category
     return "general"
 
 
@@ -450,9 +541,11 @@ def parse_cve_v5_json(data: dict[str, Any], rel_path: str) -> Optional[dict[str,
     if not cve_id.startswith("CVE-"):
         return None
 
-    cna = (data.get("containers") or {}).get("cna") or {}
+    containers = data.get("containers") or {}
+    cna = containers.get("cna") or {}
     if not isinstance(cna, dict):
         return None
+    adp_list = [a for a in (containers.get("adp") or []) if isinstance(a, dict)]
 
     title = str(cna.get("title", "") or "").strip()
     descs = [
@@ -473,30 +566,51 @@ def parse_cve_v5_json(data: dict[str, Any], rel_path: str) -> Optional[dict[str,
         if vendor or product:
             affected_strs.append(f"{vendor} {product}".strip())
 
-    cwes: list[str] = []
-    for pt in cna.get("problemTypes") or []:
-        if not isinstance(pt, dict):
-            continue
-        for pd in pt.get("descriptions") or []:
-            if isinstance(pd, dict):
-                cwe_id = str(pd.get("cweId", "") or "").strip()
-                cwe_desc = str(pd.get("description", "") or "").strip()
-                if cwe_id:
-                    cwes.append(f"{cwe_id} ({cwe_desc})" if cwe_desc and cwe_desc != cwe_id else cwe_id)
+    def _extract_cwes(problem_types: Any) -> list[str]:
+        found: list[str] = []
+        for pt in problem_types or []:
+            if not isinstance(pt, dict):
+                continue
+            for pd in pt.get("descriptions") or []:
+                if isinstance(pd, dict):
+                    cwe_id = str(pd.get("cweId", "") or "").strip()
+                    cwe_desc = str(pd.get("description", "") or "").strip()
+                    if cwe_id:
+                        entry = f"{cwe_id} ({cwe_desc})" if cwe_desc and cwe_desc != cwe_id else cwe_id
+                        if entry not in found:
+                            found.append(entry)
+        return found
 
-    severity = ""
-    cvss_score = ""
-    for metric in cna.get("metrics") or []:
-        if not isinstance(metric, dict):
-            continue
-        for k in ("cvssV4_0", "cvssV3_1", "cvssV3_0", "cvssV2_0"):
-            mv = metric.get(k)
-            if isinstance(mv, dict):
-                cvss_score = str(mv.get("baseScore", "") or "")
-                severity = str(mv.get("baseSeverity", "") or "").lower()
+    cwes = _extract_cwes(cna.get("problemTypes"))
+    if not cwes:
+        for adp in adp_list:
+            for entry in _extract_cwes(adp.get("problemTypes")):
+                if entry not in cwes:
+                    cwes.append(entry)
+
+    def _extract_cvss(metrics: Any) -> tuple[str, str]:
+        for metric in metrics or []:
+            if not isinstance(metric, dict):
+                continue
+            for k in ("cvssV4_0", "cvssV3_1", "cvssV3_0", "cvssV2_0"):
+                mv = metric.get(k)
+                if isinstance(mv, dict):
+                    score = str(mv.get("baseScore", "") or "").strip()
+                    sev = str(mv.get("baseSeverity", "") or "").strip().lower()
+                    if score or sev:
+                        return score, sev
+        return "", ""
+
+    cvss_score, severity = _extract_cvss(cna.get("metrics"))
+    if not cvss_score or not severity:
+        for adp in adp_list:
+            a_score, a_sev = _extract_cvss(adp.get("metrics"))
+            if not cvss_score and a_score:
+                cvss_score = a_score
+            if not severity and a_sev:
+                severity = a_sev
+            if cvss_score and severity:
                 break
-        if severity or cvss_score:
-            break
 
     refs = [
         str(r.get("url", "")).strip()

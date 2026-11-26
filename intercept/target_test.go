@@ -270,3 +270,19 @@ func TestBypass_CustomScriptCodeNotScanned(t *testing.T) {
 	// the stored code, which the hook never sees.
 	wantTargets(t, "custom script tool", targetsOf("my_script_tool", map[string]any{"path": "/login", "retries": 3}))
 }
+
+func TestSecragKnowledgeBaseToolsHaveNoNetworkTargets(t *testing.T) {
+	// Local offline knowledge-base queries routinely mention example URLs, IMDS
+	// IPs (169.254.169.254), and localhost ports; they never open network sockets
+	// and must never trigger the Target Gate.
+	q := map[string]any{"query": "SSRF bypass http://169.254.169.254/latest/meta-data/ 127.0.0.1:6379 http://example.com"}
+	for _, name := range []string{
+		"mcp__secrag__kb_search",
+		"mcp__secrag__kb_read_section",
+		"mcp__secrag__kb_lookup_cve",
+		"mcp__secrag__kb_stats",
+	} {
+		wantTargets(t, name, targetsOf(name, q))
+		wantTargets(t, "ExecuteExtraTool/"+name, targetsOf("ExecuteExtraTool", map[string]any{"tool_name": name, "params": q}))
+	}
+}

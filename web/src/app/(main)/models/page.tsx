@@ -74,6 +74,12 @@ export default function ModelsPage() {
     }
   }, []);
 
+  const reloadOAuthForced = React.useCallback(
+    () => loadOAuth({ verify: true, force: true }),
+    [loadOAuth],
+  );
+  const pollOAuth = React.useCallback(() => loadOAuth(), [loadOAuth]);
+
   const load = React.useCallback(async () => {
     try {
       setProfiles(await api.llmProfiles());
@@ -164,6 +170,7 @@ export default function ModelsPage() {
         p.streaming ?? true,
         p.session_header_key ?? "",
         p.user_agent ?? "",
+        p.format === "openai" ? (p.max_tokens_field ?? "") : "",
       );
       if (r.ok) {
         toast.success(t("Connected · {latency}ms · {model}", { latency: r.latency_ms ?? "?", model: r.model ?? p.model }), {
@@ -179,7 +186,7 @@ export default function ModelsPage() {
     }
   }
 
-  const activeHealth = activeProfile ? healthOf(activeProfile, healthMap.get(activeProfile.id), oauthMap) : null;
+  const activeHealth = activeProfile ? healthOf(activeProfile, healthMap.get(activeProfile.id), oauthMap, ollamaStatus) : null;
   const activeReasoning = activeProfile ? reasoningSummary(activeProfile) : null;
 
   return (
@@ -335,7 +342,7 @@ export default function ModelsPage() {
           {/* Profile cards grid */}
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
             {filteredProfiles.map((p) => {
-              const h = healthOf(p, healthMap.get(p.id), oauthMap);
+              const h = healthOf(p, healthMap.get(p.id), oauthMap, ollamaStatus);
               const reasoning = reasoningSummary(p);
               const isTesting = testingId === p.id;
               return (
@@ -346,6 +353,7 @@ export default function ModelsPage() {
                   tabIndex={0}
                   onClick={() => openEditor(p)}
                   onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
                       openEditor(p);
@@ -499,7 +507,8 @@ export default function ModelsPage() {
         onOpenChange={setEditOpen}
         onSaved={() => void load()}
         oauthMap={oauthMap}
-        onReloadOAuth={() => loadOAuth({ verify: true, force: true })}
+        onReloadOAuth={reloadOAuthForced}
+        onPollOAuth={pollOAuth}
         profiles={profiles}
         healthMap={healthMap}
         ollamaStatus={ollamaStatus}

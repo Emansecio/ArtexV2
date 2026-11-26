@@ -84,3 +84,45 @@ func TestProbeOllamaModelContext(t *testing.T) {
 		t.Fatalf("expected num_ctx=65536, got %d", n)
 	}
 }
+
+func TestMergeModelDetailFallbackValidatesDefaultReasoningEffort(t *testing.T) {
+	// Live discovery only supports ["low", "medium"]; fallback has default "high".
+	// Must NOT assign unsupported "high" to DefaultReasoningEffort.
+	dst := modelDetail{
+		ID:              "demo-model",
+		ReasoningLevels: []string{"low", "medium"},
+	}
+	src := modelDetail{
+		ID:                     "demo-model",
+		ReasoningLevels:        []string{"low", "medium", "high"},
+		DefaultReasoningEffort: "high",
+	}
+	mergeModelDetailFallback(&dst, src)
+	if dst.DefaultReasoningEffort != "" {
+		t.Fatalf("expected unsupported default reasoning effort to be ignored, got %q", dst.DefaultReasoningEffort)
+	}
+
+	// When fallback default IS in live ReasoningLevels, it should be copied.
+	srcSupported := modelDetail{
+		ID:                     "demo-model",
+		DefaultReasoningEffort: "medium",
+	}
+	mergeModelDetailFallback(&dst, srcSupported)
+	if dst.DefaultReasoningEffort != "medium" {
+		t.Fatalf("expected supported default reasoning effort 'medium', got %q", dst.DefaultReasoningEffort)
+	}
+
+	// When both dst and src have empty ReasoningLevels, DefaultReasoningEffort must stay empty.
+	emptyDst := modelDetail{ID: "non-reasoning"}
+	mergeModelDetailFallback(&emptyDst, modelDetail{DefaultReasoningEffort: "high"})
+	if emptyDst.DefaultReasoningEffort != "" {
+		t.Fatalf("expected empty DefaultReasoningEffort when ReasoningLevels is empty, got %q", emptyDst.DefaultReasoningEffort)
+	}
+
+	// When dst has empty ReasoningLevels and src supplies both levels and a valid default, both are copied.
+	inheritDst := modelDetail{ID: "inherit-model"}
+	mergeModelDetailFallback(&inheritDst, src)
+	if len(inheritDst.ReasoningLevels) != 3 || inheritDst.DefaultReasoningEffort != "high" {
+		t.Fatalf("expected inherited levels and valid default 'high', got %+v", inheritDst)
+	}
+}

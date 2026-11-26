@@ -6,10 +6,12 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/Autumn-27/norma/llm"
@@ -65,9 +67,15 @@ type rpcRequest struct {
 
 type rpcResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id"`
+	ID      json.RawMessage `json:"id"`
+	Method  string          `json:"method,omitempty"`
 	Result  json.RawMessage `json:"result"`
 	Error   *rpcError       `json:"error"`
+}
+
+func hasRPCID(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && string(trimmed) != "null"
 }
 
 type rpcError struct {
@@ -80,12 +88,13 @@ func (e *rpcError) Error() string { return fmt.Sprintf("mcp rpc error %d: %s", e
 // conn is a JSON-RPC 2.0 connection over a newline-delimited byte stream. It is
 // transport-agnostic (stdio, pipe, socket) for testability.
 type conn struct {
-	w       io.Writer
-	mu      sync.Mutex
-	nextID  int
-	pending map[int]chan rpcResponse
-	closeCh chan struct{}
-	once    sync.Once
+	w          io.Writer
+	mu         sync.Mutex
+	nextID     int
+	pending    map[int]chan rpcResponse
+	closeCh    chan struct{}
+	once       sync.Once
+	stderrTail func() string
 }
 
 func newConn(r io.Reader, w io.Writer) *conn {
@@ -106,12 +115,30 @@ func (c *conn) readLoop(r io.Reader) {
 		if err := json.Unmarshal(line, &resp); err != nil {
 			continue // notifications / non-response frames are ignored
 		}
-		if resp.ID == 0 {
+		if !hasRPCID(resp.ID) {
+			continue
+		}
+		if resp.Method != "" {
+			// Server-to-client JSON-RPC request (e.g. ping): never let it collide
+			// with a client-initiated pending RPC ID. Reply asynchronously so
+			// readLoop never blocks on c.w and deadlocks bidirectional pipes.
+			if resp.Method == "ping" {
+				pingID := append(json.RawMessage(nil), bytes.TrimSpace(resp.ID)...)
+				go func() {
+					c.mu.Lock()
+					_ = c.writeLocked(map[string]any{"jsonrpc": "2.0", "id": pingID, "result": map[string]any{}})
+					c.mu.Unlock()
+				}()
+			}
+			continue
+		}
+		var id int
+		if err := json.Unmarshal(resp.ID, &id); err != nil || id <= 0 {
 			continue
 		}
 		c.mu.Lock()
-		ch := c.pending[resp.ID]
-		delete(c.pending, resp.ID)
+		ch := c.pending[id]
+		delete(c.pending, id)
 		c.mu.Unlock()
 		if ch != nil {
 			ch <- resp
@@ -133,14 +160,35 @@ func (c *conn) call(ctx context.Context, method string, params any) (json.RawMes
 	ch := make(chan rpcResponse, 1)
 	c.pending[id] = ch
 	err := c.writeLocked(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params})
-	c.mu.Unlock()
 	if err != nil {
+		delete(c.pending, id)
+		c.mu.Unlock()
 		return nil, err
 	}
+	c.mu.Unlock()
 	select {
 	case <-ctx.Done():
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
 		return nil, ctx.Err()
 	case <-c.closeCh:
+		select {
+		case resp := <-ch:
+			if resp.Error != nil {
+				return nil, resp.Error
+			}
+			return resp.Result, nil
+		default:
+		}
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		if c.stderrTail != nil {
+			if tail := c.stderrTail(); tail != "" {
+				return nil, fmt.Errorf("mcp: connection closed (stderr: %s)", tail)
+			}
+		}
 		return nil, fmt.Errorf("mcp: connection closed")
 	case resp := <-ch:
 		if resp.Error != nil {
@@ -191,21 +239,37 @@ func (c *Client) initialize(ctx context.Context) error {
 	return c.conn.notify("notifications/initialized", map[string]any{})
 }
 
-// Tools lists the server's tools and adapts them to CoreTools.
+// Tools lists the server's tools (following MCP nextCursor pagination when
+// present) and adapts them to CoreTools.
 func (c *Client) Tools(ctx context.Context) ([]tool.CoreTool, error) {
-	raw, err := c.conn.call(ctx, "tools/list", map[string]any{})
-	if err != nil {
-		return nil, err
-	}
-	var res struct {
-		Tools []remoteTool `json:"tools"`
-	}
-	if err := json.Unmarshal(raw, &res); err != nil {
-		return nil, err
-	}
-	out := make([]tool.CoreTool, 0, len(res.Tools))
-	for _, rt := range res.Tools {
-		out = append(out, c.wrap(rt))
+	const maxPages = 20
+	var out []tool.CoreTool
+	cursor := ""
+	seenCursors := map[string]bool{}
+	for page := 0; page < maxPages; page++ {
+		params := map[string]any{}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		raw, err := c.conn.call(ctx, "tools/list", params)
+		if err != nil {
+			return nil, err
+		}
+		var res struct {
+			Tools      []remoteTool `json:"tools"`
+			NextCursor string       `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return nil, err
+		}
+		for _, rt := range res.Tools {
+			out = append(out, c.wrap(rt))
+		}
+		if res.NextCursor == "" || seenCursors[res.NextCursor] {
+			break
+		}
+		seenCursors[res.NextCursor] = true
+		cursor = res.NextCursor
 	}
 	return out, nil
 }
@@ -231,25 +295,18 @@ func (c *Client) wrap(rt remoteTool) tool.CoreTool {
 			if len(in) > 0 {
 				_ = json.Unmarshal(in, &args)
 			}
+			if args == nil {
+				args = map[string]any{}
+			}
 			raw, err := c.conn.call(ctx, "tools/call", map[string]any{"name": rt.Name, "arguments": args})
 			if err != nil {
 				return tool.Errorf("Error: " + err.Error()), nil
 			}
-			var res struct {
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
-				IsError bool `json:"isError"`
-			}
-			if err := json.Unmarshal(raw, &res); err != nil {
+			text, isErr, err := formatMCPToolResult(raw)
+			if err != nil {
 				return tool.Errorf("Error: bad MCP response: " + err.Error()), nil
 			}
-			var text string
-			for _, blk := range res.Content {
-				text += blk.Text
-			}
-			return tool.Result{Content: []llm.ContentBlock{llm.TextBlock(tool.Capture(tc, text))}, IsError: res.IsError}, nil
+			return tool.Result{Content: []llm.ContentBlock{llm.TextBlock(tool.Capture(tc, text))}, IsError: isErr}, nil
 		},
 	}
 	if readOnly {
@@ -257,6 +314,108 @@ func (c *Client) wrap(rt remoteTool) tool.CoreTool {
 		spec.Concurrent = func(json.RawMessage) bool { return true }
 	}
 	return tool.Build(spec)
+}
+
+func formatMCPToolResult(raw json.RawMessage) (string, bool, error) {
+	var res struct {
+		Content []struct {
+			Type        string `json:"type"`
+			Text        string `json:"text"`
+			MimeType    string `json:"mimeType"`
+			URI         string `json:"uri"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Resource    *struct {
+				URI      string `json:"uri"`
+				MimeType string `json:"mimeType"`
+				Text     string `json:"text"`
+				Blob     string `json:"blob"`
+			} `json:"resource"`
+		} `json:"content"`
+		StructuredContent json.RawMessage `json:"structuredContent"`
+		IsError           bool            `json:"isError"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return "", false, err
+	}
+	var sb strings.Builder
+	for _, blk := range res.Content {
+		var part string
+		switch blk.Type {
+		case "", "text":
+			part = blk.Text
+		case "image":
+			if blk.MimeType != "" {
+				part = fmt.Sprintf("[image: %s]", blk.MimeType)
+			} else {
+				part = "[image]"
+			}
+		case "audio":
+			if blk.MimeType != "" {
+				part = fmt.Sprintf("[audio: %s]", blk.MimeType)
+			} else {
+				part = "[audio]"
+			}
+		case "resource":
+			if blk.Resource != nil {
+				if blk.Resource.Text != "" {
+					part = blk.Resource.Text
+				} else if blk.Resource.URI != "" {
+					if blk.Resource.MimeType != "" {
+						part = fmt.Sprintf("[resource: %s (%s)]", blk.Resource.URI, blk.Resource.MimeType)
+					} else {
+						part = fmt.Sprintf("[resource: %s]", blk.Resource.URI)
+					}
+				} else if blk.Resource.Blob != "" {
+					if blk.Resource.MimeType != "" {
+						part = fmt.Sprintf("[resource: %s]", blk.Resource.MimeType)
+					} else {
+						part = "[resource: binary]"
+					}
+				}
+			}
+		case "resource_link":
+			if blk.URI != "" {
+				label := blk.URI
+				if blk.Name != "" {
+					label = fmt.Sprintf("%s (%s)", blk.Name, blk.URI)
+				}
+				if blk.Description != "" {
+					label += ": " + blk.Description
+				}
+				part = "[resource_link: " + label + "]"
+			}
+		default:
+			part = blk.Text
+		}
+		if part == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(part)
+	}
+	if sb.Len() == 0 {
+		trimmed := bytes.TrimSpace(res.StructuredContent)
+		if len(trimmed) > 0 && string(trimmed) != "null" {
+			sb.Write(trimmed)
+		}
+	}
+	return sb.String(), res.IsError, nil
+}
+
+// Alive reports whether the underlying transport connection is still open.
+func (c *Client) Alive() bool {
+	if c == nil || c.conn == nil {
+		return false
+	}
+	select {
+	case <-c.conn.closeCh:
+		return false
+	default:
+		return true
+	}
 }
 
 // Close shuts down the client's transport.

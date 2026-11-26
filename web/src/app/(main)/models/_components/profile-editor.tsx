@@ -72,6 +72,7 @@ export function ProfileEditorSheet({
   onSaved,
   oauthMap,
   onReloadOAuth,
+  onPollOAuth,
   profiles = [],
   healthMap = new Map(),
   ollamaStatus = null,
@@ -82,6 +83,7 @@ export function ProfileEditorSheet({
   onSaved: (id: string) => void;
   oauthMap: Map<string, OAuthProviderStatus>;
   onReloadOAuth: () => Promise<void>;
+  onPollOAuth?: () => Promise<void>;
   profiles?: LLMProfile[];
   healthMap?: Map<string, LLMPoolMember>;
   ollamaStatus?: OllamaStatus | null;
@@ -121,14 +123,38 @@ export function ProfileEditorSheet({
   const [oauthBusy, setOauthBusy] = React.useState(false);
   const [manualCode, setManualCode] = React.useState("");
   const [manualOpen, setManualOpen] = React.useState(false);
+  const [syncedKey, setSyncedKey] = React.useState("");
   const autoNameRef = React.useRef("");
   const fetchSeqRef = React.useRef(0);
 
+  const clearFetchedModels = React.useCallback(() => {
+    fetchSeqRef.current++;
+    setLoadingModels(false);
+    setModels([]);
+    setModelDetails(new Map());
+    setFilteredCount(0);
+    setIncludeAllModels(false);
+    setLookedUpDetail(null);
+    setModelsOpen(false);
+    setModelQuery("");
+  }, []);
+
+  const activeSyncKey = open
+    ? profile
+      ? `edit:${profile.id}:${profile.format}:${profile.base_url ?? ""}:${profile.proxy ?? ""}`
+      : "new"
+    : "";
+
   React.useEffect(() => {
     if (!open) {
-      fetchSeqRef.current++;
+      clearFetchedModels();
+      setSyncedKey("");
+      setBaseUrl("");
+      setProxy("");
+      setApiKey("");
       return;
     }
+    clearFetchedModels();
     setName(profile?.name ?? "");
     autoNameRef.current = "";
     setFormat(normalizeFormat(profile?.format));
@@ -150,17 +176,11 @@ export function ProfileEditorSheet({
     setRetry(profile?.retry ?? ZERO_OVERRIDE);
     setApiKey("");
     setKeyHint(profile?.api_key_hint ?? "");
-    setModels([]);
-    setModelDetails(new Map());
-    setFilteredCount(0);
-    setIncludeAllModels(false);
-    setLookedUpDetail(null);
-    setModelsOpen(false);
-    setModelQuery("");
     setManualCode("");
     setManualOpen(false);
     setAdvancedOpen(false);
-  }, [open, profile]);
+    setSyncedKey(activeSyncKey);
+  }, [open, profile, activeSyncKey, clearFetchedModels]);
 
   const profileId = profile ? Number(profile.id) : undefined;
   const providers = getProviders();
@@ -170,13 +190,16 @@ export function ProfileEditorSheet({
   const meta = providerMeta(format);
   const oauthProv = meta.oauthProvider ?? null;
   const oauthStatus = oauthProv ? oauthMap.get(oauthProv) : undefined;
+  const effectiveBaseUrl = oauthProv ? "" : baseUrl.trim();
+  const effectiveApiKey = oauthProv ? "" : apiKey;
+  const pollOAuth = onPollOAuth ?? onReloadOAuth;
 
   // Poll OAuth status while a browser login is pending in this drawer.
   React.useEffect(() => {
     if (!open || !oauthProv || !oauthStatus?.pending) return;
-    const timer = window.setInterval(() => void onReloadOAuth(), 2000);
+    const timer = window.setInterval(() => void pollOAuth(), 2000);
     return () => window.clearInterval(timer);
-  }, [open, oauthProv, oauthStatus?.pending, onReloadOAuth]);
+  }, [open, oauthProv, oauthStatus?.pending, pollOAuth]);
 
   async function startOAuth() {
     if (!oauthProv || oauthBusy) return;
@@ -194,7 +217,7 @@ export function ProfileEditorSheet({
       } else {
         toast.info(t("Complete sign-in in the browser tab that just opened."));
       }
-      await onReloadOAuth();
+      await pollOAuth();
     } catch (e) {
       toast.error(t("OAuth sign-in failed: {error}", { error: (e as Error).message }));
     } finally {
@@ -223,6 +246,7 @@ export function ProfileEditorSheet({
     setOauthBusy(true);
     try {
       await api.logoutLLMOAuth(oauthProv);
+      clearFetchedModels();
       await onReloadOAuth();
       toast.success(t("OAuth account disconnected"));
     } catch (e) {
@@ -249,7 +273,7 @@ export function ProfileEditorSheet({
         setModelQuery("");
       }
       try {
-        const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId, {
+        const r = await api.fetchLLMModels(format, effectiveBaseUrl, effectiveApiKey, proxy, profileId, {
           force,
           include_all: incAll,
         });
@@ -257,6 +281,7 @@ export function ProfileEditorSheet({
         if (r.ok && r.models && r.models.length > 0) {
           setModels(r.models);
           setFilteredCount(r.filtered_count ?? 0);
+          setIncludeAllModels(incAll);
           const detailMap = new Map<string, ModelDetail>();
           for (const d of r.model_details ?? []) {
             detailMap.set(d.id, d);
@@ -267,9 +292,6 @@ export function ProfileEditorSheet({
             toast.success(t("Loaded {count} models", { count: r.models.length }));
           }
         } else if (!silent) {
-          setModels([]);
-          setModelDetails(new Map());
-          setFilteredCount(0);
           toast.error(t("Failed to load models: {error}", { error: r.error ?? t("no models returned") }));
         }
       } catch (e) {
@@ -283,7 +305,7 @@ export function ProfileEditorSheet({
         }
       }
     },
-    [format, baseUrl, apiKey, proxy, profileId, includeAllModels],
+    [format, effectiveBaseUrl, effectiveApiKey, proxy, profileId, includeAllModels],
   );
 
   // Automatically fetch available models in the background when a ready provider is active.
@@ -296,11 +318,11 @@ export function ProfileEditorSheet({
       Boolean(!isNew && profile?.api_key_hint && profile.format === format));
 
   React.useEffect(() => {
-    if (!canAutoFetch) return;
+    if (!canAutoFetch || syncedKey !== activeSyncKey) return;
     void loadModels({ silent: true });
-    // Intentionally scoped to sheet open + provider readiness transitions.
+    // Intentionally scoped to sheet open (post-form-sync) + provider readiness transitions.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, format, oauthStatus?.connected, ollamaStatus?.state, profile?.id]);
+  }, [open, syncedKey, activeSyncKey, format, oauthStatus?.connected, ollamaStatus?.state, profile?.id]);
 
   // Debounced spec lookup for typed model IDs not yet present in the fetched list.
   React.useEffect(() => {
@@ -318,9 +340,9 @@ export function ProfileEditorSheet({
     const timer = window.setTimeout(() => {
       void api
         .lookupLLMModelSpec(format, trimmed, {
-          base_url: baseUrl,
+          base_url: effectiveBaseUrl,
           proxy,
-          api_key: apiKey,
+          api_key: effectiveApiKey,
           profile_id: profileId,
         })
         .then((res) => {
@@ -339,7 +361,7 @@ export function ProfileEditorSheet({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [open, format, model, modelDetails, baseUrl, proxy, apiKey, profileId]);
+  }, [open, format, model, modelDetails, effectiveBaseUrl, proxy, effectiveApiKey, profileId]);
 
   const selectedModelDetail = React.useMemo(() => {
     const trimmed = model.trim();
@@ -370,8 +392,12 @@ export function ProfileEditorSheet({
     if (format === "openai") {
       setMaxTokensField(detail.max_tokens_field ? detail.max_tokens_field : NONE);
     }
+    const authoritative =
+      detail.source === "models.dev" || detail.source === "known" || detail.source === "api";
     if (detail.thinking_type) {
       setThinkingType(detail.thinking_type);
+    } else if (authoritative) {
+      setThinkingType(NONE);
     }
     if (detail.reasoning_levels && detail.reasoning_levels.length > 0) {
       if (effort === NONE) {
@@ -387,6 +413,8 @@ export function ProfileEditorSheet({
               : detail.reasoning_levels[0],
         );
       }
+    } else if (authoritative) {
+      setEffort(NONE);
     }
     if (isNew && (!name.trim() || name.trim() === autoNameRef.current)) {
       const suggested = `${meta.shortLabel} · ${detail.label || detail.id}`;
@@ -418,8 +446,8 @@ export function ProfileEditorSheet({
       const r = await api.testLLM(
         format,
         model,
-        baseUrl,
-        apiKey,
+        effectiveBaseUrl,
+        effectiveApiKey,
         proxy,
         toStore(thinkingType),
         toStore(effort),
@@ -427,7 +455,7 @@ export function ProfileEditorSheet({
         streaming,
         sessionHeaderKey.trim(),
         userAgent.trim(),
-        format === "openai" ? toStore(maxTokensField) : "",
+        format === "openai" ? (maxTokensField === NONE ? "max_tokens" : maxTokensField) : "",
       );
       if (r.ok) {
         toast.success(t("Connected · {latency}ms · {model}", { latency: r.latency_ms ?? "?", model: r.model ?? model }), {
@@ -473,9 +501,9 @@ export function ProfileEditorSheet({
         name: name.trim(),
         format,
         model: model.trim(),
-        base_url: baseUrl.trim(),
+        base_url: effectiveBaseUrl,
         proxy: proxy.trim(),
-        api_key: apiKey,
+        api_key: effectiveApiKey,
         rate_per_second: Number(rps) || 0,
         rate_per_minute: Number(rpm) || 0,
         context_window_k: contextWindowK,
@@ -506,10 +534,16 @@ export function ProfileEditorSheet({
     }
   }
 
+  const canReuseStoredKey =
+    !isNew &&
+    Boolean(keyHint) &&
+    profile?.format === format &&
+    (profile?.base_url ?? "").trim() === effectiveBaseUrl;
+
   let keyPlaceholder = "sk-…";
   if (format === "ollama") {
     keyPlaceholder = t("optional — a local Ollama server runs keyless");
-  } else if (keyHint) {
+  } else if (canReuseStoredKey) {
     keyPlaceholder = t("Set ({hint}); leave empty to keep it", { hint: keyHint });
   }
 
@@ -566,14 +600,19 @@ export function ProfileEditorSheet({
                     title={`${p.shortLabel} — ${conn.label}: ${conn.hint}`}
                     onClick={() => {
                       if (format !== p.id) {
+                        clearFetchedModels();
                         setFormat(p.id);
-                        setModels([]);
-                        setModelDetails(new Map());
-                        setFilteredCount(0);
-                        setIncludeAllModels(false);
-                        setLookedUpDetail(null);
-                        setModelsOpen(false);
-                        setModelQuery("");
+                        setBaseUrl(
+                          profile && profile.format === p.id && !p.oauthProvider
+                            ? (profile.base_url ?? "")
+                            : "",
+                        );
+                        if (p.oauthProvider) {
+                          setApiKey("");
+                        }
+                        if (p.id !== "anthropic" && p.id !== "anthropic-oauth") {
+                          setThinkingType(NONE);
+                        }
                       }
                     }}
                     className={cn(
@@ -728,16 +767,21 @@ export function ProfileEditorSheet({
               </div>
             )}
 
-            <div className="grid gap-1.5">
-              <Label htmlFor="p-base-url">{t("Base URL (optional)")}</Label>
-              <Input
-                id="p-base-url"
-                className="font-mono text-xs"
-                placeholder={meta.baseUrlPlaceholder}
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-              />
-            </div>
+            {!oauthProv && (
+              <div className="grid gap-1.5">
+                <Label htmlFor="p-base-url">{t("Base URL (optional)")}</Label>
+                <Input
+                  id="p-base-url"
+                  className="font-mono text-xs"
+                  placeholder={meta.baseUrlPlaceholder}
+                  value={baseUrl}
+                  onChange={(e) => {
+                    clearFetchedModels();
+                    setBaseUrl(e.target.value);
+                  }}
+                />
+              </div>
+            )}
           </section>
 
           {/* Step 2: Model */}
@@ -756,6 +800,7 @@ export function ProfileEditorSheet({
                 <Popover
                   open={modelsOpen}
                   onOpenChange={(o) => {
+                    if (o && models.length === 0) return;
                     setModelsOpen(o);
                     if (!o) setModelQuery("");
                   }}
@@ -766,11 +811,17 @@ export function ProfileEditorSheet({
                       type="button"
                       variant="outline"
                       className="shrink-0 gap-1.5"
-                      disabled={loadingModels}
-                      onClick={() => void loadModels({ silent: false, force: true })}
-                      title={t("Refresh available models from the API")}
+                      disabled={loadingModels && models.length === 0}
+                      onClick={models.length === 0 ? () => void loadModels({ silent: false, force: true }) : undefined}
+                      title={models.length === 0 ? t("Refresh available models from the API") : undefined}
                     >
-                      {loadingModels ? <Loader2Icon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
+                      {loadingModels ? (
+                        <Loader2Icon className="size-3.5 animate-spin" />
+                      ) : models.length > 0 ? (
+                        <ChevronDownIcon className="size-3.5" />
+                      ) : (
+                        <RefreshCwIcon className="size-3.5" />
+                      )}
                       <span className="hidden sm:inline">
                         {models.length > 0 ? t("Models ({count})", { count: models.length }) : t("Fetch")}
                       </span>
@@ -778,7 +829,7 @@ export function ProfileEditorSheet({
                   </PopoverTrigger>
                   {models.length > 0 && (
                     <PopoverContent className="w-96 gap-0 p-0" align="end">
-                      <div className="border-b p-1">
+                      <div className="flex items-center gap-1 border-b p-1">
                         <Input
                           autoFocus
                           className="h-8 border-0 shadow-none focus-visible:ring-0 dark:bg-transparent"
@@ -788,6 +839,18 @@ export function ProfileEditorSheet({
                           spellCheck={false}
                           aria-label={t("Search models")}
                         />
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="ghost"
+                          className="size-7 shrink-0"
+                          disabled={loadingModels}
+                          onClick={() => void loadModels({ silent: false, force: true })}
+                          title={t("Refresh available models from the API")}
+                          aria-label={t("Refresh available models from the API")}
+                        >
+                          {loadingModels ? <Loader2Icon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
+                        </Button>
                       </div>
                       <div className="max-h-64 overflow-y-auto overscroll-contain p-1">
                         {filteredModels.length === 0 ? (
@@ -838,7 +901,6 @@ export function ProfileEditorSheet({
                             disabled={loadingModels}
                             onClick={() => {
                               const next = !includeAllModels;
-                              setIncludeAllModels(next);
                               void loadModels({ silent: false, force: false, includeAll: next });
                             }}
                           >
@@ -860,11 +922,23 @@ export function ProfileEditorSheet({
                 const curOut = Math.round(Number(maxTokens) || 0);
                 const ctxMatches = detCtx === 0 || Math.abs(curCtx - detCtx) < 1000;
                 const outMatches = detOut === 0 || curOut === detOut;
+                const authoritative =
+                  selectedModelDetail.source === "models.dev" ||
+                  selectedModelDetail.source === "known" ||
+                  selectedModelDetail.source === "api";
+                const expectedField = selectedModelDetail.max_tokens_field || NONE;
                 const fieldMatches =
                   format !== "openai" ||
-                  !selectedModelDetail.max_tokens_field ||
-                  maxTokensField === selectedModelDetail.max_tokens_field;
-                const allMatch = ctxMatches && outMatches && fieldMatches;
+                  (!authoritative && !selectedModelDetail.max_tokens_field) ||
+                  maxTokensField === expectedField;
+                const thinkingMatches =
+                  !authoritative || Boolean(selectedModelDetail.thinking_type) || thinkingType === NONE;
+                const effortMatches =
+                  !authoritative ||
+                  ((selectedModelDetail.reasoning_levels?.length ?? 0) > 0
+                    ? effort === NONE || selectedModelDetail.reasoning_levels!.includes(effort)
+                    : effort === NONE);
+                const allMatch = ctxMatches && outMatches && fieldMatches && thinkingMatches && effortMatches;
                 const sourceLabel =
                   selectedModelDetail.source === "api"
                     ? t("Live API")
@@ -1181,7 +1255,10 @@ export function ProfileEditorSheet({
                     className="font-mono text-xs"
                     placeholder="socks5://user:pass@127.0.0.1:1080 · http://127.0.0.1:8080"
                     value={proxy}
-                    onChange={(e) => setProxy(e.target.value)}
+                    onChange={(e) => {
+                      clearFetchedModels();
+                      setProxy(e.target.value);
+                    }}
                   />
                   <p className="text-muted-foreground text-xs">
                     {t(

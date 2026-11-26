@@ -219,4 +219,8 @@ type CompletionRequest struct {
 	// PromptCacheKey is an optional stable cache routing key (used as
 	// prompt_cache_key on OpenAI Chat Completions and Responses APIs).
 	PromptCacheKey string
+	// SessionID is an optional per-session identifier (e.g. worker or chat
+	// session ID) used by stateful providers such as Antigravity CLI to keep
+	// concurrent sessions isolated even when they share a PromptCacheKey.
+	SessionID string
 }
