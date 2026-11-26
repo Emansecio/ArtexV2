@@ -20,7 +20,7 @@ func TestRewriteStockNpxBrowserMCP(t *testing.T) {
 			command:     "npx",
 			args:        []string{"@playwright/mcp", "--headless"},
 			wantOK:      true,
-			wantCommand: "playwright-mcp",
+			wantCommand: "patchright-mcp",
 			wantArgs:    []string{"--headless", "--browser", "chromium"},
 		},
 		{
@@ -28,7 +28,7 @@ func TestRewriteStockNpxBrowserMCP(t *testing.T) {
 			command:     "npx",
 			args:        []string{"@playwright/mcp"},
 			wantOK:      true,
-			wantCommand: "playwright-mcp",
+			wantCommand: "patchright-mcp",
 			wantArgs:    []string{"--headless", "--browser", "chromium"},
 		},
 		{
@@ -36,7 +36,7 @@ func TestRewriteStockNpxBrowserMCP(t *testing.T) {
 			command:     "npx",
 			args:        []string{"@playwright/mcp@0.0.83", "--headless"},
 			wantOK:      true,
-			wantCommand: "playwright-mcp",
+			wantCommand: "patchright-mcp",
 			wantArgs:    []string{"--headless", "--browser", "chromium"},
 		},
 		{
@@ -44,7 +44,7 @@ func TestRewriteStockNpxBrowserMCP(t *testing.T) {
 			command:     "npx",
 			args:        []string{"@playwright/mcp", "--headless", "--proxy-server", "http://127.0.0.1:8788"},
 			wantOK:      true,
-			wantCommand: "playwright-mcp",
+			wantCommand: "patchright-mcp",
 			wantArgs:    []string{"--headless", "--proxy-server", "http://127.0.0.1:8788", "--browser", "chromium"},
 		},
 		{
@@ -52,7 +52,7 @@ func TestRewriteStockNpxBrowserMCP(t *testing.T) {
 			command:     "npx",
 			args:        []string{"@playwright/mcp", "--headless", "--browser", "firefox"},
 			wantOK:      true,
-			wantCommand: "playwright-mcp",
+			wantCommand: "patchright-mcp",
 			wantArgs:    []string{"--headless", "--browser", "firefox"},
 		},
 		{
@@ -60,7 +60,7 @@ func TestRewriteStockNpxBrowserMCP(t *testing.T) {
 			command:     "npx",
 			args:        []string{"@playwright/mcp", "--browser=chrome"},
 			wantOK:      true,
-			wantCommand: "playwright-mcp",
+			wantCommand: "patchright-mcp",
 			wantArgs:    []string{"--browser=chrome", "--headless"},
 		},
 		{
@@ -68,7 +68,7 @@ func TestRewriteStockNpxBrowserMCP(t *testing.T) {
 			command:     "npx",
 			args:        []string{"-y", "@playwright/mcp", "--headless"},
 			wantOK:      true,
-			wantCommand: "playwright-mcp",
+			wantCommand: "patchright-mcp",
 			wantArgs:    []string{"--headless", "--browser", "chromium"},
 		},
 		{
@@ -76,7 +76,7 @@ func TestRewriteStockNpxBrowserMCP(t *testing.T) {
 			command:     "npx",
 			args:        []string{"--yes", "--", "@playwright/mcp"},
 			wantOK:      true,
-			wantCommand: "playwright-mcp",
+			wantCommand: "patchright-mcp",
 			wantArgs:    []string{"--headless", "--browser", "chromium"},
 		},
 		{
@@ -130,7 +130,7 @@ func TestRewriteBrowserMCPRow(t *testing.T) {
 		t.Fatalf("missing --browser: ok=%v %q %q", ok, cmd, args)
 	}
 
-	cmd, args, ok = rewriteBrowserMCPRow("playwright-mcp", []string{"--headless", "--browser", "firefox"})
+	cmd, args, ok = rewriteBrowserMCPRow("patchright-mcp", []string{"--headless", "--browser", "firefox"})
 	if ok {
 		t.Fatalf("existing --browser rewritten: %q %q", cmd, args)
 	}

@@ -10,14 +10,13 @@ import (
 
 const (
 	browserMCPName             = "browser"
-	browserMCPCommand          = "playwright-mcp"
-	browserMCPDirectBinSetting = "browser_mcp_direct_bin_v1"
+	browserMCPCommand          = "patchright-mcp"
+	browserMCPDirectBinSetting = "browser_mcp_patchright_v1"
 )
 
 // browserMCPSeedArgs is the JSON args array for a fresh browser MCP row.
-// --headless: the image has no display.
-// --browser chromium: Playwright MCP defaults to the "chrome" channel at
-// /opt/google/chrome, which the image does not ship.
+// --headless: works cleanly in both headless and desktop environments.
+// --browser chromium: uses Patchright's patched Chromium engine.
 const browserMCPSeedArgs = `["--headless","--browser","chromium"]`
 
 // npxMetaFlags are npx switches that do not take a value and that still leave
@@ -67,14 +66,17 @@ func rewriteStockNpxBrowserMCP(command string, args []string) (string, []string,
 	return browserMCPCommand, rest, true
 }
 
-// rewriteBrowserMCPRow is the one-time row rewrite: stock npx @playwright/mcp
-// becomes playwright-mcp, and a playwright-mcp row that still has no --browser
-// (the MCP defaults to a Chrome channel the image does not ship) gets
-// --browser chromium. Any other command or package is left alone.
+// rewriteBrowserMCPRow is the one-time row rewrite: stock `npx @playwright/mcp`
+// or legacy `playwright-mcp` becomes `patchright-mcp` with `--browser chromium`.
+// Any other custom command or package is left alone.
 func rewriteBrowserMCPRow(command string, args []string) (string, []string, bool) {
 	cmd, out, ok := rewriteStockNpxBrowserMCP(command, args)
 	if !ok {
 		cmd, out = command, append([]string{}, args...)
+	}
+	if cmd == "playwright-mcp" {
+		cmd = browserMCPCommand
+		ok = true
 	}
 	if cmd == browserMCPCommand && !hasCLIFlag(out, "--browser") {
 		out = append(out, "--browser", "chromium")

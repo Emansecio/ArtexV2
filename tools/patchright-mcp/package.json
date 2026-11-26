@@ -1,0 +1,12 @@
+{
+  "name": "artex-patchright-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright MCP server backed by Patchright for ArtexV2 (supports --proxy-server, --headless, --browser)",
+  "bin": {
+    "patchright-mcp": "./bin/patchright-mcp.cjs"
+  },
+  "dependencies": {
+    "patchright": "latest"
+  }
+}
