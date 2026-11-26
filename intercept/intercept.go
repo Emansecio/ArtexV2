@@ -129,7 +129,7 @@ func compileRule(r db.InterceptRule) (compiledRule, bool) {
 	if configJSON, err := json.Marshal(r); err == nil {
 		cr.configDigest = digestInput(configJSON)
 	}
-	if r.MatchType == "" || r.MatchType == "contains" {
+	if r.MatchType != "regex" && r.MatchType != "argv" {
 		cr.patternB = []byte(r.Pattern)
 	}
 	switch r.MatchType {

@@ -342,6 +342,7 @@ func builtinsDigest() string {
 	h := sha256.New()
 	h.Write([]byte("builtins-v2\n"))
 	fmt.Fprintf(h, "browser:%s|%s\n", browserMCPCommand, browserMCPSeedArgs)
+	fmt.Fprintf(h, "secrag:%s|%s|%s\n", secragMCPName, secragMCPCommand, secragMCPSeedSetting)
 	for _, a := range builtinAgents {
 		fmt.Fprintf(h, "%s|%s|%s|%s|%v|%v\n", a.key, a.name, a.role, a.desc, a.interactiveShell, a.runSeconds != nil)
 		if a.runSeconds != nil {
@@ -451,6 +452,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.migrateStockBrowserMCP(); err != nil {
 		return fmt.Errorf("migrate browser mcp: %w", err)
 	}
+	if err := d.seedSecragMCP(); err != nil {
+		return fmt.Errorf("seed secrag mcp: %w", err)
+	}
 	// NOTE: the placeholder ScopeSentry data-source MCP (empty URL + empty X-API-Key,
 	// disabled) is seeded directly in schema.sql §F so a raw `psql < schema.sql` init
 	// also gets it. schema.sql is Exec'd on every startup, so it stays idempotent.
@@ -515,7 +519,8 @@ ON CONFLICT DO NOTHING`, r.kind, r.pattern, r.note); err != nil {
 // declares `mcps: ScopeSentry`, which only takes effect once it's made visible and
 // that MCP is enabled/configured.
 var builtinSkillVisibility = map[string][]string{
-	"api-recon": {"auto", "pentest", "worker"},
+	"api-recon":   {"auto", "pentest", "worker"},
+	"cybersec-kb": {"mainagent", "planner", "worker", "pentest", "retester"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default

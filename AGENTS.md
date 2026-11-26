@@ -42,6 +42,13 @@ ArtexV2 contains **two separate Go modules** and a **static-exported Next.js fro
    does not bundle `./artex`.
 5. **Patchright MCP (`tools/patchright-mcp/`)**: Node.js wrapper exposing Patchright's built-in
    MCP server via `patchright-mcp` (symlinked to `~/.local/bin/patchright-mcp`).
+6. **Local Cybersecurity RAG MCP (`tools/secrag-mcp/`)**: Isolated `uv` Python 3.12 MCP server
+   (`secrag-mcp` / `secrag-ingest`, symlinked to `~/.local/bin/`) backed by SQLite FTS5 + USearch
+   HNSW (`data/secrag/`). Its 4 compact tools (`kb_search`, `kb_read_section`, `kb_lookup_cve`,
+   `kb_stats`) are exposed eagerly (non-deferred) via `isEagerMCPServer("secrag")` in
+   `server/assembly.go` and paired with `<knowledge-base-guidance>` in `agent/deferred.go` +
+   embedded skill `skills/cybersec-kb/SKILL.md`. All tool results remain framed by
+   `mcpUntrustedNote` and `UNTRUSTED_OUTPUT`.
 
 ---
 

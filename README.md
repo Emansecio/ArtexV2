@@ -45,6 +45,14 @@ justify it, and every autonomous action passes through scope rules, approval gat
 - **Patchright Browser MCP (Stealth Default)**: Built-in `browser` MCP server powered exclusively by
   [`patchright`](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (`tools/patchright-mcp/` →
   `patchright-mcp`) with Chromium Headless Shell for anti-detection browser automation.
+- **Local Cybersecurity RAG (`secrag` MCP)**: Offline 3-stage hybrid knowledge base
+  (`tools/secrag-mcp/` → `secrag-mcp` + `secrag-ingest`) combining SQLite FTS5 (BM25), USearch HNSW
+  (`f16` mmap), `BAAI/bge-small-en-v1.5` (Apple Silicon MPS GPU bulk indexing + FastEmbed ONNX query
+  runtime), and `Xenova/ms-marco-MiniLM-L-6-v2` cross-encoder reranking (~0.7s warm latency;
+  configurable via `SECRAG_RERANK_MODEL`) over HackTricks,
+  PayloadsAllTheThings, OWASP, GTFOBins/LOLBAS/WADComs, MITRE ATT&CK, Atomic Red Team, SigmaHQ,
+  Nuclei Templates, CISA KEV, Exploit-DB, PoC-in-GitHub, Bug Bounty writeups, and dual-tier
+  CVEListV5 (2020–2026).
 - **4-Locale i18n Parity**: Full localization across **English (`en`)**, **Português do Brasil
   (`pt-BR`)**, **Türkçe (`tr`)**, and **简体中文 (`zh-CN`)** with automated parity tests.
 - **Hardened Security & Performance**: Strict same-origin CORS/WebSocket enforcement, anti-CSRF

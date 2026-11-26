@@ -87,3 +87,33 @@ func TestUnlockGatingFlow(t *testing.T) {
 		t.Fatal("gated tool should be unlocked after skill load")
 	}
 }
+
+func TestKnowledgeBaseGuidance(t *testing.T) {
+	dummyNoKB := []actool.CoreTool{
+		actool.Build(actool.Spec{Name: "Bash", Description: "shell"}),
+	}
+	if got := knowledgeBaseGuidance(dummyNoKB); got != "" {
+		t.Fatalf("expected empty guidance without secrag tool, got %q", got)
+	}
+
+	dummyWithKB := append(dummyNoKB, actool.Build(actool.Spec{
+		Name:        "mcp__secrag__kb_search",
+		Description: "search kb",
+	}))
+	got := knowledgeBaseGuidance(dummyWithKB)
+	if !strings.Contains(got, "<knowledge-base-guidance>") || !strings.Contains(got, "mcp__secrag__kb_lookup_cve") {
+		t.Fatalf("expected knowledge-base guidance block, got:\n%s", got)
+	}
+
+	// Verify deferredSystem and assembleWorkerSystem both include KnowledgeBaseGuidance
+	// in the cached static prefix.
+	def := DeferredInfo{KnowledgeBaseGuidance: got}
+	sys, _ := deferredSystem("BASE", def)
+	if !strings.Contains(sys[0], "<knowledge-base-guidance>") {
+		t.Fatalf("deferredSystem missing KB guidance: %v", sys)
+	}
+	wsys, boundary := assembleWorkerSystem("STATIC", "DYNAMIC", def, true)
+	if boundary != 1 || !strings.Contains(wsys[0], "<knowledge-base-guidance>") || strings.Contains(wsys[1], "<knowledge-base-guidance>") {
+		t.Fatalf("assembleWorkerSystem should keep KB guidance in static cached segment: %v (boundary=%d)", wsys, boundary)
+	}
+}

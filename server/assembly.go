@@ -224,8 +224,14 @@ func wireAgentAugmentWithPool(pool *mcpPool, pg *db.DB, skillDir string, hostToo
 				updateMCPHealthThrottled(pg, m.ID, true, "")
 				for _, t := range res.tools {
 					extra = append(extra, agent.DecorateTool(t, t.Description()+mcpUntrustedNote, nil))
-					allNames = append(allNames, t.Name())
 					serverTools[m.Name] = append(serverTools[m.Name], t.Name())
+					// Compact always-ready reference MCPs (e.g. secrag, 4 small tools) are
+					// exposed directly in the agent's native tool list when directly visible
+					// so models invoke them without spending an extra SearchExtraTools turn.
+					if isEagerMCPServer(m.Name) && res.target.directVisible && !res.target.skillGated {
+						continue
+					}
+					allNames = append(allNames, t.Name())
 					if res.target.directVisible && !res.target.skillGated {
 						globalNames = append(globalNames, t.Name())
 						globalSet[t.Name()] = true
@@ -303,6 +309,10 @@ func wireAgentAugmentWithPool(pool *mcpPool, pg *db.DB, skillDir string, hostToo
 		}
 		return extra, def, cleanup
 	})
+}
+
+func isEagerMCPServer(name string) bool {
+	return name == "secrag"
 }
 
 func idSet(ids []int64) map[int64]bool {

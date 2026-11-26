@@ -473,7 +473,7 @@ func assembleWorkerSystem(staticPart, dynamicTail string, def DeferredInfo, spli
 	if !split {
 		return deferredSystem(staticPart+dynamicTail, def)
 	}
-	stat := staticPart + def.FindingGuidance
+	stat := staticPart + def.FindingGuidance + def.KnowledgeBaseGuidance
 	if block := actool.RenderDeferredToolsBlock(def.GlobalNames); block != "" {
 		stat += "\n\n" + block
 	}

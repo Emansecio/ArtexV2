@@ -17,11 +17,12 @@ import (
 // UnlockSkill unlocks a named skill's MCPs — hosts call it to rebuild the unlock set
 // from history on a resumed session (design doc C2).
 type DeferredInfo struct {
-	FindingGuidance string            // derived from the final permitted tools, including DB overrides
-	Deferred        []string          // all MCP tool names (schema withheld)
-	GlobalNames     []string          // MCP names to list in the system-prompt block
-	Unlock          *actool.UnlockSet // shared call-gate; nil when no MCP tools
-	UnlockSkill     func(skillName string)
+	FindingGuidance       string            // derived from the final permitted tools, including DB overrides
+	KnowledgeBaseGuidance string            // derived when local cybersecurity RAG (secrag MCP) tools are active
+	Deferred              []string          // all MCP tool names (schema withheld)
+	GlobalNames           []string          // MCP names to list in the system-prompt block
+	Unlock                *actool.UnlockSet // shared call-gate; nil when no MCP tools
+	UnlockSkill           func(skillName string)
 }
 
 // ToolAugmentFunc is the ToolAugment hook. If set, it returns the EXTRA tools
@@ -86,6 +87,7 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 	// Tool RAG (off by default): lexical projection of the bound list; only removes.
 	out = applyToolRAG(ctx, agentKey, out, def.Deferred, bm25Score)
 	out, def.FindingGuidance = findingWorkflowTools(agentKey, out)
+	def.KnowledgeBaseGuidance = knowledgeBaseGuidance(out)
 	for i, t := range out {
 		out[i] = guardPanic(t)
 	}
