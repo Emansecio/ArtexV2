@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 from typing import Optional
+
+from mcp.types import ToolAnnotations
 
 try:
     from mcp.server.mcpserver import MCPServer as _MCPServer
@@ -14,7 +17,14 @@ except ImportError:
 
 from .embeddings import LocalEmbedder, LocalReranker
 from .retriever import VALID_CATEGORIES, HybridRetriever
-from .storage import KnowledgeStore
+from .storage import KnowledgeStore, resolve_data_dir
+
+READONLY_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 mcp = _MCPServer(
     "secrag",
@@ -28,36 +38,45 @@ mcp = _MCPServer(
     ),
 )
 
+_init_lock = threading.Lock()
 _retriever: Optional[HybridRetriever] = None
 _store: Optional[KnowledgeStore] = None
 
 
 def _get_store() -> KnowledgeStore:
     global _store
-    if _store is None:
-        _store = KnowledgeStore(read_only=False)
+    if _store is not None:
+        return _store
+    with _init_lock:
+        if _store is None:
+            db_file = resolve_data_dir() / "kb.sqlite"
+            # Open strictly read-only when DB exists so concurrent secrag-ingest never causes write locks.
+            _store = KnowledgeStore(read_only=db_file.exists())
     return _store
 
 
 def _get_retriever() -> HybridRetriever:
     global _retriever
-    if _retriever is None:
-        _retriever = HybridRetriever(
-            store=_get_store(),
-            embedder=LocalEmbedder(),
-            reranker=LocalReranker(),
-        )
+    if _retriever is not None:
+        return _retriever
+    with _init_lock:
+        if _retriever is None:
+            _retriever = HybridRetriever(
+                store=_get_store(),
+                embedder=LocalEmbedder(),
+                reranker=LocalReranker(),
+            )
     return _retriever
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY_ANNOTATIONS)
 def kb_search(
     query: str,
     category: str = "",
     source: str = "",
     top_k: int = 5,
 ) -> str:
-    """Search the local cybersecurity knowledge base using 3-stage hybrid retrieval (BM25 + dense vectors + multilingual cross-encoder reranker).
+    """Search the local cybersecurity knowledge base using 3-stage hybrid retrieval (BM25 + dense vectors + cross-encoder reranker).
 
     Use concise English technical keywords (e.g. "SSTI Jinja2 filter bypass", "Kubernetes RBAC privilege escalation",
     "GraphQL introspection auth bypass", "ADCS ESC8 relay", "Redis Lua sandbox escape").
@@ -101,7 +120,7 @@ def kb_search(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY_ANNOTATIONS)
 def kb_read_section(doc_id: int, section_id: int = 0) -> str:
     """Read the full content of a document section returned by kb_search or kb_lookup_cve.
 
@@ -136,9 +155,9 @@ def kb_read_section(doc_id: int, section_id: int = 0) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY_ANNOTATIONS)
 def kb_lookup_cve(cve_id: str) -> str:
-    """Direct indexed lookup for a specific CVE (e.g. 'CVE-2024-3094') across CISA KEV, Nuclei Templates, Exploit-DB, CVEListV5, and HackTricks.
+    """Direct indexed lookup for a specific CVE (e.g. 'CVE-2024-3094') across CISA KEV, Nuclei Templates, Exploit-DB, PoC-in-GitHub, CVEListV5, and HackTricks.
 
     Prefer this tool whenever you encounter a concrete CVE identifier or want to check whether a CVE is in CISA KEV or has a Nuclei template / PoC.
     """
@@ -163,7 +182,7 @@ def kb_lookup_cve(cve_id: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY_ANNOTATIONS)
 def kb_stats() -> str:
     """Inspect loaded knowledge-base sources, document/chunk/vector counts, and available categories."""
     st = _get_store().stats()

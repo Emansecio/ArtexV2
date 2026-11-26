@@ -893,15 +893,30 @@ SOURCES: list[tuple[str, int, Callable[[KnowledgeStore, Path], str]]] = [
 
 
 def run_embedding_pass(store: KnowledgeStore, batch_size: int = 512, checkpoint_every: int = 8192) -> int:
+    deleted_ids = store.get_deleted_vector_ids()
     pending = int(store.conn.execute("SELECT COUNT(*) FROM chunks WHERE embedded = 0").fetchone()[0])
-    if pending == 0:
-        log("All chunks are already embedded.")
+    if pending == 0 and not deleted_ids:
+        log("All chunks are already embedded and vector index has no stale entries.")
         return 0
+
+    vec_index = store.open_writable_vector_index()
+    dirty_index = False
+
+    if deleted_ids:
+        present_deleted = [cid for cid in deleted_ids if cid in vec_index]
+        if present_deleted:
+            vec_index.remove(np.asarray(present_deleted, dtype=np.uint64))
+            dirty_index = True
+            log(f"Removed {len(present_deleted):,} stale/orphan vector(s) from USearch index.")
+        if pending == 0:
+            if dirty_index:
+                store.save_vector_index_atomic(vec_index)
+            store.clear_deleted_vector_ids(deleted_ids)
+            return 0
 
     embedder = LocalEmbedder(prefer_mps=True)
     accel = "Apple MPS GPU" if embedder._ensure_mps() else "ONNX CPU"
     log(f"Embedding {pending:,} pending chunks using {embedder.model_name} ({accel}, f16)...")
-    vec_index = store.open_writable_vector_index()
     t0 = time.perf_counter()
     done = 0
     since_save = 0
@@ -914,14 +929,20 @@ def run_embedding_pass(store: KnowledgeStore, batch_size: int = 512, checkpoint_
         store.mark_chunks_embedded(ids)
         done += len(ids)
         since_save += len(ids)
+        dirty_index = True
         if since_save >= checkpoint_every:
             store.save_vector_index_atomic(vec_index)
+            if deleted_ids:
+                store.clear_deleted_vector_ids(deleted_ids)
+                deleted_ids = []
             elapsed = max(0.1, time.perf_counter() - t0)
             log(f"  embedded {done:,}/{pending:,} ({done/elapsed:.1f} chunks/s) — checkpoint saved")
             since_save = 0
 
-    if since_save > 0 or not store.vec_path.exists():
+    if dirty_index or not store.vec_path.exists():
         store.save_vector_index_atomic(vec_index)
+    if deleted_ids:
+        store.clear_deleted_vector_ids(deleted_ids)
 
     elapsed = max(0.1, time.perf_counter() - t0)
     log(f"Embedding complete: {done:,} chunks in {elapsed:.1f}s ({done/elapsed:.1f} chunks/s)")
@@ -937,6 +958,7 @@ def main() -> None:
     parser.add_argument("--skip-embed", action="store_true", help="Only populate SQLite + FTS5; skip vector embedding pass")
     parser.add_argument("--embed-only", action="store_true", help="Run vector embedding pass on pending chunks without fetching sources")
     parser.add_argument("--prune-sources", action="store_true", help="Delete cloned git repositories in _sources/ after indexing")
+    parser.add_argument("--ensure-schema", action="store_true", help="Apply lightweight schema migrations (deleted_vectors, chunks_fts_vocab) and exit")
     parser.add_argument("--batch-size", type=int, default=512, help="SQLite fetch batch size (default: 512)")
     parser.add_argument("--stats", action="store_true", help="Print current DB stats and exit")
     args = parser.parse_args()
@@ -948,6 +970,9 @@ def main() -> None:
     src_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        if args.ensure_schema:
+            log("Schema verified/updated cleanly.")
+            return
         if args.stats:
             print(json.dumps(store.stats(), indent=2))
             return

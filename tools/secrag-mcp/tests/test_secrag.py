@@ -274,3 +274,113 @@ tags:
     assert st["lexical_only_chunks"] == 1
     assert st["pending_embed_chunks"] == 0
     store.close()
+
+
+def test_orphan_vector_removal_and_multithread_readonly(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = KnowledgeStore(data_dir=tmp_path)
+    embedder = _DummyEmbedder()
+
+    # Insert 2 docs: one in 'writeups', one in 'web'
+    md1 = "# Initial Writeup\n## GraphQL IDOR\nOriginal text about graphql idor vulnerability."
+    secs1 = chunk_markdown(md1, doc_title="Initial Writeup", root_breadcrumb="H1 > IDOR")
+    _, cids1, _ = store.upsert_document(
+        source="bugbounty-writeups",
+        category="writeups",
+        rel_path="h1/idor.md",
+        title="Initial Writeup",
+        url="",
+        tags=["idor"],
+        cves=[],
+        full_text=md1,
+        sections_with_chunks=secs1,
+    )
+    md2 = "# Web Doc\n## SQLi\nSome unrelated sql injection notes."
+    secs2 = chunk_markdown(md2, doc_title="Web Doc", root_breadcrumb="HT > Web")
+    _, cids2, _ = store.upsert_document(
+        source="hacktricks",
+        category="web",
+        rel_path="web/sqli.md",
+        title="Web Doc",
+        url="",
+        tags=["sqli"],
+        cves=[],
+        full_text=md2,
+        sections_with_chunks=secs2,
+    )
+    store.conn.commit()
+
+    # Embed initial chunks
+    vec_idx = store.open_writable_vector_index()
+    for batch in store.iter_unembedded_chunks(batch_size=32):
+        ids = [cid for cid, _ in batch]
+        vecs = embedder.embed_documents([t for _, t in batch])
+        vec_idx.add(np.asarray(ids, dtype=np.uint64), vecs.astype(np.float16))
+        store.mark_chunks_embedded(ids)
+    store.save_vector_index_atomic(vec_idx)
+    assert cids1[0] in store.get_readonly_vector_index()
+
+    # Update doc1 -> old chunk ID must be recorded in deleted_vectors
+    md1_v2 = "# Updated Writeup\n## GraphQL IDOR v2\nUpdated graphql idor bypass payload."
+    secs1_v2 = chunk_markdown(md1_v2, doc_title="Updated Writeup", root_breadcrumb="H1 > IDOR")
+    _, cids1_v2, removed = store.upsert_document(
+        source="bugbounty-writeups",
+        category="writeups",
+        rel_path="h1/idor.md",
+        title="Updated Writeup",
+        url="",
+        tags=["idor"],
+        cves=[],
+        full_text=md1_v2,
+        sections_with_chunks=secs1_v2,
+    )
+    store.conn.commit()
+    assert removed == cids1
+    assert store.get_deleted_vector_ids() == cids1
+
+    # Simulate run_embedding_pass cleanup + add
+    vec_idx = store.open_writable_vector_index()
+    del_ids = store.get_deleted_vector_ids()
+    vec_idx.remove(np.asarray(del_ids, dtype=np.uint64))
+    for batch in store.iter_unembedded_chunks(batch_size=32):
+        ids = [cid for cid, _ in batch]
+        vecs = embedder.embed_documents([t for _, t in batch])
+        vec_idx.add(np.asarray(ids, dtype=np.uint64), vecs.astype(np.float16))
+        store.mark_chunks_embedded(ids)
+    store.save_vector_index_atomic(vec_idx)
+    store.clear_deleted_vector_ids(del_ids)
+
+    assert store.get_deleted_vector_ids() == []
+    ro_idx = store.get_readonly_vector_index()
+    assert cids1[0] not in ro_idx
+    assert cids1_v2[0] in ro_idx
+    store.close()
+
+    # Concurrent read-only queries across 8 threads
+    ro_store = KnowledgeStore(data_dir=tmp_path, read_only=True)
+    qv = embedder.embed_query("graphql idor bypass")
+
+    def worker(_i):
+        fts = ro_store.fts_search("graphql idor", category="writeups", limit=5)
+        vec = ro_store.vector_search(qv, category="writeups", limit=5)
+        assert len(fts) == 1 and fts[0][0] == cids1_v2[0]
+        assert len(vec) == 1 and vec[0][0] == cids1_v2[0]
+        return True
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        assert all(ex.map(worker, range(32)))
+    ro_store.close()
+
+
+def test_mcp_tools_declare_readonly_annotations():
+    import asyncio
+    from secrag.server import mcp
+
+    tools = asyncio.run(mcp.list_tools())
+    names = {t.name for t in tools}
+    assert {"kb_search", "kb_read_section", "kb_lookup_cve", "kb_stats"} <= names
+    for t in tools:
+        assert t.annotations is not None, f"tool {t.name} missing annotations"
+        dumped = t.annotations.model_dump(by_alias=True)
+        assert dumped.get("readOnlyHint") is True, f"tool {t.name} missing readOnlyHint=True: {dumped}"
