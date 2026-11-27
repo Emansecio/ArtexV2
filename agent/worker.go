@@ -721,6 +721,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
 		PromptCacheKey:  fmt.Sprintf("artex-task-%d-worker", taskID),
+		PromptCacheTTL:  "1h",
 		Tools:           wrapCachedWebFetch(withWebFetch(ctx, tools, w.proxyAddr, w.proxyCACert), w.probeCache),
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,

@@ -406,10 +406,13 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     rate_per_second  DOUBLE PRECISION NOT NULL DEFAULT 0,
     rate_per_minute  DOUBLE PRECISION NOT NULL DEFAULT 0,
     context_window_k INTEGER NOT NULL DEFAULT 0,
-    -- Thinking params are split into two independent fields: thinking_type=thinking toggle (''/disabled/enabled),
-    -- reasoning_effort=thinking effort (''/low/medium/high/xhigh/max); the two are independent.
+    -- Thinking params are split into independent fields: thinking_type=thinking toggle (''/disabled/enabled/adaptive),
+    -- reasoning_effort=thinking effort (''/low/medium/high/xhigh/max), thinking_budget=budget_tokens for enabled mode,
+    -- thinking_display=(''/summarized/omitted) for visible thinking summaries.
     reasoning_effort TEXT NOT NULL DEFAULT '',
     thinking_type    TEXT NOT NULL DEFAULT '',
+    thinking_budget  INTEGER NOT NULL DEFAULT 0,
+    thinking_display TEXT NOT NULL DEFAULT '',
     is_default       BOOLEAN NOT NULL DEFAULT false,
     -- Rotation (failover) parameters, see the LLM rotation design doc:
     --   priority     ordering; larger values are picked earlier; the active profile (is_default) always leads the chain, regardless of this value.

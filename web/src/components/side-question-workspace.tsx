@@ -1,10 +1,11 @@
 "use client";
 
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { memo, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { ArrowUpIcon, MessageCircleQuestionIcon, SquareIcon, Trash2Icon, XIcon } from "lucide-react";
 
 import { Markdown } from "@/components/markdown";
+import { splitMarkdownBlocks } from "@/components/transcript";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -30,13 +31,31 @@ import { cn } from "@/lib/utils";
 
 type ComposerLayout = "inline" | "stacked";
 
-const preparationLabels = {
-  preparing: t("Preparing context…"),
-  summarizing_history: t("Summarizing earlier side Q&A…"),
-  compressing_snapshot: t("Compressing the side-question context copy…"),
-  retrying: t("Model context exceeded, shrinking and retrying…"),
-  answering: t("Answering…"),
-};
+const MemoSideMarkdownBlock = memo(function MemoSideMarkdownBlock({ text }: { text: string }) {
+  return <Markdown text={text} />;
+});
+
+function StreamingSideAnswer({ text }: { text: string }) {
+  const { blocks, tail } = useMemo(() => splitMarkdownBlocks(text), [text]);
+  return (
+    <div className="space-y-1.5 text-sm whitespace-pre-wrap break-words">
+      {blocks.map((block, idx) => (
+        <MemoSideMarkdownBlock key={idx} text={block} />
+      ))}
+      {tail && <div className="whitespace-pre-wrap break-words">{tail}</div>}
+    </div>
+  );
+}
+
+function getPreparationLabels() {
+  return {
+    preparing: t("Preparing context…"),
+    summarizing_history: t("Summarizing earlier side Q&A…"),
+    compressing_snapshot: t("Compressing the side-question context copy…"),
+    retrying: t("Model context exceeded, shrinking and retrying…"),
+    answering: t("Answering…"),
+  };
+}
 
 export function SideQuestionButton({ side }: { side: SideQuestions }) {
   if (!side.enabled) return null;
@@ -145,10 +164,10 @@ function SidePanel({
                   {item.context.snapshot_summarized && ` · ${t("uses the main-context digest")}`}
                 </p>
               )}
-              {item.answer && <Markdown text={item.answer} />}
+              {item.answer && (item.status === "running" ? <StreamingSideAnswer text={item.answer} /> : <Markdown text={item.answer} />)}
               {!item.answer && item.status === "running" && (
                 <p role="status" className="text-muted-foreground text-sm">
-                  {preparationLabels[item.context?.phase ?? "answering"]}
+                  {getPreparationLabels()[item.context?.phase ?? "answering"]}
                 </p>
               )}
               {item.error && (

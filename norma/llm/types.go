@@ -219,6 +219,12 @@ type CompletionRequest struct {
 	// PromptCacheKey is an optional stable cache routing key (used as
 	// prompt_cache_key on OpenAI Chat Completions and Responses APIs).
 	PromptCacheKey string
+	// PromptCacheTTL optionally sets Anthropic's cache TTL for the stable prefix
+	// (tools + static system), e.g. "1h". Empty uses the provider default (5m).
+	PromptCacheTTL string
+	// PromptCacheTailTTL optionally sets Anthropic's cache TTL for the sliding
+	// message breakpoints, e.g. "1h" or "" (5m).
+	PromptCacheTailTTL string
 	// SessionID is an optional per-session identifier (e.g. worker or chat
 	// session ID) used by stateful providers such as Antigravity CLI to keep
 	// concurrent sessions isolated even when they share a PromptCacheKey.

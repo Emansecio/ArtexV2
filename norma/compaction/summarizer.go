@@ -55,6 +55,7 @@ type SessionPrefix struct {
 	System          []string
 	DynamicBoundary int
 	PromptCacheKey  string
+	PromptCacheTTL  string
 	SystemReminder  string
 }
 
@@ -127,6 +128,7 @@ func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.M
 		}
 		req.Tools = fork.Tools
 		req.PromptCacheKey = fork.PromptCacheKey
+		req.PromptCacheTTL = fork.PromptCacheTTL
 	}
 	var lastErr error
 	for range maxStreamingRetries {

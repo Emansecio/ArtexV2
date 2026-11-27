@@ -174,9 +174,11 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		Provider:        c.prov,
 		SummaryProvider: c.summaryProv,
 		SystemPrompt:    system,
-		DynamicBoundary: boundary,
-		PromptCacheKey:  fmt.Sprintf("artex-chat-%s", sessionID),
-		Tools:           withWebFetch(ctx, tools, c.proxyAddr, c.proxyCACert), // WebFetch: routed through the recording proxy for tracing; loads the proxy CA to verify MITM-resigned HTTPS certificates; every redirect hop is gated
+		DynamicBoundary:    boundary,
+		PromptCacheKey:     fmt.Sprintf("artex-chat-%s", sessionID),
+		PromptCacheTTL:     "1h",
+		PromptCacheTailTTL: "1h",
+		Tools:              withWebFetch(ctx, tools, c.proxyAddr, c.proxyCACert), // WebFetch: routed through the recording proxy for tracing; loads the proxy CA to verify MITM-resigned HTTPS certificates; every redirect hop is gated
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,

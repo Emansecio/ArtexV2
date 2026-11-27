@@ -121,8 +121,15 @@ type Config struct {
 
 	// ThinkingType toggles extended/reasoning mode via the request's
 	// "thinking":{"type":...} field, for both formats. "" omits it (provider
-	// default); "enabled"/"disabled" are sent verbatim.
+	// default); "enabled"/"adaptive"/"disabled" are sent verbatim.
 	ThinkingType string
+	// ThinkingBudget sets thinking.budget_tokens on Anthropic when ThinkingType
+	// is "enabled" (must be >= 1024 and < max_tokens). 0 uses a safe default.
+	ThinkingBudget int
+	// ThinkingDisplay controls whether thinking summaries are streamed back:
+	// "" or "summarized" requests visible thinking ("summarized" on Anthropic,
+	// reasoning.summary="auto" on OpenAI Responses); "omitted" suppresses them.
+	ThinkingDisplay string
 	// ReasoningEffort sets the reasoning strength. "" omits it. For OpenAI it maps
 	// to "reasoning_effort"; for Anthropic to "output_config":{"effort":...}.
 	// Typical values: low / medium / high / max.
@@ -330,11 +337,15 @@ func defaultHTTPClient(proxy string) (*http.Client, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.MaxIdleConns = 256
 	tr.MaxIdleConnsPerHost = 64
-	tr.IdleConnTimeout = 90 * time.Second
+	tr.IdleConnTimeout = 5 * time.Minute
 	tr.TLSHandshakeTimeout = 5 * time.Second
 	tr.ReadBufferSize = 64 << 10
 	tr.WriteBufferSize = 64 << 10
 	tr.ForceAttemptHTTP2 = true
+	tr.HTTP2 = &http.HTTP2Config{
+		SendPingTimeout: 15 * time.Second,
+		PingTimeout:     5 * time.Second,
+	}
 	tr.ResponseHeaderTimeout = responseHeaderTimeoutFromEnv()
 	if proxy == "" {
 		tr.Proxy = http.ProxyFromEnvironment

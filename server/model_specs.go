@@ -51,30 +51,32 @@ type knownModelRule struct {
 	maxOutputTokens        int
 	reasoningLevels        []string
 	defaultReasoningEffort string
-	supportsThinkingSwitch bool
-	usesMaxCompletion      bool // OpenAI Chat Completions requires max_completion_tokens
+	defaultThinkingType    string // "adaptive" | "enabled" | ""
+	usesMaxCompletion      bool   // OpenAI Chat Completions requires max_completion_tokens
 }
 
 // knownModelRules are ordered from most specific to most general.
 var knownModelRules = []knownModelRule{
 	// --- Anthropic Claude ---
-	{match: "claude-opus-5", prefix: true, contextWindow: 1_000_000, maxOutputTokens: 128_000, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-sonnet-5", prefix: true, contextWindow: 1_000_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-opus-4-8", prefix: true, contextWindow: 1_000_000, maxOutputTokens: 128_000, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-opus-4.8", prefix: true, contextWindow: 1_000_000, maxOutputTokens: 128_000, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-opus-4-6", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high", "max"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-opus-4.6", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high", "max"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-opus-4-5", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-opus-4.5", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-opus-4", prefix: true, contextWindow: 200_000, maxOutputTokens: 32_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-sonnet-4-6", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-sonnet-4.6", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-sonnet-4-5", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-sonnet-4.5", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-sonnet-4", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", supportsThinkingSwitch: true},
-	{match: "claude-haiku-4", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, supportsThinkingSwitch: true},
-	{match: "claude-3-7-sonnet", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, supportsThinkingSwitch: true},
-	{match: "claude-3.7-sonnet", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, supportsThinkingSwitch: true},
+	{match: "claude-opus-5", prefix: true, contextWindow: 1_000_000, maxOutputTokens: 128_000, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, defaultReasoningEffort: "high", defaultThinkingType: "adaptive"},
+	{match: "claude-sonnet-5", prefix: true, contextWindow: 1_000_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", defaultThinkingType: "adaptive"},
+	{match: "claude-opus-4-8", prefix: true, contextWindow: 1_000_000, maxOutputTokens: 128_000, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, defaultReasoningEffort: "high", defaultThinkingType: "adaptive"},
+	{match: "claude-opus-4.8", prefix: true, contextWindow: 1_000_000, maxOutputTokens: 128_000, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, defaultReasoningEffort: "high", defaultThinkingType: "adaptive"},
+	{match: "claude-opus-4-7", prefix: true, contextWindow: 1_000_000, maxOutputTokens: 128_000, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, defaultReasoningEffort: "high", defaultThinkingType: "adaptive"},
+	{match: "claude-opus-4.7", prefix: true, contextWindow: 1_000_000, maxOutputTokens: 128_000, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, defaultReasoningEffort: "high", defaultThinkingType: "adaptive"},
+	{match: "claude-opus-4-6", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high", "max"}, defaultReasoningEffort: "high", defaultThinkingType: "adaptive"},
+	{match: "claude-opus-4.6", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high", "max"}, defaultReasoningEffort: "high", defaultThinkingType: "adaptive"},
+	{match: "claude-opus-4-5", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", defaultThinkingType: "enabled"},
+	{match: "claude-opus-4.5", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", defaultThinkingType: "enabled"},
+	{match: "claude-opus-4", prefix: true, contextWindow: 200_000, maxOutputTokens: 32_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", defaultThinkingType: "enabled"},
+	{match: "claude-sonnet-4-6", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", defaultThinkingType: "adaptive"},
+	{match: "claude-sonnet-4.6", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", defaultThinkingType: "adaptive"},
+	{match: "claude-sonnet-4-5", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", defaultThinkingType: "enabled"},
+	{match: "claude-sonnet-4.5", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", defaultThinkingType: "enabled"},
+	{match: "claude-sonnet-4", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultReasoningEffort: "high", defaultThinkingType: "enabled"},
+	{match: "claude-haiku-4", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultThinkingType: "enabled"},
+	{match: "claude-3-7-sonnet", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultThinkingType: "enabled"},
+	{match: "claude-3.7-sonnet", prefix: true, contextWindow: 200_000, maxOutputTokens: 64_000, reasoningLevels: []string{"low", "medium", "high"}, defaultThinkingType: "enabled"},
 	{match: "claude-3-5-", prefix: true, contextWindow: 200_000, maxOutputTokens: 8_192},
 	{match: "claude-3.5-", prefix: true, contextWindow: 200_000, maxOutputTokens: 8_192},
 	{match: "claude-3-", prefix: true, contextWindow: 200_000, maxOutputTokens: 4_096},
@@ -335,8 +337,8 @@ func lookupKnownModelSpec(provider, modelID string) (modelDetail, bool) {
 			NonChat:                isNonChatModel(modelID),
 			Source:                 "known",
 		}
-		if r.supportsThinkingSwitch && (provider == "anthropic" || provider == "anthropic-oauth") {
-			d.ThinkingType = "enabled"
+		if r.defaultThinkingType != "" && (provider == "anthropic" || provider == "anthropic-oauth") {
+			d.ThinkingType = r.defaultThinkingType
 		}
 		if r.usesMaxCompletion && provider == "openai" {
 			d.MaxTokensField = llm.MaxTokensFieldCompletion
@@ -370,7 +372,7 @@ func mergeModelDetailFallback(dst *modelDetail, src modelDetail) {
 		len(dst.ReasoningLevels) > 0 && containsStr(dst.ReasoningLevels, src.DefaultReasoningEffort) {
 		dst.DefaultReasoningEffort = src.DefaultReasoningEffort
 	}
-	if dst.ThinkingType == "" && src.ThinkingType != "" {
+	if src.ThinkingType != "" && (dst.ThinkingType == "" || (dst.ThinkingType == "enabled" && src.ThinkingType == "adaptive")) {
 		dst.ThinkingType = src.ThinkingType
 	}
 	if dst.MaxTokensField == "" && src.MaxTokensField != "" {

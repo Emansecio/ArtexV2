@@ -41,6 +41,7 @@ import {
   getMaxTokensFieldHint,
   getMaxTokensFields,
   getProviders,
+  getThinkingDisplayOptions,
   getThinkingTypes,
   NONE,
   normalizeFormat,
@@ -49,6 +50,7 @@ import {
   providerConnectionState,
   providerMeta,
   rich,
+  thinkingTypeMatchesDetected,
   toStore,
 } from "./llm-helpers";
 import { ProviderIcon } from "./provider-icons";
@@ -100,6 +102,8 @@ export function ProfileEditorSheet({
   const [rpm, setRpm] = React.useState("0");
   const [cw, setCw] = React.useState("0");
   const [thinkingType, setThinkingType] = React.useState(NONE);
+  const [thinkingBudget, setThinkingBudget] = React.useState("");
+  const [thinkingDisplay, setThinkingDisplay] = React.useState(NONE);
   const [effort, setEffort] = React.useState(NONE);
   const [priority, setPriority] = React.useState("0");
   const [poolExclude, setPoolExclude] = React.useState(false);
@@ -165,6 +169,8 @@ export function ProfileEditorSheet({
     setRpm(String(profile?.rate_per_minute ?? 0));
     setCw(profile?.context_window_k ? String(profile.context_window_k * 1000) : "0");
     setThinkingType(fromStore(profile?.thinking_type));
+    setThinkingBudget(profile?.thinking_budget ? String(profile.thinking_budget) : "");
+    setThinkingDisplay(fromStore(profile?.thinking_display));
     setEffort(fromStore(profile?.reasoning_effort));
     setPriority(String(profile?.priority ?? 0));
     setPoolExclude(profile?.pool_exclude ?? false);
@@ -185,6 +191,7 @@ export function ProfileEditorSheet({
   const profileId = profile ? Number(profile.id) : undefined;
   const providers = getProviders();
   const thinkingTypes = getThinkingTypes();
+  const thinkingDisplayOptions = getThinkingDisplayOptions();
   const effortLevels = getEffortLevels();
   const maxTokensFields = getMaxTokensFields();
   const meta = providerMeta(format);
@@ -456,6 +463,8 @@ export function ProfileEditorSheet({
         sessionHeaderKey.trim(),
         userAgent.trim(),
         format === "openai" ? (maxTokensField === NONE ? "max_tokens" : maxTokensField) : "",
+        thinkingType === "enabled" ? Math.max(0, Math.round(Number(thinkingBudget) || 0)) : 0,
+        toStore(thinkingDisplay),
       );
       if (r.ok) {
         toast.success(t("Connected · {latency}ms · {model}", { latency: r.latency_ms ?? "?", model: r.model ?? model }), {
@@ -508,6 +517,8 @@ export function ProfileEditorSheet({
         rate_per_minute: Number(rpm) || 0,
         context_window_k: contextWindowK,
         thinking_type: toStore(thinkingType),
+        thinking_budget: thinkingType === "enabled" ? Math.max(0, Math.round(Number(thinkingBudget) || 0)) : 0,
+        thinking_display: toStore(thinkingDisplay),
         reasoning_effort: toStore(effort),
         priority: Number(priority) || 0,
         pool_exclude: poolExclude,
@@ -931,8 +942,11 @@ export function ProfileEditorSheet({
                   format !== "openai" ||
                   (!authoritative && !selectedModelDetail.max_tokens_field) ||
                   maxTokensField === expectedField;
-                const thinkingMatches =
-                  !authoritative || Boolean(selectedModelDetail.thinking_type) || thinkingType === NONE;
+                const thinkingMatches = thinkingTypeMatchesDetected(
+                  thinkingType,
+                  selectedModelDetail.thinking_type,
+                  authoritative,
+                );
                 const effortMatches =
                   !authoritative ||
                   ((selectedModelDetail.reasoning_levels?.length ?? 0) > 0
@@ -1109,7 +1123,7 @@ export function ProfileEditorSheet({
 
             <div className="grid gap-2">
               <Label className="text-xs font-medium text-muted-foreground">{t("Thinking switch · thinking.type")}</Label>
-              <div className="grid grid-cols-3 gap-1.5 rounded-lg bg-muted/60 p-1">
+              <div className="grid grid-cols-2 gap-1.5 rounded-lg bg-muted/60 p-1 sm:grid-cols-4">
                 {thinkingTypes.map((o) => {
                   const active = thinkingType === o.value;
                   return (
@@ -1132,10 +1146,63 @@ export function ProfileEditorSheet({
               </div>
               <p className="text-muted-foreground text-xs">
                 {t(
-                  "Controls whether the thinking field is sent. Not sent = the field is omitted (compatible with models like MiniMax that lack support); Disabled = send disabled; Enabled = send enabled. Independent of the effort below.",
+                  "Controls whether the thinking field is sent. Not sent = omitted; Disabled = off; Enabled = fixed budget (Claude 4.5); Adaptive = model-managed (Claude 4.6+/5.x). Independent of effort below.",
                 )}
               </p>
             </div>
+
+            {thinkingType === "enabled" && (
+              <div className="grid gap-1.5">
+                <Label htmlFor="llm-thinking-budget" className="text-xs font-medium text-muted-foreground">
+                  {t("Thinking budget · budget_tokens")}
+                </Label>
+                <Input
+                  id="llm-thinking-budget"
+                  type="number"
+                  min={0}
+                  step={1024}
+                  value={thinkingBudget}
+                  onChange={(e) => setThinkingBudget(e.target.value)}
+                  placeholder="10000"
+                  className="h-8 font-mono text-xs"
+                />
+                <p className="text-muted-foreground text-[11px]">
+                  {t("Token budget for enabled thinking (min 1024, must be lower than max tokens; 0 = safe default).")}
+                </p>
+              </div>
+            )}
+
+            {(thinkingType === "enabled" ||
+              thinkingType === "adaptive" ||
+              ((format === "openai-responses" || format === "chatgpt") && effort !== NONE)) && (
+              <div className="grid gap-2">
+                <Label className="text-xs font-medium text-muted-foreground">{t("Thinking display")}</Label>
+                <div className="grid grid-cols-3 gap-1.5 rounded-lg bg-muted/60 p-1">
+                  {thinkingDisplayOptions.map((o) => {
+                    const active = thinkingDisplay === o.value;
+                    return (
+                      <button
+                        key={o.value}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => setThinkingDisplay(o.value)}
+                        className={cn(
+                          "rounded-md px-2.5 py-1.5 text-xs font-medium transition-all duration-150",
+                          active
+                            ? "bg-background text-foreground shadow-xs"
+                            : "text-muted-foreground hover:text-foreground",
+                        )}
+                      >
+                        {o.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-muted-foreground text-[11px]">
+                  {t("Auto/Summarized streams visible thinking steps; Omitted hides them for slightly faster first text token.")}
+                </p>
+              </div>
+            )}
 
             <div className="grid gap-2">
               <div className="flex items-center justify-between gap-2">

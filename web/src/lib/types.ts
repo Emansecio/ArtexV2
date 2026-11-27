@@ -1161,8 +1161,12 @@ export interface LLMProfile {
   rate_per_second: number;
   rate_per_minute: number;
   context_window_k?: number;
-  // Thinking switch (thinking.type): ""=not sent (default) | "disabled"=off | "enabled"=on
+  // Thinking switch (thinking.type): ""=not sent (default) | "disabled"=off | "enabled"=on | "adaptive"=adaptive
   thinking_type?: string;
+  // Thinking budget (budget_tokens) when thinking_type="enabled"; 0 = provider/adapter default
+  thinking_budget?: number;
+  // Thinking display preference: ""=auto (summarized) | "summarized" | "omitted"
+  thinking_display?: string;
   // Thinking effort: ""=not sent (default) | "low"/"medium"/"high"/"xhigh"/"max"
   reasoning_effort?: string;
   is_default: boolean;

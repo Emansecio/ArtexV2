@@ -54,10 +54,13 @@ type Config struct {
 	ContextWindowK int
 	// ThinkingType independently controls the thinking "on/off" field (thinking.type):
 	//   "" = don't send (default, compatible with models that don't support the field);
-	//   "disabled" = explicitly off; "enabled" = on. Fully decoupled from
-	//   ReasoningEffort — some endpoints have no thinking field and activate thinking
-	//   via the effort parameter alone, so the two can be set independently.
+	//   "disabled" = explicitly off; "enabled" = on; "adaptive" = adaptive thinking.
+	//   Fully decoupled from ReasoningEffort.
 	ThinkingType string
+	// ThinkingBudget sets thinking.budget_tokens on Anthropic when ThinkingType is "enabled".
+	ThinkingBudget int
+	// ThinkingDisplay controls whether thinking summaries are streamed ("", "summarized", "omitted").
+	ThinkingDisplay string
 	// ReasoningEffort independently controls the thinking "effort" field:
 	//   "" = don't send (default); "low"/"medium"/"high"/"xhigh"/"max" = the effort level.
 	//   Mapped to top-level reasoning_effort for OpenAI, and to output_config.effort
@@ -274,6 +277,8 @@ func promptCacheTTL() string {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_PROMPT_CACHE_TTL"))) {
 	case "1h":
 		return "1h"
+	case "5m":
+		return "5m"
 	default:
 		return ""
 	}
@@ -704,6 +709,8 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	// the field is not sent). The two are decoupled: send only thinking.type, only
 	// effort, both, or neither.
 	lc.ThinkingType = c.ThinkingType
+	lc.ThinkingBudget = c.ThinkingBudget
+	lc.ThinkingDisplay = c.ThinkingDisplay
 	lc.ReasoningEffort = c.ReasoningEffort
 	// Field-name selection for the output cap (empty = use max_tokens). The cap's
 	// VALUE is not here: it travels per round with agentcore.Options.MaxTokens; the
@@ -874,12 +881,16 @@ func sharedLLMTransport(proxy string) (*http.Transport, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 256
 	transport.MaxIdleConnsPerHost = 64
-	transport.IdleConnTimeout = 90 * time.Second
+	transport.IdleConnTimeout = 5 * time.Minute
 	transport.TLSHandshakeTimeout = 5 * time.Second
 	transport.ReadBufferSize = 64 << 10
 	transport.WriteBufferSize = 64 << 10
 	transport.ResponseHeaderTimeout = 60 * time.Second
 	transport.ForceAttemptHTTP2 = true
+	transport.HTTP2 = &http.HTTP2Config{
+		SendPingTimeout: 15 * time.Second,
+		PingTimeout:     5 * time.Second,
+	}
 	if proxy == "" {
 		transport.Proxy = nil // empty = direct; no fallback to the HTTP_PROXY/HTTPS_PROXY env vars
 	} else {

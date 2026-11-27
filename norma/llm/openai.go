@@ -295,20 +295,21 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	useCache := p.cfg.promptCacheEnabled()
 	var wireMsgs any = msgs
 	var sysParts []oaContentPart
+	var ccStable, ccTail map[string]any
 	if useCache && p.cfg.OpenAICacheControl {
-		cc := anthropicCacheControl(p.cfg.PromptCacheTTL)
+		ccStable, ccTail = resolveAnthropicCacheControls(p.cfg.PromptCacheTTL, req.PromptCacheTTL, req.PromptCacheTailTTL)
 		// Honor DynamicBoundary like the Anthropic path: the static system
 		// prefix gets its own cached part so per-run dynamic tail content does
 		// not poison the cross-worker shared prefix.
 		if b := req.DynamicBoundary; b > 0 && b < len(req.System) {
 			if static := joinSystem(req.System[:b]); static != "" {
-				sysParts = append(sysParts, oaContentPart{Type: "text", Text: static, CacheControl: cc})
+				sysParts = append(sysParts, oaContentPart{Type: "text", Text: static, CacheControl: ccStable})
 			}
 			if dyn := joinSystem(req.System[b:]); dyn != "" {
 				sysParts = append(sysParts, oaContentPart{Type: "text", Text: dyn})
 			}
 		}
-		wireMsgs = toOAWireMessages(msgs, cc, sysParts)
+		wireMsgs = toOAWireMessages(msgs, ccStable, ccTail, sysParts)
 	}
 
 	body := oaReq{
@@ -349,8 +350,8 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	}
 	// Cache the tool-schema block too (multi-KB, shared across sibling runs) —
 	// same breakpoint placement as the Anthropic path's last tool.
-	if useCache && p.cfg.OpenAICacheControl && len(body.Tools) > 0 {
-		body.Tools[len(body.Tools)-1].CacheControl = anthropicCacheControl(p.cfg.PromptCacheTTL)
+	if ccStable != nil && len(body.Tools) > 0 {
+		body.Tools[len(body.Tools)-1].CacheControl = ccStable
 	}
 	return json.Marshal(body)
 }
@@ -385,8 +386,9 @@ func stripOldOAReasoning(msgs []oaMessage, thinking, preserveToolLoop bool) {
 
 // toOAWireMessages renders the wire messages with cache_control breakpoints:
 // on the system message (sysParts, when DynamicBoundary split it into
-// static+dynamic parts) and on the last user/tool content block.
-func toOAWireMessages(msgs []oaMessage, cc map[string]any, sysParts []oaContentPart) []oaWireMessage {
+// static+dynamic parts, or ccStable on the whole system message) and on the
+// last user/tool content block (ccTail).
+func toOAWireMessages(msgs []oaMessage, ccStable, ccTail map[string]any, sysParts []oaContentPart) []oaWireMessage {
 	lastCacheIdx := -1
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if (msgs[i].Role == "user" || msgs[i].Role == "tool") && msgs[i].Content != "" {
@@ -400,8 +402,10 @@ func toOAWireMessages(msgs []oaMessage, cc map[string]any, sysParts []oaContentP
 		switch {
 		case i == 0 && m.Role == "system" && len(sysParts) > 0:
 			content = sysParts
-		case m.Content != "" && cc != nil && (m.Role == "system" || i == lastCacheIdx):
-			content = []oaContentPart{{Type: "text", Text: m.Content, CacheControl: cc}}
+		case m.Content != "" && m.Role == "system" && ccStable != nil:
+			content = []oaContentPart{{Type: "text", Text: m.Content, CacheControl: ccStable}}
+		case m.Content != "" && i == lastCacheIdx && ccTail != nil:
+			content = []oaContentPart{{Type: "text", Text: m.Content, CacheControl: ccTail}}
 		case m.Content != "":
 			content = m.Content
 		}
@@ -457,11 +461,27 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 			// consumer never sees duplicated content across attempts.
 			scan := newSSEScannerWithIdleTimeout(resp.Body, p.cfg.streamIdleTimeout())
 			started := map[int]bool{}
+			stopped := map[int]bool{}
+			var startedOrder []int
 			var stopReason string
 			var usage Usage
 			emitted := false
 			consumerStopped := false
 			var streamErr error
+			emitToolStops := func() bool {
+				for _, idx := range startedOrder {
+					if stopped[idx] {
+						continue
+					}
+					stopped[idx] = true
+					emitted = true
+					if !yield(StreamEvent{Type: SEToolUseStop, ToolIndex: idx}, nil) {
+						consumerStopped = true
+						return false
+					}
+				}
+				return true
+			}
 			for {
 				_, data, serr := scan.next()
 				if serr == io.EOF {
@@ -490,6 +510,9 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 					usage = u
 				}
 				for _, ev := range evs {
+					if ev.Type == SEToolUseStart {
+						startedOrder = append(startedOrder, ev.ToolIndex)
+					}
 					emitted = true
 					if !yield(ev, nil) {
 						consumerStopped = true
@@ -497,6 +520,9 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 					}
 				}
 				if consumerStopped {
+					break
+				}
+				if sr != "" && !emitToolStops() {
 					break
 				}
 			}
@@ -518,6 +544,9 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 					return
 				}
 				continue
+			}
+			if !emitToolStops() {
+				return
 			}
 			if !yield(StreamEvent{Type: SEMessageDelta, StopReason: stopReason, Usage: usage}, nil) {
 				return
@@ -589,8 +618,10 @@ func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
 			PromptTokens        int `json:"prompt_tokens"`
 			CompletionTokens    int `json:"completion_tokens"`
 			PromptTokensDetails struct {
-				CachedTokens int `json:"cached_tokens"`
+				CachedTokens     int `json:"cached_tokens"`
+				CacheWriteTokens int `json:"cache_write_tokens"`
 			} `json:"prompt_tokens_details"`
+			PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
 		} `json:"usage"`
 		Error *struct {
 			Message string `json:"message"`
@@ -605,10 +636,15 @@ func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
 	}
 	var usage Usage
 	if r.Usage != nil {
+		cached := r.Usage.PromptTokensDetails.CachedTokens
+		if cached == 0 {
+			cached = r.Usage.PromptCacheHitTokens
+		}
 		usage = Usage{
-			InputTokens:     r.Usage.PromptTokens,
-			OutputTokens:    r.Usage.CompletionTokens,
-			CacheReadTokens: r.Usage.PromptTokensDetails.CachedTokens,
+			InputTokens:      r.Usage.PromptTokens,
+			OutputTokens:     r.Usage.CompletionTokens,
+			CacheReadTokens:  cached,
+			CacheWriteTokens: r.Usage.PromptTokensDetails.CacheWriteTokens,
 		}
 	}
 	if len(r.Choices) == 0 {
@@ -695,8 +731,10 @@ func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, sto
 			PromptTokens        int `json:"prompt_tokens"`
 			CompletionTokens    int `json:"completion_tokens"`
 			PromptTokensDetails struct {
-				CachedTokens int `json:"cached_tokens"`
+				CachedTokens     int `json:"cached_tokens"`
+				CacheWriteTokens int `json:"cache_write_tokens"`
 			} `json:"prompt_tokens_details"`
+			PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
 		} `json:"usage"`
 		Error *struct {
 			Message string `json:"message"`
@@ -717,7 +755,16 @@ func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, sto
 		return nil, "", Usage{}, false, fmt.Errorf("openai: %s", msg)
 	}
 	if f.Usage != nil {
-		usage = Usage{InputTokens: f.Usage.PromptTokens, OutputTokens: f.Usage.CompletionTokens, CacheReadTokens: f.Usage.PromptTokensDetails.CachedTokens}
+		cached := f.Usage.PromptTokensDetails.CachedTokens
+		if cached == 0 {
+			cached = f.Usage.PromptCacheHitTokens
+		}
+		usage = Usage{
+			InputTokens:      f.Usage.PromptTokens,
+			OutputTokens:     f.Usage.CompletionTokens,
+			CacheReadTokens:  cached,
+			CacheWriteTokens: f.Usage.PromptTokensDetails.CacheWriteTokens,
+		}
 		hasUsage = true
 	}
 	if len(f.Choices) == 0 {

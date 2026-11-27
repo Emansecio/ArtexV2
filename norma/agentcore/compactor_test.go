@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"iter"
 	"strings"
 	"testing"
 
@@ -104,5 +105,64 @@ func TestPlainCompactorIsNotContextView(t *testing.T) {
 	var built harness.Compactor = compaction.New(compaction.Config{}, nil)
 	if _, ok := built.(harness.ContextView); ok {
 		t.Fatal("compaction.Compactor must not satisfy harness.ContextView — its Pre rewrites messages in place")
+	}
+}
+
+type captureLLMProvider struct {
+	reqs []llm.CompletionRequest
+}
+
+func (p *captureLLMProvider) Name() string { return "capture" }
+func (p *captureLLMProvider) Stream(_ context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	p.reqs = append(p.reqs, req)
+	return func(yield func(llm.StreamEvent, error) bool) {
+		if !yield(llm.StreamEvent{Type: llm.SETextDelta, Text: "<summary>ok</summary>"}, nil) {
+			return
+		}
+		yield(llm.StreamEvent{Type: llm.SEMessageStop, StopReason: "end_turn"}, nil)
+	}
+}
+func (p *captureLLMProvider) Complete(_ context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	p.reqs = append(p.reqs, req)
+	return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("<summary>ok</summary>")}}, "end_turn", llm.Usage{}, nil
+}
+
+func TestSameProviderCompactionForwardsPromptCacheTTL(t *testing.T) {
+	prov := &captureLLMProvider{}
+	s := NewSession(Options{
+		Provider:               prov,
+		SystemPrompt:           []string{"static sys", "dynamic sys"},
+		DynamicBoundary:        1,
+		PromptCacheKey:         "role-key",
+		PromptCacheTTL:         "1h",
+		PromptCacheTailTTL:     "1h",
+		DisableBackgroundTasks: true,
+		Compaction: &compaction.Config{
+			ContextWindow: 200000,
+			KeepRecent:    1,
+		},
+	})
+	defer s.Close()
+
+	msgs := []llm.Message{
+		llm.UserText(strings.Repeat("u", 2000)),
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock(strings.Repeat("a", 2000))}},
+		llm.UserText("u2"),
+	}
+	if _, ok := s.compactor.Reactive(context.Background(), msgs); !ok {
+		t.Fatal("expected Reactive compaction to succeed")
+	}
+	if len(prov.reqs) != 1 {
+		t.Fatalf("expected 1 summary request, got %d", len(prov.reqs))
+	}
+	req := prov.reqs[0]
+	if req.PromptCacheKey != "role-key" {
+		t.Errorf("PromptCacheKey=%q, want role-key", req.PromptCacheKey)
+	}
+	if req.PromptCacheTTL != "1h" {
+		t.Errorf("PromptCacheTTL=%q, want 1h", req.PromptCacheTTL)
+	}
+	if req.PromptCacheTailTTL != "" {
+		t.Errorf("PromptCacheTailTTL=%q, want empty", req.PromptCacheTailTTL)
 	}
 }

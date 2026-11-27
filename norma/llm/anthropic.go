@@ -62,10 +62,17 @@ type anthropicReq struct {
 	Stream        bool                   `json:"stream"`
 }
 
-// anthropicThinking is the "thinking":{"type":"enabled"|"disabled"} switch.
+// anthropicThinking configures Anthropic's extended/adaptive thinking block.
 type anthropicThinking struct {
-	Type string `json:"type"`
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+	Display      string `json:"display,omitempty"`
 }
+
+const (
+	minAnthropicThinkingBudget     = 1024
+	defaultAnthropicThinkingBudget = 10000
+)
 
 // anthropicOutputConfig carries the reasoning strength via
 // "output_config":{"effort":"low"|"medium"|"high"|"max"}.
@@ -82,10 +89,29 @@ type anthropicTool struct {
 
 func anthropicCacheControl(ttl string) map[string]any {
 	cc := map[string]any{"type": "ephemeral"}
-	if ttl != "" {
+	if ttl != "" && ttl != "5m" {
 		cc["ttl"] = ttl
 	}
 	return cc
+}
+
+// resolveAnthropicCacheControls computes the cache_control objects for stable
+// prefix breakpoints ([tools, static system]) and the rolling conversation tail.
+// A non-empty cfgTTL overrides per-request TTLs uniformly; otherwise Anthropic's
+// ordering rule (1h entries must precede 5m entries) promotes stableTTL to 1h
+// whenever tailTTL is 1h.
+func resolveAnthropicCacheControls(cfgTTL, reqStableTTL, reqTailTTL string) (ccStable, ccTail map[string]any) {
+	stableTTL := reqStableTTL
+	tailTTL := reqTailTTL
+	if cfgTTL != "" {
+		stableTTL = cfgTTL
+		tailTTL = cfgTTL
+	}
+	// Anthropic requires 1h cache entries to precede 5m entries in the prefix.
+	if tailTTL == "1h" && stableTTL != "1h" {
+		stableTTL = "1h"
+	}
+	return anthropicCacheControl(stableTTL), anthropicCacheControl(tailTTL)
 }
 
 func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {
@@ -95,35 +121,66 @@ func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byt
 	}
 	// Effective thinking mode: a non-empty per-request override (req.Thinking)
 	// wins over Config.ThinkingType. Thinking-type content blocks may be replayed
-	// only when thinking is actively "enabled"; any other mode (incl. "disabled")
+	// only when thinking is actively enabled/adaptive; any other mode (incl. "disabled")
 	// strips them so Anthropic does not reject the request.
 	thinkingType := p.cfg.ThinkingType
 	if req.Thinking != "" {
 		thinkingType = req.Thinking
 	}
 	thinkingEnabled := thinkingType != "" && thinkingType != "disabled"
-	var cc map[string]any
+	var thinkingBlock *anthropicThinking
+	if thinkingEnabled {
+		display := p.cfg.ThinkingDisplay
+		if display == "" {
+			display = "summarized"
+		}
+		thinkingBlock = &anthropicThinking{
+			Type:    thinkingType,
+			Display: display,
+		}
+		if thinkingType == "enabled" {
+			budget := p.cfg.ThinkingBudget
+			if budget <= 0 {
+				budget = defaultAnthropicThinkingBudget
+			} else if budget < minAnthropicThinkingBudget {
+				budget = minAnthropicThinkingBudget
+			}
+			// Anthropic requires 1024 <= budget_tokens < max_tokens.
+			if maxTok <= minAnthropicThinkingBudget {
+				maxTok = minAnthropicThinkingBudget + 1024
+			}
+			if budget >= maxTok {
+				budget = maxTok - 1024
+				if budget < minAnthropicThinkingBudget {
+					budget = minAnthropicThinkingBudget
+					maxTok = budget + 1024
+				}
+			}
+			thinkingBlock.BudgetTokens = budget
+		}
+	} else if thinkingType != "" {
+		thinkingBlock = &anthropicThinking{Type: thinkingType}
+	}
+	var ccStable, ccTail map[string]any
 	if p.cfg.promptCacheEnabled() {
-		cc = anthropicCacheControl(p.cfg.PromptCacheTTL)
+		ccStable, ccTail = resolveAnthropicCacheControls(p.cfg.PromptCacheTTL, req.PromptCacheTTL, req.PromptCacheTailTTL)
 	}
 	filtered := mergeAdjacentSameRole(PairToolBlocks(filterThinkingBlocks(req.Messages, thinkingEnabled)))
 	body := anthropicReq{
 		Model:         p.cfg.Model,
-		Messages:      toAnthropicWireMessages(filtered, cc),
+		Messages:      toAnthropicWireMessages(filtered, ccTail),
 		MaxTokens:     maxTok,
 		Temperature:   req.Temperature,
 		StopSequences: req.Stop,
 		Stream:        stream,
-		System:        buildAnthropicSystem(req, cc),
+		System:        buildAnthropicSystem(req, ccStable),
+		Thinking:      thinkingBlock,
 	}
 	for _, t := range req.Tools {
 		body.Tools = append(body.Tools, anthropicTool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
 	}
-	if cc != nil && len(body.Tools) > 0 {
-		body.Tools[len(body.Tools)-1].CacheControl = cc
-	}
-	if thinkingType != "" {
-		body.Thinking = &anthropicThinking{Type: thinkingType}
+	if ccStable != nil && len(body.Tools) > 0 {
+		body.Tools[len(body.Tools)-1].CacheControl = ccStable
 	}
 	effort := p.cfg.ReasoningEffort
 	reasoningActive := (p.cfg.ReasoningEffort != "" && p.cfg.ReasoningEffort != "none") || thinkingEnabled

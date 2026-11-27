@@ -40,7 +40,8 @@ type orReq struct {
 }
 
 type orReasoning struct {
-	Effort string `json:"effort"`
+	Effort  string `json:"effort"`
+	Summary string `json:"summary,omitempty"`
 }
 
 // orInputItem is a union: a message (Role+Content string, no Type) or a typed
@@ -94,7 +95,11 @@ func (p *openaiResponsesProvider) buildBody(req CompletionRequest, stream bool) 
 		effort = req.ReasoningEffort
 	}
 	if thinkingType != "disabled" && effort != "" && effort != "none" {
-		body.Reasoning = &orReasoning{Effort: effort}
+		r := &orReasoning{Effort: effort}
+		if p.cfg.ThinkingDisplay != "omitted" {
+			r.Summary = "auto"
+		}
+		body.Reasoning = r
 	}
 	var tools []orTool
 	for _, t := range req.Tools {
@@ -321,7 +326,8 @@ type orUsage struct {
 	InputTokens        int `json:"input_tokens"`
 	OutputTokens       int `json:"output_tokens"`
 	InputTokensDetails struct {
-		CachedTokens int `json:"cached_tokens"`
+		CachedTokens     int `json:"cached_tokens"`
+		CacheWriteTokens int `json:"cache_write_tokens"`
 	} `json:"input_tokens_details"`
 }
 
@@ -330,9 +336,10 @@ type orUsage struct {
 // the cached subset.
 func (u orUsage) norm() Usage {
 	return Usage{
-		InputTokens:     u.InputTokens,
-		OutputTokens:    u.OutputTokens,
-		CacheReadTokens: u.InputTokensDetails.CachedTokens,
+		InputTokens:      u.InputTokens,
+		OutputTokens:     u.OutputTokens,
+		CacheReadTokens:  u.InputTokensDetails.CachedTokens,
+		CacheWriteTokens: u.InputTokensDetails.CacheWriteTokens,
 	}
 }
 

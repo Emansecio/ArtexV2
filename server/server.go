@@ -544,6 +544,8 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
 	cfg.ContextWindowK = p.ContextWindowK
 	cfg.ThinkingType = p.ThinkingType
+	cfg.ThinkingBudget = p.ThinkingBudget
+	cfg.ThinkingDisplay = p.ThinkingDisplay
 	cfg.ReasoningEffort = p.ReasoningEffort
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
@@ -580,6 +582,8 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var sessionHeaderKey string
 	var userAgent string
 	var retry db.RetryOverride
+	thinkingBudget := cfg.ThinkingBudget
+	thinkingDisplay := cfg.ThinkingDisplay
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
 			if p.Name == "default" {
@@ -588,14 +592,23 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 				sessionHeaderKey = p.SessionHeaderKey
 				userAgent = p.UserAgent
 				retry = p.Retry
+				if thinkingBudget == 0 {
+					thinkingBudget = p.ThinkingBudget
+				}
+				if thinkingDisplay == "" {
+					thinkingDisplay = p.ThinkingDisplay
+				}
 				break
 			}
 		}
 	}
+	if cfg.ThinkingType != "enabled" {
+		thinkingBudget = 0
+	}
 	newID, err := s.m.pg.SaveProfile(&db.LLMProfile{
 		ID: id, Name: "default", Format: format, Model: cfg.Model, BaseURL: cfg.BaseURL, Proxy: cfg.Proxy,
 		APIKey: cfg.APIKey, ClearAPIKey: cfg.OAuthProvider() != "", RatePerSecond: cfg.RatePerSecond, RatePerMinute: cfg.RatePerMinute,
-		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
+		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ThinkingBudget: thinkingBudget, ThinkingDisplay: thinkingDisplay, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey, UserAgent: userAgent,
 		Retry: retry,
@@ -729,6 +742,8 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
 	cfg.ContextWindowK = p.ContextWindowK
 	cfg.ThinkingType = p.ThinkingType
+	cfg.ThinkingBudget = p.ThinkingBudget
+	cfg.ThinkingDisplay = p.ThinkingDisplay
 	cfg.ReasoningEffort = p.ReasoningEffort
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
@@ -1698,6 +1713,8 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		Proxy            *string `json:"proxy"`
 		APIKey           string  `json:"api_key"`
 		ThinkingType     *string `json:"thinking_type"`
+		ThinkingBudget   *int    `json:"thinking_budget"`
+		ThinkingDisplay  *string `json:"thinking_display"`
 		ReasoningEffort  *string `json:"reasoning_effort"`
 		ProfileID        *int64  `json:"profile_id"`         // passed when testing a stored profile: if api_key is empty, its stored key is used
 		Streaming        *bool   `json:"streaming"`          // omitted = streaming, the same defaults as when saving a profile
@@ -1719,7 +1736,8 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 			stored = p
 		}
 	}
-	var baseURL, proxy, thinkingType, reasoningEffort, sessionHeaderKey, userAgent, maxTokensField string
+	var baseURL, proxy, thinkingType, thinkingDisplay, reasoningEffort, sessionHeaderKey, userAgent, maxTokensField string
+	var thinkingBudget int
 	if req.BaseURL != nil {
 		baseURL = strings.TrimSpace(*req.BaseURL)
 	} else if stored != nil {
@@ -1744,6 +1762,16 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		thinkingType = strings.TrimSpace(*req.ThinkingType)
 	} else if stored != nil {
 		thinkingType = stored.ThinkingType
+	}
+	if req.ThinkingBudget != nil {
+		thinkingBudget = *req.ThinkingBudget
+	} else if stored != nil {
+		thinkingBudget = stored.ThinkingBudget
+	}
+	if req.ThinkingDisplay != nil {
+		thinkingDisplay = strings.TrimSpace(*req.ThinkingDisplay)
+	} else if stored != nil {
+		thinkingDisplay = stored.ThinkingDisplay
 	}
 	if req.ReasoningEffort != nil {
 		reasoningEffort = strings.TrimSpace(*req.ReasoningEffort)
@@ -1781,6 +1809,8 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// mirror production: send the SAME thinking params so a provider that rejects the
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
 	cfg.ThinkingType = thinkingType
+	cfg.ThinkingBudget = thinkingBudget
+	cfg.ThinkingDisplay = thinkingDisplay
 	cfg.ReasoningEffort = reasoningEffort
 	if req.Provider == "openai" && maxTokensField == llm.MaxTokensFieldCompletion {
 		cfg.MaxTokensField = maxTokensField

@@ -618,6 +618,8 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		SystemPrompt:           system,
 		DynamicBoundary:        boundary,
 		PromptCacheKey:         fmt.Sprintf("artex-task-%d-planner", taskID),
+		PromptCacheTTL:         "1h",
+		PromptCacheTailTTL:     "1h",
 		Tools:                  plannerTools,
 		DeferredTools:          def.Deferred,
 		UnlockSet:              def.Unlock,

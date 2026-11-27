@@ -626,6 +626,8 @@ type LLMProfileDTO struct {
 	RatePerMinute   float64 `json:"rate_per_minute"`
 	ContextWindowK  int     `json:"context_window_k"`
 	ThinkingType    string  `json:"thinking_type"`
+	ThinkingBudget  int     `json:"thinking_budget"`
+	ThinkingDisplay string  `json:"thinking_display"`
 	ReasoningEffort string  `json:"reasoning_effort"`
 	IsDefault       bool    `json:"is_default"`
 	// Pooling (failover) parameters: higher priority is picked first (the active
@@ -665,6 +667,8 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		RatePerMinute:    p.RatePerMinute,
 		ContextWindowK:   p.ContextWindowK,
 		ThinkingType:     p.ThinkingType,
+		ThinkingBudget:   p.ThinkingBudget,
+		ThinkingDisplay:  p.ThinkingDisplay,
 		ReasoningEffort:  p.ReasoningEffort,
 		IsDefault:        p.IsDefault,
 		Priority:         p.Priority,

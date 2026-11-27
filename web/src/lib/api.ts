@@ -1189,6 +1189,8 @@ export const api = {
     session_header_key = "", // non-empty = the test request also carries this custom session header (value is a one-off session id)
     user_agent = "", // non-empty = the test overrides the User-Agent header with this value
     max_tokens_field?: string, // ""=max_tokens | "max_completion_tokens" (openai format only); omit to inherit stored profile value
+    thinking_budget?: number,
+    thinking_display?: string,
   ) =>
     // reply = the model's actual reply (truncated); the backend marks a profile that replies with nothing as failed
     post<{
@@ -1211,6 +1213,8 @@ export const api = {
       session_header_key,
       user_agent,
       ...(max_tokens_field !== undefined ? { max_tokens_field } : {}),
+      ...(thinking_budget !== undefined ? { thinking_budget } : {}),
+      ...(thinking_display !== undefined ? { thinking_display } : {}),
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
@@ -1224,7 +1228,9 @@ export const api = {
     rate_per_second?: number;
     rate_per_minute?: number;
     context_window_k?: number;
-    thinking_type?: string; // ""(not sent)|"disabled"|"enabled"
+    thinking_type?: string; // ""(not sent)|"disabled"|"enabled"|"adaptive"
+    thinking_budget?: number; // budget_tokens when thinking_type="enabled"; 0=default
+    thinking_display?: string; // ""(auto/summarized)|"summarized"|"omitted"
     reasoning_effort?: string; // ""(not sent)|"low"|"medium"|"high"|"xhigh"|"max"
     priority?: number; // pool order position; higher is used first
     pool_exclude?: boolean; // true = not a failover target

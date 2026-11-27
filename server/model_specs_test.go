@@ -18,8 +18,9 @@ func TestLookupKnownModelSpec(t *testing.T) {
 		wantFld  string
 		wantThk  string
 	}{
-		{"anthropic", "claude-sonnet-4-6", 200_000, 64_000, "", "enabled"},
-		{"anthropic-oauth", "claude-opus-4-6", 200_000, 64_000, "", "enabled"},
+		{"anthropic", "claude-sonnet-4-6", 200_000, 64_000, "", "adaptive"},
+		{"anthropic-oauth", "claude-opus-4-6", 200_000, 64_000, "", "adaptive"},
+		{"anthropic-oauth", "claude-haiku-4-5", 200_000, 64_000, "", "enabled"},
 		{"openai", "gpt-5.4", 1_000_000, 128_000, llm.MaxTokensFieldCompletion, ""},
 		{"openai", "o3", 200_000, 100_000, llm.MaxTokensFieldCompletion, ""},
 		{"openai-responses", "o3", 200_000, 100_000, "", ""},
@@ -124,5 +125,48 @@ func TestMergeModelDetailFallbackValidatesDefaultReasoningEffort(t *testing.T) {
 	mergeModelDetailFallback(&inheritDst, src)
 	if len(inheritDst.ReasoningLevels) != 3 || inheritDst.DefaultReasoningEffort != "high" {
 		t.Fatalf("expected inherited levels and valid default 'high', got %+v", inheritDst)
+	}
+}
+
+func TestLookupKnownModelSpecAdaptiveOverridesEnabledToggle(t *testing.T) {
+	// API metadata reports reasoning_options type="toggle" (setting ThinkingType="enabled"),
+	// and models.dev may also report ThinkingType="enabled". Curated adaptive models
+	// (Claude 4.6/4.7/4.8/5.x) must upgrade "enabled" -> "adaptive".
+	for _, modelID := range []string{"claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"} {
+		raw := rawModelEntry{
+			ID: modelID,
+			ReasoningOptions: []struct {
+				Type   string   `json:"type"`
+				Values []string `json:"values"`
+			}{{Type: "toggle"}},
+		}
+		got := buildModelDetailFromAPI("anthropic", raw, nil)
+		if got.ThinkingType != "adaptive" {
+			t.Errorf("buildModelDetailFromAPI(anthropic, %q): ThinkingType=%q, want adaptive", modelID, got.ThinkingType)
+		}
+	}
+
+	// Enabled-only model must keep "enabled".
+	haiku := buildModelDetailFromAPI("anthropic", rawModelEntry{
+		ID: "claude-haiku-4-5",
+		ReasoningOptions: []struct {
+			Type   string   `json:"type"`
+			Values []string `json:"values"`
+		}{{Type: "toggle"}},
+	}, nil)
+	if haiku.ThinkingType != "enabled" {
+		t.Errorf("buildModelDetailFromAPI(anthropic, claude-haiku-4-5): ThinkingType=%q, want enabled", haiku.ThinkingType)
+	}
+
+	// Direct mergeModelDetailFallback check: "enabled" upgrades to "adaptive",
+	// whereas "adaptive" is never downgraded to "enabled".
+	dst := modelDetail{ID: "claude-opus-4-7", ThinkingType: "enabled"}
+	mergeModelDetailFallback(&dst, modelDetail{ID: "claude-opus-4-7", ThinkingType: "adaptive"})
+	if dst.ThinkingType != "adaptive" {
+		t.Errorf("mergeModelDetailFallback enabled->adaptive: got %q, want adaptive", dst.ThinkingType)
+	}
+	mergeModelDetailFallback(&dst, modelDetail{ID: "claude-opus-4-7", ThinkingType: "enabled"})
+	if dst.ThinkingType != "adaptive" {
+		t.Errorf("mergeModelDetailFallback adaptive->enabled must not downgrade: got %q, want adaptive", dst.ThinkingType)
 	}
 }

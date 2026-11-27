@@ -192,3 +192,34 @@ func TestSummarizerPTLExhausts(t *testing.T) {
 		t.Fatalf("should have retried after truncation, calls=%d", p.calls)
 	}
 }
+
+func TestSummarizerCacheForkPreservesPromptCacheTTL(t *testing.T) {
+	p := &captureProvider{reply: "<summary>condensed</summary>"}
+	sum := ProviderSummarizerWithOptions(p, SummaryOptions{
+		SessionPrefixFn: func() *SessionPrefix {
+			return &SessionPrefix{
+				Tools:           []llm.ToolSchema{{Name: "Bash", InputSchema: map[string]any{"type": "object"}}},
+				System:          []string{"static sys", "dynamic sys"},
+				DynamicBoundary: 1,
+				PromptCacheKey:  "sess-key",
+				PromptCacheTTL:  "1h",
+			}
+		},
+	})
+	if _, err := sum(context.Background(), []llm.Message{llm.UserText("hi")}); err != nil {
+		t.Fatalf("summarize: %v", err)
+	}
+	if len(p.reqs) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(p.reqs))
+	}
+	req := p.reqs[0]
+	if req.PromptCacheKey != "sess-key" {
+		t.Errorf("PromptCacheKey=%q, want sess-key", req.PromptCacheKey)
+	}
+	if req.PromptCacheTTL != "1h" {
+		t.Errorf("PromptCacheTTL=%q, want 1h", req.PromptCacheTTL)
+	}
+	if req.PromptCacheTailTTL != "" {
+		t.Errorf("PromptCacheTailTTL=%q, want empty (5m tail for one-shot summary)", req.PromptCacheTailTTL)
+	}
+}

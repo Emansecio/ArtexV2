@@ -20,6 +20,7 @@ type LLMUsage struct {
 	Model         string `json:"model"`
 	ProfileName   string `json:"profile_name"`
 	LatencyMs     int    `json:"latency_ms"`
+	TTFTMs        *int   `json:"ttft_ms,omitempty"`
 	InputTokens   int    `json:"input_tokens"`
 	OutputTokens  int    `json:"output_tokens"`
 	CacheRead     int    `json:"cache_read"`
@@ -60,10 +61,10 @@ func (d *DB) InsertLLMUsage(u *LLMUsage) error {
 		expID = u.ExplorationID
 	}
 	_, err := d.Exec(`
-INSERT INTO llm_usage(task_id, exploration_id, worker, model, profile_name, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status)
-VALUES (NULLIF($1,''),$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),$6,$7,$8,$9,$10,$11)`,
+INSERT INTO llm_usage(task_id, exploration_id, worker, model, profile_name, latency_ms, ttft_ms, input_tokens, output_tokens, cache_read, cache_write, status)
+VALUES (NULLIF($1,''),$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),$6,$7,$8,$9,$10,$11,$12)`,
 		u.TaskID, expID, u.Worker, u.Model, u.ProfileName,
-		u.LatencyMs, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.Status)
+		u.LatencyMs, u.TTFTMs, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.Status)
 	return err
 }
 

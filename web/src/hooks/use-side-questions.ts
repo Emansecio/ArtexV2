@@ -6,7 +6,7 @@ import { toast } from "sonner";
 
 import { isBtwCommand, type SideExchange, type SideHistory, sideAPI } from "@/lib/side-questions";
 import { setVisibleInterval } from "@/lib/polling";
-import { subscribeWS } from "@/lib/ws";
+import { isWSConnected, subscribeWS } from "@/lib/ws";
 
 // crypto.randomUUID is only available in secure contexts (https/localhost); it degrades when accessed via IP+http.
 function newSideRequestID(): string {
@@ -118,10 +118,20 @@ export function useSideQuestions(parent: string | null) {
     };
   }, [parent]);
 
+  const runningRef = useRef(false);
+  runningRef.current = Boolean(runningID);
+
   useEffect(() => {
     if (!open || !parent) return;
     void load();
-    const stopPolling = setVisibleInterval(() => load(), 2000, { topics: ["side"] });
+    // Skip periodic history refetch while a live WS stream is delivering updates.
+    const stopPolling = setVisibleInterval(
+      () => {
+        if (!runningRef.current || !isWSConnected()) return load();
+      },
+      2000,
+      { topics: ["side"] },
+    );
     return stopPolling;
   }, [open, parent, load]);
 
@@ -129,10 +139,60 @@ export function useSideQuestions(parent: string | null) {
   useEffect(() => {
     if (!runningID) return;
     const version = epoch.current;
+    let rafId = 0;
+    let pendingSnapshot: SideExchange | null = null;
+    let pendingDeltas: { id: string; sequence: number; append: string; context?: SideExchange["context"] }[] = [];
+
+    const flush = () => {
+      rafId = 0;
+      if (version !== epoch.current) return;
+      const snap = pendingSnapshot;
+      const ds = pendingDeltas;
+      pendingSnapshot = null;
+      pendingDeltas = [];
+      if (snap) {
+        setItems((old) => merge(old, [snap]));
+        restoreFailedDraft([snap]);
+      }
+      if (ds.length > 0) {
+        setItems((old) =>
+          old.map((ex) => {
+            let cur = ex;
+            for (const d of ds) {
+              if (cur.id !== d.id || (cur.sequence ?? 0) >= d.sequence) continue;
+              cur = {
+                ...cur,
+                sequence: d.sequence,
+                answer: (cur.answer ?? "") + d.append,
+                context: d.context ?? cur.context,
+              };
+            }
+            return cur;
+          }),
+        );
+      }
+    };
+    const schedule = () => {
+      if (!rafId) rafId = window.requestAnimationFrame(flush);
+    };
+
     const unsub = subscribeWS(`side:${runningID}`, {
+      onState: (open) => {
+        if (open && version === epoch.current) void load();
+      },
       onEvent: (event, data) => {
         if (version !== epoch.current) return;
+        if (event === "resync") {
+          void load();
+          return;
+        }
         if (event === "cleared") {
+          if (rafId) {
+            window.cancelAnimationFrame(rafId);
+            rafId = 0;
+          }
+          pendingSnapshot = null;
+          pendingDeltas = [];
           unsub();
           setItems([]);
           return;
@@ -140,9 +200,18 @@ export function useSideQuestions(parent: string | null) {
         if (event === "side" || event === "snapshot") {
           const item = data as SideExchange;
           if (!item || item.id !== runningID) return;
-          setItems((old) => merge(old, [item]));
-          restoreFailedDraft([item]);
-          if (item.status !== "running") unsub();
+          pendingSnapshot = item;
+          pendingDeltas = [];
+          if (item.status !== "running") {
+            if (rafId) {
+              window.cancelAnimationFrame(rafId);
+              rafId = 0;
+            }
+            flush();
+            unsub();
+            return;
+          }
+          schedule();
           return;
         }
         if (event === "delta") {
@@ -153,24 +222,21 @@ export function useSideQuestions(parent: string | null) {
             context?: SideExchange["context"];
           };
           if (!delta || delta.id !== runningID || !delta.append || delta.sequence == null) return;
-          const seq = delta.sequence;
-          const append = delta.append;
-          setItems((old) =>
-            old.map((ex) => {
-              if (ex.id !== delta.id || (ex.sequence ?? 0) >= seq) return ex;
-              return {
-                ...ex,
-                sequence: seq,
-                answer: (ex.answer ?? "") + append,
-                context: delta.context ?? ex.context,
-              };
-            }),
-          );
+          pendingDeltas.push({
+            id: delta.id,
+            sequence: delta.sequence,
+            append: delta.append,
+            context: delta.context,
+          });
+          schedule();
         }
       },
     });
-    return unsub;
-  }, [runningID, streamEpoch, restoreFailedDraft]);
+    return () => {
+      if (rafId) window.cancelAnimationFrame(rafId);
+      unsub();
+    };
+  }, [runningID, streamEpoch, restoreFailedDraft, load]);
 
   const ask = async (input: string) => {
     const question = input.trim();

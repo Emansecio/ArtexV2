@@ -40,6 +40,8 @@ type Options struct {
 	AppendSystemPrompt []string
 	DynamicBoundary    int
 	PromptCacheKey     string
+	PromptCacheTTL     string
+	PromptCacheTailTTL string
 
 	// Tools the agent may call. Defaults to tool.DefaultTools().
 	Tools []tool.CoreTool
@@ -350,6 +352,7 @@ func NewSession(opts Options) *Session {
 					System:          system,
 					DynamicBoundary: boundary,
 					PromptCacheKey:  s.opts.PromptCacheKey,
+					PromptCacheTTL:  s.opts.PromptCacheTTL,
 					SystemReminder:  buildSystemReminder(extra),
 				}
 			}
@@ -581,6 +584,8 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 		System:                  s.system(),
 		DynamicBoundary:         s.opts.DynamicBoundary,
 		PromptCacheKey:          s.opts.PromptCacheKey,
+		PromptCacheTTL:          s.opts.PromptCacheTTL,
+		PromptCacheTailTTL:      s.opts.PromptCacheTailTTL,
 		SessionID:               sessionID,
 		Messages:                s.messages,
 		SystemReminder:          buildSystemReminder(reminderExtra),

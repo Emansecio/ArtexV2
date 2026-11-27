@@ -2268,6 +2268,10 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
 		p.MaxTokensField = ""
 	}
+	if err := validateProfileThinking(&p); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	// Custom User-Agent: trim and reject control characters / over-long values so a
 	// bad value can never inject a header or bloat every request. "" = no override.
 	ua, err := agent.ValidateUserAgent(p.UserAgent)
@@ -2317,6 +2321,94 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// engine's provider has to be rebuilt either way.
 	s.reapplyActiveProfile()
 	writeJSON(w, 200, map[string]any{"id": id})
+}
+
+// validateProfileThinking normalizes and validates thinking_type, thinking_budget,
+// thinking_display, reasoning_effort, and max_tokens compatibility for a profile
+// before persisting it, preventing broken configurations that would 400 at runtime.
+func validateProfileThinking(p *db.LLMProfile) error {
+	p.ThinkingType = strings.TrimSpace(p.ThinkingType)
+	p.ThinkingDisplay = strings.TrimSpace(p.ThinkingDisplay)
+	p.ReasoningEffort = strings.TrimSpace(p.ReasoningEffort)
+	if p.ThinkingBudget < 0 {
+		p.ThinkingBudget = 0
+	}
+	switch p.ThinkingType {
+	case "", "disabled", "enabled", "adaptive":
+	default:
+		return fmt.Errorf("invalid thinking_type %q (allowed: empty, disabled, enabled, adaptive)", p.ThinkingType)
+	}
+	switch p.ThinkingDisplay {
+	case "", "summarized", "omitted":
+	default:
+		return fmt.Errorf("invalid thinking_display %q (allowed: empty, summarized, omitted)", p.ThinkingDisplay)
+	}
+	if p.ThinkingType != "enabled" {
+		p.ThinkingBudget = 0
+	}
+	if p.Format != "anthropic" && p.Format != "anthropic-oauth" {
+		return nil
+	}
+
+	norm := normalizeModelKey(p.Model)
+	isAdaptiveOnly := strings.HasPrefix(norm, "claude-opus-5") ||
+		strings.HasPrefix(norm, "claude-sonnet-5") ||
+		strings.HasPrefix(norm, "claude-haiku-5") ||
+		strings.HasPrefix(norm, "claude-opus-4-8") ||
+		strings.HasPrefix(norm, "claude-opus-4.8") ||
+		strings.HasPrefix(norm, "claude-opus-4-7") ||
+		strings.HasPrefix(norm, "claude-opus-4.7") ||
+		strings.Contains(norm, "fable") ||
+		strings.Contains(norm, "mythos")
+
+	if isAdaptiveOnly && p.ThinkingType == "enabled" {
+		return fmt.Errorf("model %q requires thinking_type \"adaptive\" (not \"enabled\")", p.Model)
+	}
+	if strings.HasPrefix(norm, "claude-") {
+		det, known := lookupKnownModelSpec(p.Format, p.Model)
+		if known {
+			if det.ThinkingType == "enabled" && p.ThinkingType == "adaptive" {
+				return fmt.Errorf("model %q does not support thinking_type \"adaptive\" (use \"enabled\" with thinking_budget)", p.Model)
+			}
+			if det.ThinkingType == "" && len(det.ReasoningLevels) == 0 && p.ThinkingType != "" && p.ThinkingType != "disabled" {
+				return fmt.Errorf("model %q does not support extended thinking", p.Model)
+			}
+			if p.ReasoningEffort != "" && p.ReasoningEffort != "none" {
+				if len(det.ReasoningLevels) == 0 {
+					return fmt.Errorf("model %q does not support reasoning_effort %q", p.Model, p.ReasoningEffort)
+				}
+				supported := false
+				for _, lvl := range det.ReasoningLevels {
+					if lvl == p.ReasoningEffort {
+						supported = true
+						break
+					}
+				}
+				if !supported {
+					return fmt.Errorf("model %q does not support reasoning_effort %q (supported: %s)",
+						p.Model, p.ReasoningEffort, strings.Join(det.ReasoningLevels, ", "))
+				}
+			}
+		}
+	}
+	if p.ThinkingType == "enabled" {
+		if p.ThinkingBudget > 0 && p.ThinkingBudget < 1024 {
+			return fmt.Errorf("thinking_budget must be at least 1024 when thinking_type is \"enabled\"")
+		}
+		if p.MaxTokens > 0 {
+			effBudget := p.ThinkingBudget
+			if effBudget == 0 {
+				effBudget = 1024
+			}
+			if p.MaxTokens <= effBudget {
+				return fmt.Errorf("max_tokens (%d) must be greater than thinking_budget (%d) when thinking_type is \"enabled\"", p.MaxTokens, effBudget)
+			}
+		}
+	}
+	if p.ThinkingType == "adaptive" && p.MaxTokens > 0 && p.MaxTokens < 1024 {
+		return fmt.Errorf("max_tokens (%d) must be at least 1024 when thinking_type is \"adaptive\"", p.MaxTokens)
+	}
+	return nil
 }
 
 // pgGetLLMRetryPolicy returns the global retry policy (per-layer counts +

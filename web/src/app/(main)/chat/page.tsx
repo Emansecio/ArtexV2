@@ -28,7 +28,7 @@ import { MentionTextarea } from "@/components/mention-textarea";
 import { SideQuestionButton, SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
 import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
-import { Transcript, type StreamingDeltaView } from "@/components/transcript";
+import { Transcript } from "@/components/transcript";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -57,6 +57,15 @@ import { Spinner } from "@/components/ui/spinner";
 import { useSideQuestions } from "@/hooks/use-side-questions";
 import { mergeActivities } from "@/lib/activity-merge";
 import { api } from "@/lib/api";
+import {
+  activityClearsDeltaKind,
+  appendStreamDeltas,
+  clearKindForActivity,
+  clearsForFreshActivities,
+  clearStreamDelta,
+  type StreamDeltaClear,
+} from "@/lib/delta-store";
+import { setVisibleInterval } from "@/lib/polling";
 import { subscribeWS } from "@/lib/ws";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
@@ -93,6 +102,26 @@ function fmtDuration(ms: number): string {
 // then one more page each time the user scrolls to the top. Kept modest so a long
 // thread stays snappy (only ~a page of rows is in the DOM until you scroll up).
 const HISTORY_PAGE = 200;
+
+function sameConversationList(a: Conversation[], b: Conversation[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      x.id !== y.id ||
+      x.title !== y.title ||
+      x.agent_key !== y.agent_key ||
+      x.updated_at !== y.updated_at ||
+      x.running !== y.running ||
+      x.pinned !== y.pinned ||
+      x.llm_profile_id !== y.llm_profile_id
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
 const CONVERSATION_LIST_PAGE = 100;
 
 // Which agent groups the user has collapsed in the left rail. Persisted so the
@@ -511,12 +540,13 @@ function ChatView({
   leadingControl?: React.ReactNode;
 }) {
   const approvalFocus = useApprovalFocus({ conversationId: conv.id });
+  const convStreamKey = `conv:${conv.id}`;
   const [messages, setMessages] = React.useState<Activity[]>([]);
-  const [streamingDelta, setStreamingDelta] = React.useState<StreamingDeltaView | null>(null);
   const [running, setRunning] = React.useState(false);
   const [input, setInput] = React.useState(initial?.input ?? "");
   const [sending, setSending] = React.useState(false);
   const [stopping, setStopping] = React.useState(false);
+  const stoppingRef = React.useRef(false);
   // Upload method 1: already-uploaded attachments (stored under sessions/conv-<id>/uploads/) are sent with the next message.
   const [attachments, setAttachments] = React.useState<ChatAttachment[]>(initial?.attachments ?? []);
   React.useEffect(() => {
@@ -566,7 +596,9 @@ function ChatView({
     hasMoreRef.current = false;
     setHasMore(false);
     setMessages([]);
-    setStreamingDelta(null);
+    clearStreamDelta(convStreamKey);
+    stoppingRef.current = false;
+    setStopping(false);
     setHistoryLoaded(false);
     setRunning(false);
     let live = true;
@@ -590,7 +622,7 @@ function ChatView({
     return () => {
       live = false;
     };
-  }, [conv.id]);
+  }, [conv.id, convStreamKey]);
 
   // A trigger or another tab may start a turn while this conversation is open.
   // A false list snapshot must not stop the tail before its final messages load.
@@ -601,7 +633,7 @@ function ChatView({
   // Real-time SSE token & activity stream while a turn is running, with graceful polling fallback.
   React.useEffect(() => {
     if (!running || !historyLoaded) {
-      setStreamingDelta(null);
+      clearStreamDelta(convStreamKey);
       return;
     }
     let live = true;
@@ -618,23 +650,23 @@ function ChatView({
       rafId = 0;
       if (!live) return;
       const acts = pendingActs.splice(0, pendingActs.length);
-      const ds = pendingDeltas.splice(0, pendingDeltas.length);
+      const ds = stoppingRef.current ? [] : pendingDeltas.splice(0, pendingDeltas.length);
+      if (stoppingRef.current) pendingDeltas.length = 0;
+      const clears: StreamDeltaClear[] = [];
       if (acts.length > 0) {
         const last = acts[acts.length - 1];
         cursorRef.current = Math.max(cursorRef.current, last.seq);
         setMessages((prev) => mergeActivities(prev, acts));
-        if (acts.some((a) => a.kind === "text" || a.kind === "thinking" || a.kind === "tool_use" || a.kind === "result")) {
-          setStreamingDelta(null);
+        for (const a of acts) {
+          const clearKind = clearKindForActivity(a.kind);
+          if (clearKind) clears.push({ key: convStreamKey, kind: clearKind });
         }
       }
-      if (ds.length > 0) {
-        setStreamingDelta((prev) => {
-          let cur = prev;
-          for (const d of ds) {
-            cur = cur && cur.kind === d.kind ? { kind: d.kind, text: cur.text + d.text } : { kind: d.kind, text: d.text };
-          }
-          return cur;
-        });
+      if (clears.length > 0 || ds.length > 0) {
+        appendStreamDeltas(
+          clears,
+          ds.map((d) => ({ key: convStreamKey, kind: d.kind, text: d.text })),
+        );
       }
     };
     const schedule = () => {
@@ -653,12 +685,18 @@ function ChatView({
           if (!live) return;
           if (r.items.length) {
             setMessages((prev) => mergeActivities(prev, r.items));
-            setStreamingDelta(null);
+            const clears = clearsForFreshActivities(convStreamKey, r.items, cursorRef.current);
+            if (clears.length > 0) appendStreamDeltas(clears, []);
           }
           cursorRef.current = Math.max(cursorRef.current, r.cursor);
           keepPolling = r.running;
           setRunning(r.running);
-          if (!r.running) onTitleMaybeChanged();
+          if (!r.running) {
+            stoppingRef.current = false;
+            setStopping(false);
+            clearStreamDelta(convStreamKey);
+            onTitleMaybeChanged();
+          }
         } catch {
           /* transient */
         } finally {
@@ -684,8 +722,10 @@ function ChatView({
         cursorRef.current = Math.max(cursorRef.current, last.seq);
         setMessages((prev) => mergeActivities(prev, acts));
       }
+      stoppingRef.current = false;
+      setStopping(false);
       setRunning(false);
-      setStreamingDelta(null);
+      clearStreamDelta(convStreamKey);
       onTitleMaybeChanged();
     };
 
@@ -695,6 +735,8 @@ function ChatView({
         if (!live) return;
         if (r.items.length) {
           setMessages((prev) => mergeActivities(prev, r.items));
+          const clears = clearsForFreshActivities(convStreamKey, r.items, cursorRef.current);
+          if (clears.length > 0) appendStreamDeltas(clears, []);
         }
         cursorRef.current = Math.max(cursorRef.current, r.cursor);
         if (!r.running) {
@@ -736,12 +778,17 @@ function ChatView({
         if (event === "activity") {
           const a = data as Activity;
           if (a.seq > cursorRef.current) cursorRef.current = a.seq;
-          if (a.kind === "text" || a.kind === "thinking" || a.kind === "tool_use" || a.kind === "result") {
-            pendingDeltas.length = 0;
+          if (clearKindForActivity(a.kind)) {
+            for (let i = pendingDeltas.length - 1; i >= 0; i--) {
+              if (activityClearsDeltaKind(a.kind, pendingDeltas[i].kind)) {
+                pendingDeltas.splice(i, 1);
+              }
+            }
           }
           pendingActs.push(a);
           schedule();
         } else if (event === "delta") {
+          if (stoppingRef.current) return;
           const df = data as { kind?: string; text?: string };
           if (!df.text || (df.kind !== "text" && df.kind !== "thinking")) return;
           pendingDeltas.push({ kind: df.kind, text: df.text });
@@ -762,8 +809,9 @@ function ChatView({
       if (rafId) window.cancelAnimationFrame(rafId);
       if (pollTimer !== undefined) clearTimeout(pollTimer);
       unsubWS?.();
+      clearStreamDelta(convStreamKey);
     };
-  }, [running, historyLoaded, conv.id, onTitleMaybeChanged]);
+  }, [running, historyLoaded, conv.id, convStreamKey, onTitleMaybeChanged]);
 
   const loadFocusPage = React.useCallback((before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE), [conv.id]);
   const mergeFocusPage = React.useCallback((page: { items: Activity[]; hasMore: boolean }) => {
@@ -835,6 +883,19 @@ function ChatView({
     const vp = viewport();
     if (vp) vp.scrollTop = vp.scrollHeight;
   }, [messages, running, viewport, approvalFocus.state]);
+  // Follow live streaming deltas and lazy detail expansions while anchored at bottom.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: conv.id intentionally rebinds the observer on thread switch.
+  React.useEffect(() => {
+    const el = contentRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      if (approvalFocus.state || !atBottomRef.current) return;
+      const vp = viewport();
+      if (vp) vp.scrollTop = vp.scrollHeight;
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [conv.id, viewport, approvalFocus.state]);
 
   // Per-conversation token total, live — same accounting as the main-agent
   // console: completed runs' `result` sum + the in-progress run's latest `usage`.
@@ -902,18 +963,19 @@ function ChatView({
     }
   }
 
-  // stop aborts the in-flight run for this conversation. running flips to false on
-  // the next 1s poll once the backend unwinds the agent; the trigger queue is not
-  // affected — the agent's next queued fire still starts.
+  // stop aborts the in-flight run for this conversation. Keep stopping=true and
+  // suppress trailing deltas until the run actually finishes (status running=false).
   async function stop() {
-    if (stopping) return;
+    if (stoppingRef.current) return;
+    stoppingRef.current = true;
     setStopping(true);
+    clearStreamDelta(convStreamKey);
     try {
       await api.stopConversation(conv.id);
     } catch (e) {
-      toast.error(t("Stop failed: {error}", { error: (e as Error).message }));
-    } finally {
+      stoppingRef.current = false;
       setStopping(false);
+      toast.error(t("Stop failed: {error}", { error: (e as Error).message }));
     }
   }
 
@@ -967,7 +1029,7 @@ function ChatView({
               {hasMore && (
                 <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">{t("Scroll up to load earlier messages…")}</div>
               )}
-              <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined} streamingDelta={running ? streamingDelta : null} />
+              <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined} streamSessionKey={running ? convStreamKey : null} />
             </>
           )}
         </div>
@@ -1255,7 +1317,10 @@ export default function ChatPage() {
     const seq = ++conversationListSeq.current;
     try {
       const items = await api.conversations();
-      if (seq === conversationListSeq.current) { setConvs(items); setConvsLoaded(true); }
+      if (seq === conversationListSeq.current) {
+        setConvs((prev) => (sameConversationList(prev, items) ? prev : items));
+        setConvsLoaded(true);
+      }
     } catch {
       // Preserve the selected transcript and list on a transient poll failure.
     }
@@ -1276,19 +1341,13 @@ export default function ChatPage() {
   }, []);
 
   // One list poll supplies runtime state for all sidebar rows, including the
-  // unselected ones. Await completion so slow requests do not overlap.
+  // unselected ones; pauses while the tab is hidden to avoid background churn.
   React.useEffect(() => {
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    async function poll() {
-      await reloadConvs();
-      if (!disposed) timer = setTimeout(() => void poll(), 2000);
-    }
-    void poll();
+    void reloadConvs();
+    const stopPolling = setVisibleInterval(() => reloadConvs(), 2000);
     return () => {
-      disposed = true;
       conversationListSeq.current++;
-      clearTimeout(timer);
+      stopPolling();
     };
   }, [reloadConvs]);
 

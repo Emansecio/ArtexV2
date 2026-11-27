@@ -669,9 +669,13 @@ function UserRow({ step, intent, getDetail }: { step: Activity; intent?: boolean
 // from the detail and shown inline.
 function AnswerBlock({ step, getDetail }: { step: Activity; getDetail: (seq: number) => Promise<string> }) {
   const [ref, inView] = useInView();
-  const [full, setFull] = React.useState<string | null>(null);
+  const [full, setFull] = React.useState<string | null>(() => step.detail || null);
   React.useEffect(() => {
-    if (!inView) return; // fetch the full answer only when it nears view
+    if (step.detail) {
+      setFull(step.detail);
+      return;
+    }
+    if (!inView) return; // fetch the full answer only when detail wasn't embedded in the frame
     let live = true;
     getDetail(step.seq)
       .then((d) => {
@@ -683,7 +687,7 @@ function AnswerBlock({ step, getDetail }: { step: Activity; getDetail: (seq: num
     return () => {
       live = false;
     };
-  }, [inView, step.seq, getDetail, step.summary]);
+  }, [inView, step.seq, step.detail, getDetail, step.summary]);
   return (
     <div ref={ref} className="mb-2 mt-1 flex min-w-0 flex-col gap-1">
       <div
@@ -767,11 +771,6 @@ function ExecView({
   );
 }
 
-export interface StreamingDeltaView {
-  kind: "text" | "thinking";
-  text: string;
-}
-
 // Transcript renders a session's activity as a compact grouped execution replay:
 // human turns, thinking, tool calls (command+result paired), and messages — for
 // the main agent (interactive) and worker/planner (read-only) alike.
@@ -783,7 +782,7 @@ const MemoStreamingBlock = React.memo(function MemoStreamingBlock({ text }: { te
 // finalized blocks + a trailing live tail, respecting fenced code blocks (``` / ~~~)
 // so each completed paragraph/table/code block is parsed by ReactMarkdown once (O(N)
 // total instead of O(P²) re-parsing the full document on every paragraph boundary).
-function splitMarkdownBlocks(text: string): { blocks: string[]; tail: string } {
+export function splitMarkdownBlocks(text: string): { blocks: string[]; tail: string } {
   const blocks: string[] = [];
   let blockStart = 0;
   let fenceChar = "";
@@ -821,15 +820,8 @@ function splitMarkdownBlocks(text: string): { blocks: string[]; tail: string } {
   return { blocks, tail: text.slice(blockStart) };
 }
 
-function StreamingBubble({
-  streamingDelta,
-  streamSessionKey,
-}: {
-  streamingDelta?: StreamingDeltaView | null;
-  streamSessionKey?: string | null;
-}) {
-  const storeDelta = useStreamDelta(streamSessionKey);
-  const active = streamSessionKey ? storeDelta : streamingDelta;
+function StreamingBubble({ streamSessionKey }: { streamSessionKey?: string | null }) {
+  const active = useStreamDelta(streamSessionKey);
   const parsed = React.useMemo(
     () => (active?.text && active.kind !== "thinking" ? splitMarkdownBlocks(active.text) : null),
     [active?.text, active?.kind],
@@ -867,7 +859,6 @@ export function Transcript({
   chat,
   fetchDetail,
   focusedSeq,
-  streamingDelta,
   streamSessionKey,
 }: {
   activity: Activity[];
@@ -876,7 +867,6 @@ export function Transcript({
   chat?: boolean;
   fetchDetail?: (seq: number) => Promise<string>;
   focusedSeq?: number;
-  streamingDelta?: StreamingDeltaView | null;
   streamSessionKey?: string | null;
 }) {
   const transcriptRef = React.useRef<HTMLDivElement>(null);
@@ -894,7 +884,7 @@ export function Transcript({
   return (
     <div ref={transcriptRef} className="flex flex-col gap-1" style={focusPadding ? { paddingBlock: focusPadding } : undefined}>
       <ExecView activity={activity} taskId={taskId} chat={chat} fetchDetail={fetchDetail} focusedSeq={focusedSeq} />
-      <StreamingBubble streamingDelta={streamingDelta} streamSessionKey={streamSessionKey} />
+      <StreamingBubble streamSessionKey={streamSessionKey} />
       {live && (
         <div className="flex items-center gap-2 pl-2 pt-1 text-xs text-muted-foreground">
           <span className="flex gap-1">

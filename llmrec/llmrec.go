@@ -165,6 +165,11 @@ type Recorder struct {
 	thinkingType    string
 	reasoningEffort string
 	enabled         func() bool // reports whether recording is currently on; nil = always record
+
+	// Tracks sessions that already observed a warm prompt-cache hit so a sharp
+	// subsequent drop on a non-trivial prompt is logged once as an anomaly signal.
+	cacheMu    sync.Mutex
+	sessionHit map[string]bool
 }
 
 // Wrap returns a Provider that records calls to pg when enabled() reports true.
@@ -254,6 +259,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 			stopReason  string
 			streamErr   error
 			complete    bool // message_stop was seen
+			ttftMs      *int
 		)
 
 		finished := false
@@ -267,7 +273,10 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				status = "error"
 			}
 			// Lightweight metering row — always written.
-			r.recordUsage(ctx, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+			r.recordUsage(ctx, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), ttftMs, status)
+			if status == "ok" {
+				r.checkCacheDrop(session, worker, usage)
+			}
 			// Opt-in context size telemetry — independent of recordBodies.
 			if collectContext {
 				r.recordContext(taskID, worker, ctxMetrics, usage, status)
@@ -287,6 +296,10 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 					return
 				}
 				return
+			}
+			if ttftMs == nil {
+				ms := int(time.Since(start).Milliseconds())
+				ttftMs = &ms
 			}
 			// Always track usage (cheap); accumulate text/thinking only for bodies.
 			// message_start carries the input side (input + cache) and is added.
@@ -371,7 +384,10 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	} else {
 		reportStop(ctx, stopReason)
 	}
-	r.recordUsage(ctx, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+	r.recordUsage(ctx, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), nil, status)
+	if status == "ok" {
+		r.checkCacheDrop(session, worker, usage)
+	}
 	if collectContext {
 		r.recordContext(taskID, worker, ctxMetrics, usage, status)
 	}
@@ -395,7 +411,7 @@ func thinkingText(msg llm.Message) string {
 // zero-token calls with no model, which carry nothing worth metering. The ctx
 // usage sink (if any) sees these calls even when no PostgreSQL recorder is set
 // (r.pg == nil), so a budget also counts calls that are not persisted.
-func (r *Recorder) recordUsage(ctx context.Context, taskID string, expID int64, worker string, usage llm.Usage, latencyMs int, status string) {
+func (r *Recorder) recordUsage(ctx context.Context, taskID string, expID int64, worker string, usage llm.Usage, latencyMs int, ttftMs *int, status string) {
 	if r.model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 &&
 		usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0 {
 		return
@@ -413,12 +429,49 @@ func (r *Recorder) recordUsage(ctx context.Context, taskID string, expID int64, 
 		Model:         r.model,
 		ProfileName:   r.prof,
 		LatencyMs:     latencyMs,
+		TTFTMs:        ttftMs,
 		InputTokens:   usage.InputTokens,
 		OutputTokens:  usage.OutputTokens,
 		CacheRead:     usage.CacheReadTokens,
 		CacheWrite:    usage.CacheWriteTokens,
 		Status:        status,
 	})
+}
+
+const (
+	cacheDropMinInputTokens = 4096
+	cacheDropMinRatio       = 0.25
+	cacheDropMaxSessions    = 4096
+)
+
+// checkCacheDrop logs a warning when a session that previously had a warm
+// prompt-cache hit suffers a sharp drop in cache read ratio on a later turn,
+// surfacing accidental prefix instability.
+func (r *Recorder) checkCacheDrop(session, worker string, usage llm.Usage) {
+	if session == "" || usage.InputTokens < cacheDropMinInputTokens {
+		return
+	}
+	ratio := float64(usage.CacheReadTokens) / float64(usage.InputTokens)
+	dropped := false
+	r.cacheMu.Lock()
+	if r.sessionHit == nil {
+		r.sessionHit = make(map[string]bool)
+	}
+	prevHit := r.sessionHit[session]
+	if ratio >= cacheDropMinRatio {
+		if len(r.sessionHit) >= cacheDropMaxSessions && !prevHit {
+			clear(r.sessionHit)
+		}
+		r.sessionHit[session] = true
+	} else if prevHit {
+		delete(r.sessionHit, session)
+		dropped = true
+	}
+	r.cacheMu.Unlock()
+	if dropped {
+		log.Printf("[llmrec] prompt cache hit drop: session=%s worker=%s model=%s cache_read=%d/%d (%.1f%%) cache_write=%d",
+			session, worker, r.model, usage.CacheReadTokens, usage.InputTokens, ratio*100, usage.CacheWriteTokens)
+	}
 }
 
 // record persists one LLM call to PostgreSQL before the provider stream returns.

@@ -1,14 +1,56 @@
 import { useSyncExternalStore } from "react";
 
+export type StreamDeltaKind = "thinking" | "text";
+
 export interface StreamDelta {
-  kind: "thinking" | "text";
+  kind: StreamDeltaKind;
   text: string;
+}
+
+export interface StreamDeltaClear {
+  key: string;
+  kind: StreamDeltaKind | "all";
+}
+
+// activityClearsDeltaKind returns whether a committed activity of `activityKind`
+// supersedes an in-flight streaming delta of `deltaKind`. On a thinking -> text
+// transition, the first text delta often arrives before the persisted thinking
+// activity; clearing by kind prevents the thinking commit from wiping live text.
+export function activityClearsDeltaKind(activityKind: string, deltaKind: StreamDeltaKind): boolean {
+  if (activityKind === "tool_use" || activityKind === "result") return true;
+  if (activityKind === "thinking") return deltaKind === "thinking";
+  if (activityKind === "text") return deltaKind === "text";
+  return false;
+}
+
+// clearKindForActivity maps a committed activity kind to the delta-store clear
+// scope, or null when that activity does not clear streaming deltas.
+export function clearKindForActivity(activityKind: string): StreamDeltaKind | "all" | null {
+  if (activityKind === "tool_use" || activityKind === "result") return "all";
+  if (activityKind === "thinking") return "thinking";
+  if (activityKind === "text") return "text";
+  return null;
+}
+
+// clearsForFreshActivities computes delta-store clears only for activities
+// strictly newer than seenCursor (seq > seenCursor), so stale in-flight
+// catch-up or fallback-poll responses never wipe newer live streaming deltas.
+export function clearsForFreshActivities(
+  key: string,
+  items: readonly { seq: number; kind: string }[],
+  seenCursor: number,
+): StreamDeltaClear[] {
+  const clears: StreamDeltaClear[] = [];
+  for (const a of items) {
+    if (a.seq <= seenCursor) continue;
+    const clearKind = clearKindForActivity(a.kind);
+    if (clearKind) clears.push({ key, kind: clearKind });
+  }
+  return clears;
 }
 
 const deltas = new Map<string, StreamDelta>();
 const listeners = new Map<string, Set<() => void>>();
-const pendingNotify = new Set<string>();
-let rafScheduled = false;
 
 function notify(key: string) {
   const subs = listeners.get(key);
@@ -16,32 +58,22 @@ function notify(key: string) {
   for (const fn of subs) fn();
 }
 
-function flushNotifications() {
-  rafScheduled = false;
-  if (pendingNotify.size === 0) return;
-  const keys = [...pendingNotify];
-  pendingNotify.clear();
-  for (const k of keys) notify(k);
-}
-
-function scheduleNotify(keys: Iterable<string>) {
-  for (const k of keys) pendingNotify.add(k);
-  if (rafScheduled || pendingNotify.size === 0) return;
-  rafScheduled = true;
-  if (typeof requestAnimationFrame === "function") {
-    requestAnimationFrame(flushNotifications);
-  } else {
-    queueMicrotask(flushNotifications);
-  }
-}
-
+// appendStreamDeltas applies clears and incoming deltas, then notifies subscribed
+// components synchronously. Callers already batch WebSocket frames per animation
+// frame, so notifying directly avoids an extra 1-frame (16.7ms) rAF hop.
 export function appendStreamDeltas(
-  clearKeys: Iterable<string>,
-  incoming: readonly { key: string; kind: "thinking" | "text"; text: string }[],
+  clears: Iterable<string | StreamDeltaClear>,
+  incoming: readonly { key: string; kind: StreamDeltaKind; text: string }[],
 ) {
   const touched = new Set<string>();
-  for (const k of clearKeys) {
-    if (deltas.delete(k)) touched.add(k);
+  for (const entry of clears) {
+    const key = typeof entry === "string" ? entry : entry.key;
+    const kind = typeof entry === "string" ? "all" : entry.kind;
+    const cur = deltas.get(key);
+    if (cur && (kind === "all" || cur.kind === kind)) {
+      deltas.delete(key);
+      touched.add(key);
+    }
   }
   for (const d of incoming) {
     const cur = deltas.get(d.key);
@@ -51,13 +83,16 @@ export function appendStreamDeltas(
     );
     touched.add(d.key);
   }
-  if (touched.size > 0) scheduleNotify(touched);
+  for (const k of touched) notify(k);
+}
+
+export function clearStreamDelta(key: string) {
+  if (deltas.delete(key)) notify(key);
 }
 
 export function clearAllStreamDeltas() {
   const keys = [...deltas.keys()];
   deltas.clear();
-  for (const k of keys) pendingNotify.delete(k);
   for (const k of keys) notify(k);
 }
 

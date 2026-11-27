@@ -19,7 +19,7 @@ import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/
 import { MentionTextarea } from "@/components/mention-textarea";
 import { SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
-import { type StreamingDeltaView, Transcript } from "@/components/transcript";
+import { Transcript } from "@/components/transcript";
 import { mergeActivities } from "@/lib/activity-merge";
 import {
   AlertDialog,
@@ -37,7 +37,13 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Textarea } from "@/components/ui/textarea";
 import { useSideQuestions } from "@/hooks/use-side-questions";
 import { api } from "@/lib/api";
-import { appendStreamDeltas, clearAllStreamDeltas } from "@/lib/delta-store";
+import {
+  activityClearsDeltaKind,
+  appendStreamDeltas,
+  clearAllStreamDeltas,
+  clearKindForActivity,
+  type StreamDeltaClear,
+} from "@/lib/delta-store";
 import { subscribeWS } from "@/lib/ws";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { MOCK } from "@/lib/mock/enabled";
@@ -835,7 +841,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
 
           if (acts.length > 0) {
             const grouped = new Map<string, Activity[]>();
-            const clearKeys = new Set<string>();
+            const clears: StreamDeltaClear[] = [];
             for (const a of acts) {
               const k = sessionKeyOf(a);
               let arr = grouped.get(k);
@@ -844,8 +850,9 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                 grouped.set(k, arr);
               }
               arr.push(a);
-              if (a.kind === "text" || a.kind === "thinking" || a.kind === "tool_use" || a.kind === "result") {
-                clearKeys.add(k);
+              const clearKind = clearKindForActivity(a.kind);
+              if (clearKind) {
+                clears.push({ key: k, kind: clearKind });
               }
             }
             setStore((prev) => {
@@ -881,8 +888,8 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
               }
               return next;
             });
-            if (clearKeys.size > 0 || ds.length > 0) {
-              appendStreamDeltas(clearKeys, ds);
+            if (clears.length > 0 || ds.length > 0) {
+              appendStreamDeltas(clears, ds);
             }
           } else if (ds.length > 0) {
             appendStreamDeltas([], ds);
@@ -961,10 +968,12 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                     // Periodic resolver poll retries automatically.
                   });
               }
-              if (a.kind === "text" || a.kind === "thinking" || a.kind === "tool_use" || a.kind === "result") {
+              if (clearKindForActivity(a.kind)) {
                 const k = sessionKeyOf(a);
                 for (let i = pendingDeltas.length - 1; i >= 0; i--) {
-                  if (pendingDeltas[i].key === k) pendingDeltas.splice(i, 1);
+                  if (pendingDeltas[i].key === k && activityClearsDeltaKind(a.kind, pendingDeltas[i].kind)) {
+                    pendingDeltas.splice(i, 1);
+                  }
                 }
               }
               pendingActs.push(a);
@@ -1295,6 +1304,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   // Main agent is the human↔orchestrator CONSOLE: only the conversation (user msgs +
   // the main agent's own replies/steps). Planner session shows planner steps; a
   // worker session shows only its intent's activity, led by the intent objective.
+  const activeMetaTitle = sessionMeta.get(active.id)?.title;
   const activity = React.useMemo(() => {
     const items = activeState?.items ?? [];
     // The main-agent console renders purely from server data: the human turn is
@@ -1305,7 +1315,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     if (isPlanner || isSystem) return items;
     // Worker session: the intent leads the transcript as a right-aligned "user"-style
     // message (the task handed to this worker), followed by its execution steps.
-    const intentTitle = sessionMeta.get(active.id)?.title ?? active.title;
+    const intentTitle = activeMetaTitle ?? active.title;
     const intentMsg: Activity = {
       seq: -1, // sorts/leads before any real step (real seq ≥ 0)
       worker: items[0]?.worker ?? active.id, // reuse the lane so no worker chips appear
@@ -1326,7 +1336,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     active.last_activity,
     active.source_task_id,
     active.inherited,
-    sessionMeta,
+    activeMetaTitle,
   ]);
 
   // seq of this session's most-recent TodoWrite call — for the Todo popover.
@@ -1677,7 +1687,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                       taskId={taskId}
                       chat={isMain}
                       focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
-                      streamSessionKey={active.live ? activeKey : null}
+                      streamSessionKey={isPlanner || active.live ? activeKey : null}
                     />
                   ) : (
                     <div className="pl-9 text-xs text-muted-foreground">

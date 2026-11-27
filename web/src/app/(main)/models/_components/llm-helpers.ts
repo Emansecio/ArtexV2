@@ -149,6 +149,25 @@ export function getThinkingTypes(): { value: string; label: string }[] {
     { value: NONE, label: t("Not sent (default)") },
     { value: "disabled", label: t("Disabled") },
     { value: "enabled", label: t("Enabled") },
+    { value: "adaptive", label: t("Adaptive") },
+  ];
+}
+
+export function thinkingTypeMatchesDetected(
+  thinkingType: string,
+  detectedThinkingType: string | undefined,
+  authoritative: boolean,
+): boolean {
+  if (!authoritative) return true;
+  if (thinkingType === NONE || thinkingType === "disabled") return true;
+  return Boolean(detectedThinkingType) && thinkingType === detectedThinkingType;
+}
+
+export function getThinkingDisplayOptions(): { value: string; label: string }[] {
+  return [
+    { value: NONE, label: t("Auto (visible)") },
+    { value: "summarized", label: t("Summarized") },
+    { value: "omitted", label: t("Omitted") },
   ];
 }
 
@@ -441,6 +460,7 @@ export function healthOf(
 export function reasoningSummary(p: LLMProfile): string | null {
   const parts: string[] = [];
   if (p.thinking_type === "enabled") parts.push(t("Enabled"));
+  else if (p.thinking_type === "adaptive") parts.push(t("Adaptive"));
   else if (p.thinking_type === "disabled") parts.push(t("Disabled"));
   if (p.reasoning_effort) parts.push(p.reasoning_effort === "off" ? t("off") : p.reasoning_effort);
   return parts.length > 0 ? parts.join(" · ") : null;
@@ -463,6 +483,8 @@ export function profileSavePayload(
     rate_per_minute: p.rate_per_minute ?? 0,
     context_window_k: p.context_window_k ?? 0,
     thinking_type: p.thinking_type ?? "",
+    thinking_budget: p.thinking_budget ?? 0,
+    thinking_display: p.thinking_display ?? "",
     reasoning_effort: p.reasoning_effort ?? "",
     priority: patch.priority ?? p.priority ?? 0,
     pool_exclude: patch.pool_exclude ?? p.pool_exclude ?? false,
