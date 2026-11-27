@@ -703,6 +703,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		}
 	}
 	dynamicTail += "\n\nStart executing the intent above: do only it, produce only facts, assets, findings, stop when done."
+	if def.KnowledgeBaseGuidance != "" {
+		dynamicTail += "\nTip: local offline KB (mcp__secrag__kb_search / kb_lookup_cve) is ready (<500ms, zero noise) — use it freely whenever fingerprinting a stack/dependency, hitting a WAF/filter, or chaining deeper non-duplicate bug-bounty techniques (focus=\"bounty\"|\"bypass\"|\"exploit\"|\"whitebox\"|\"cloud\"|\"ad\")."
+	}
 	system, boundary := assembleWorkerSystem(staticPart, dynamicTail, def, cachePrefixEnabled())
 	// The task-level deadline (injected via ctx) clamps this run's wall-clock budget +
 	// decides the wrap-up prompt (see taskclock.go).

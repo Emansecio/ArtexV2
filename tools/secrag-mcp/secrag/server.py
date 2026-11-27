@@ -16,7 +16,7 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP as _MCPServer  # type: ignore
 
 from .embeddings import LocalEmbedder, LocalReranker
-from .retriever import VALID_CATEGORIES, HybridRetriever
+from .retriever import VALID_CATEGORIES, VALID_FOCUSES, HybridRetriever
 from .storage import KnowledgeStore, resolve_data_dir
 
 READONLY_ANNOTATIONS = ToolAnnotations(
@@ -29,10 +29,11 @@ READONLY_ANNOTATIONS = ToolAnnotations(
 mcp = _MCPServer(
     "secrag",
     instructions=(
-        "Local offline Cybersecurity Knowledge Base (HackTricks, HackTricks Cloud, "
-        "PayloadsAllTheThings, InternalAllTheThings, OWASP WSTG/MASTG/API/CheatSheets, "
-        "GTFOBins, LOLBAS, WADComs, MITRE ATT&CK, Atomic Red Team, SigmaHQ, Nuclei Templates, "
-        "CISA KEV, Exploit-DB, PoC-in-GitHub, Bug Bounty writeups, CVEListV5, optional Primus-Seed). "
+        "Local offline Cybersecurity Knowledge Base (HackTricks, HackTricks Cloud, The Hacker Recipes, "
+        "HackingTheCloud, Stratus Red Team, PayloadsAllTheThings, InternalAllTheThings, PortSwigger Labs, "
+        "HackerOne Disclosed Reports, HowToHunt, OWASP WSTG/MASTG/API/ASVS/LLM/CheatSheets, GTFOBins, LOLBAS, "
+        "WADComs, MITRE ATT&CK, Atomic Red Team, SigmaHQ, Semgrep Whitebox Rules, Nuclei Templates, Vulhub PoCs, "
+        "Metasploit Module Docs, CISA KEV, Exploit-DB, Trickest CVE PoCs, PoC-in-GitHub, GHSA Advisories, CVEListV5). "
         "Use concise English technical keywords in kb_search, then kb_read_section to "
         "expand promising hits, or kb_lookup_cve for exact CVE intelligence."
     ),
@@ -103,6 +104,48 @@ VALID_SOURCES = {
     "mitre-attack", "atomic-red-team", "nuclei", "cisa-kev",
     "bugbounty-writeups", "poc-in-github", "sigma-rules", "exploitdb",
     "cvelist-v5", "primus-seed",
+    # Phase 3 — Deep Anti-Duplicate Bug Bounty, PoC & Advisory Pack
+    "hackerone-disclosed", "portswigger-labs", "bounty-methodology",
+    "the-hacker-recipes", "hacking-the-cloud", "vulhub-pocs",
+    "metasploit-docs", "trickest-cve", "ghsa-advisories", "semgrep-rules",
+}
+
+
+CATEGORY_ALIASES = {
+    "bounty": "writeups",
+    "bugbounty": "writeups",
+    "bug-bounty": "writeups",
+    "hackerone": "writeups",
+    "reports": "writeups",
+    "whitebox": "detection",
+    "code": "detection",
+    "sast": "detection",
+    "semgrep": "detection",
+    "sigma": "detection",
+    "k8s": "cloud",
+    "kubernetes": "cloud",
+    "aws": "cloud",
+    "gcp": "cloud",
+    "azure": "cloud",
+    "container": "cloud",
+    "active-directory": "ad",
+    "kerberos": "ad",
+    "adcs": "ad",
+    "poc": "exploits",
+    "pocs": "exploits",
+    "exploit": "exploits",
+    "metasploit": "exploits",
+    "vulhub": "exploits",
+    "cves": "cve",
+    "advisory": "cve",
+    "advisories": "cve",
+    "ghsa": "cve",
+    "package": "cve",
+    "waf": "web",
+    "bypass": "web",
+    "http": "web",
+    "llm": "web",
+    "ai": "web",
 }
 
 
@@ -111,17 +154,23 @@ def kb_search(
     query: str,
     category: str = "",
     source: str = "",
+    focus: str = "",
     top_k: int = 5,
 ) -> str:
-    """Search the local cybersecurity knowledge base using 3-stage hybrid retrieval (BM25 + dense vectors + cross-encoder reranker).
+    """Search ArtexV2's local offline Cybersecurity Knowledge Base (~482k docs) with intent-aware 3-stage hybrid retrieval (BM25 + synonym expansion + dense vectors + cross-encoder reranker + cross-source diversity).
 
-    Use concise English technical keywords (e.g. "SSTI Jinja2 filter bypass", "Kubernetes RBAC privilege escalation",
-    "GraphQL introspection auth bypass", "ADCS ESC8 relay", "Redis Lua sandbox escape").
-    Optional category filter: web, api, cloud, ad, privesc, mobile, network, binary, cve, mitre, detection, exploits, writeups, threat-intel.
-    Optional source filter: hacktricks, hacktricks-cloud, payloads, owasp, privesc-bins, mitre-attack, atomic-red-team, nuclei, cisa-kev, bugbounty-writeups, poc-in-github, sigma-rules, exploitdb, cvelist-v5, primus-seed.
-    Returns ranked excerpts with doc_id and section_id; call kb_read_section(doc_id, section_id) to read the full section of a relevant hit.
+    Always available, instant (<500ms), zero network noise. Use concise English technical keywords
+    (e.g. "SSTI Jinja2 filter bypass", "OAuth redirect_uri account takeover", "single-packet race condition",
+    "HTTP/2 request smuggling cache poisoning", "Kubernetes RBAC privilege escalation", "ADCS ESC8 relay",
+    "Next.js middleware auth bypass").
+    Optional focus (auto-detected if omitted): bounty, exploit, whitebox, cloud, ad, bypass, cve.
+    Optional category filter: web, api, cloud, ad, privesc, mobile, network, binary, cve, mitre, detection, exploits, writeups, threat-intel (aliases like bounty/whitebox/k8s/poc/ghsa are auto-normalized).
+    Optional source filter: hacktricks, hacktricks-cloud, the-hacker-recipes, hacking-the-cloud, payloads, portswigger-labs, bounty-methodology, hackerone-disclosed, bugbounty-writeups, owasp, privesc-bins, mitre-attack, atomic-red-team, nuclei, vulhub-pocs, metasploit-docs, cisa-kev, exploitdb, trickest-cve, poc-in-github, ghsa-advisories, cvelist-v5, sigma-rules, semgrep-rules.
+    Returns ranked cross-source excerpts with doc_id and section_id; call kb_read_section(doc_id, section_id) to read the full section of the winning hit.
     """
     cat = category.strip().lower()
+    if cat in CATEGORY_ALIASES:
+        cat = CATEGORY_ALIASES[cat]
     if cat and cat not in VALID_CATEGORIES:
         return (
             f"Invalid category '{category}'. Valid categories: "
@@ -133,11 +182,18 @@ def kb_search(
             f"Invalid source '{source}'. Valid sources: "
             + ", ".join(sorted(VALID_SOURCES))
         )
+    foc = focus.strip().lower()
+    if foc and foc not in VALID_FOCUSES:
+        return (
+            f"Invalid focus '{focus}'. Valid focus values: "
+            + ", ".join(sorted(VALID_FOCUSES))
+        )
 
     res = _get_retriever().search(
         query=query,
         category=cat or None,
         source=src or None,
+        focus=foc or None,
         top_k=max(1, min(int(top_k or 5), 10)),
     )
     hits = res.get("results") or []
@@ -146,19 +202,31 @@ def kb_search(
             f"No knowledge-base matches found for query={query!r}"
             + (f" category={cat!r}" if cat else "")
             + (f" source={source!r}" if source else "")
+            + (f" focus={foc!r}" if foc else "")
             + ". Try broader English technical terms or remove filters."
         )
 
+    intent_tag = f", intent={res['intent']}" if res.get("intent") else ""
     lines = [
-        f"Found {len(hits)} match(es) [{res.get('mode')}, {res.get('latency_ms')} ms] for: {query}"
+        f"Found {len(hits)} match(es) [{res.get('mode')}{intent_tag}, {res.get('latency_ms')} ms] for: {query}"
     ]
+    surfaced_cves: list[str] = []
     for idx, h in enumerate(hits, start=1):
-        cve_part = f" | CVEs: {', '.join(h['cves'][:4])}" if h.get("cves") else ""
+        cves_h = h.get("cves") or []
+        for c in cves_h[:2]:
+            if c not in surfaced_cves:
+                surfaced_cves.append(c)
+        cve_part = f" | CVEs: {', '.join(cves_h[:4])}" if cves_h else ""
         lines.append(
             f"\n### [{idx}] {h['breadcrumb']}\n"
             f"- ref: `doc_id={h['doc_id']}`, `section_id={h['section_id']}` | "
             f"source: `{h['source']}` | category: `{h['category']}` | score: {h['score']:.3f}{cve_part}\n\n"
             f"{h['excerpt']}"
+        )
+    if surfaced_cves and res.get("intent") != "cve":
+        lines.append(
+            f"\n> Next-step tip: call `kb_read_section(doc_id, section_id)` for full payloads/commands, "
+            f"or `kb_lookup_cve({surfaced_cves[0]!r})` for full KEV/Vulhub/Nuclei/Metasploit/PoC intelligence."
         )
     return "\n".join(lines)
 
@@ -205,9 +273,9 @@ def kb_read_section(doc_id: int, section_id: int = 0) -> str:
 
 @mcp.tool(annotations=READONLY_ANNOTATIONS)
 def kb_lookup_cve(cve_id: str) -> str:
-    """Direct indexed lookup for a specific CVE (e.g. 'CVE-2024-3094') across CISA KEV, Nuclei Templates, Exploit-DB, PoC-in-GitHub, CVEListV5, and HackTricks.
+    """Direct indexed lookup for a specific CVE (e.g. 'CVE-2024-3094') across CISA KEV, Vulhub PoCs, Nuclei Templates, Metasploit Docs, Exploit-DB, Trickest CVE PoCs, PoC-in-GitHub, HackerOne Disclosed Reports, GHSA Advisories, CVEListV5, and HackTricks.
 
-    Prefer this tool whenever you encounter a concrete CVE identifier or want to check whether a CVE is in CISA KEV or has a Nuclei template / PoC.
+    Prefer this tool whenever you encounter a concrete CVE identifier or want to check whether a CVE is in CISA KEV or has a Nuclei template / Vulhub / Metasploit / GitHub PoC.
     """
     if not cve_id or not cve_id.strip():
         return "Please provide a valid CVE identifier (e.g. 'CVE-2024-3094')."

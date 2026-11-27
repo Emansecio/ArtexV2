@@ -26,10 +26,10 @@ CVE_PARSE_RE = re.compile(r"(?:CVE[-_\s]+)?(\d{4})[-_\s]+(\d{4,7})", re.IGNORECA
 MITRE_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-][A-Za-z0-9_\-./:+]*")
 
-# Subsets with <= this many embedded chunks use exact SIMD matmul (100% recall in ~15-40 ms)
-# instead of approximate global HNSW over-fetching. 35,000 covers both 'web' (~22k) and
-# 'cloud' (~27k), the two most frequently queried pentest domains.
-EXACT_SUBSET_THRESHOLD = 35_000
+# Subsets with <= this many embedded chunks use exact SIMD matmul (100% recall in ~15-60 ms)
+# instead of approximate global HNSW over-fetching. 55,000 covers 'writeups' (~49k),
+# 'cloud' (~28k), and 'web' (~28k) — the three core pentest & bug-bounty domains.
+EXACT_SUBSET_THRESHOLD = 55_000
 FTS_SELECTIVE_DF_CAP = 25_000
 DEFAULT_FTS_TOKENIZE = "porter unicode61 tokenchars '-_'"
 _TOKENIZE_CLAUSE_RE = re.compile(r"tokenize\s*=\s*'((?:''|[^'])*)'", re.IGNORECASE)
@@ -144,6 +144,47 @@ def _quote_fts_token(tok: str) -> str:
     return '"' + tok.replace('"', '""') + '"'
 
 
+# High-signal offensive security acronym/synonym pairs used for Stage 1a BM25
+# recall expansion when exact AND yields too few matches.
+SECURITY_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "bola": ("idor", "object", "authorization"),
+    "idor": ("bola", "authorization"),
+    "ato": ("account", "takeover"),
+    "wcd": ("cache", "deception"),
+    "wcp": ("cache", "poisoning"),
+    "ssti": ("template", "injection"),
+    "ssrf": ("request", "forgery", "metadata"),
+    "xxe": ("xml", "external", "entity"),
+    "sqli": ("sql", "injection"),
+    "rce": ("remote", "code", "execution"),
+    "lfi": ("path", "traversal", "inclusion"),
+    "csrf": ("request", "forgery"),
+    "cswsh": ("websocket", "hijacking"),
+    "toctou": ("race", "condition"),
+    "desync": ("request", "smuggling"),
+    "adcs": ("certificate", "esc1", "esc8"),
+    "imds": ("metadata", "169.254.169.254"),
+    "imdsv2": ("metadata", "hop-limit"),
+    "jwt": ("json", "web", "token"),
+    "k8s": ("kubernetes", "rbac"),
+    "privesc": ("privilege", "escalation"),
+    "oauth": ("redirect_uri", "authorization"),
+    "saml": ("assertion", "signature"),
+}
+
+
+def expand_fts5_synonyms(tokens: list[str], max_extra: int = 4) -> list[str]:
+    """Return supplementary canonical security terms for BM25 recall expansion."""
+    seen = {t.lower() for t in tokens}
+    extra: list[str] = []
+    for tok in tokens:
+        for syn in SECURITY_SYNONYMS.get(tok.lower(), ()):
+            if syn not in seen:
+                seen.add(syn)
+                extra.append(syn)
+                if len(extra) >= max_extra:
+                    return extra
+    return extra
 def build_fts5_queries(query: str) -> tuple[str, str]:
     """Return (strict_and_query, relaxed_or_query) safely quoted for FTS5."""
     tokens = extract_fts5_tokens(query)
@@ -645,7 +686,7 @@ class KnowledgeStore:
         while True:
             rows = self.conn.execute(
                 """
-                SELECT id, breadcrumb, tags, cves, content
+                SELECT id, source, category, breadcrumb, tags, cves, content
                 FROM chunks
                 WHERE embedded = 0 AND id > ?
                 ORDER BY id ASC
@@ -658,7 +699,11 @@ class KnowledgeStore:
             batch: list[tuple[int, str]] = []
             for r in rows:
                 last_id = int(r["id"])
-                header = r["breadcrumb"]
+                header = f"[{r['category']}|{r['source']}] {r['breadcrumb']}"
+                if r["tags"]:
+                    tag_tokens = r["tags"].split()[:6]
+                    if tag_tokens:
+                        header = f"{header} ({', '.join(tag_tokens)})"
                 if r["cves"]:
                     cve_tokens = r["cves"].split()[:8]
                     if cve_tokens:
@@ -931,6 +976,7 @@ class KnowledgeStore:
         *,
         category: Optional[str] = None,
         source: Optional[str] = None,
+        exclude_categories: Optional[tuple[str, ...]] = None,
         limit: int = 40,
     ) -> list[tuple[int, float]]:
         tokens = extract_fts5_tokens(query)
@@ -945,6 +991,12 @@ class KnowledgeStore:
         if source:
             where_extra.append("c.source = ?")
             params_extra.append(source.lower())
+        if exclude_categories and not category:
+            ex = [c.lower() for c in exclude_categories if c]
+            if ex:
+                placeholders = ",".join("?" for _ in ex)
+                where_extra.append(f"c.category NOT IN ({placeholders})")
+                params_extra.extend(ex)
         extra_sql = (" AND " + " AND ".join(where_extra)) if where_extra else ""
 
         sql = f"""
@@ -976,6 +1028,18 @@ class KnowledgeStore:
 
         # 1. Exact full AND (always fast)
         _run_and_merge(" AND ".join(_quote_fts_token(t) for t in tokens))
+        if len(results) >= min(limit, 12):
+            return results
+
+        # 1b. Security acronym/synonym recall expansion (e.g. BOLA->IDOR, ATO->account takeover,
+        #     WCD->cache deception, TOCTOU->race condition) when exact AND is sparse.
+        if len(results) < min(limit, 8):
+            syns = expand_fts5_synonyms(tokens)
+            if syns:
+                base_non_acro = [t for t in tokens if t.lower() not in SECURITY_SYNONYMS][:2]
+                syn_terms = base_non_acro + syns[:2]
+                if len(syn_terms) >= 2:
+                    _run_and_merge(" AND ".join(_quote_fts_token(t) for t in syn_terms))
         if len(results) >= min(limit, 12) or len(tokens) == 1:
             return results
 
@@ -1007,6 +1071,7 @@ class KnowledgeStore:
         *,
         category: Optional[str] = None,
         source: Optional[str] = None,
+        exclude_categories: Optional[tuple[str, ...]] = None,
         limit: int = 40,
     ) -> list[tuple[int, float]]:
         idx, sig = self.get_readonly_vector_index_with_sig()
@@ -1015,15 +1080,16 @@ class KnowledgeStore:
 
         cat = category.lower() if category else None
         src = source.lower() if source else None
+        excl_cats = tuple(c.lower() for c in (exclude_categories or ()) if c) if not cat else ()
         q = query_vec.astype(np.float32)
 
-        if cat or src:
+        if cat or src or excl_cats:
             meta = self._get_meta_cache(sig)
-            # Small-subset fast path: exact SIMD dot product -> 100% recall in ~15-40 ms!
+            # Small-subset fast path: exact SIMD dot product -> 100% recall in ~15-60 ms!
             subset: Optional[np.ndarray] = None
             if cat and not src and cat in meta.cat_embed_ids:
                 subset = meta.cat_embed_ids[cat]
-            elif src and not cat and src in meta.src_embed_ids:
+            elif src and not cat and not excl_cats and src in meta.src_embed_ids:
                 subset = meta.src_embed_ids[src]
             elif cat and src:
                 base = meta.cat_embed_ids.get(cat)
@@ -1077,11 +1143,12 @@ class KnowledgeStore:
                     order = part[np.argsort(sims[part])[::-1]]
                 return [(int(subset[i]), float(1.0 - sims[i])) for i in order]
 
-            # Large category/source: global HNSW + O(1) uint8 array filtering (zero SQLite round-trip)
+            # Large category/source or exclude-category pass: global HNSW + O(1) uint8 array filtering
             want_c = meta.cat_to_id.get(cat, -1) if cat else 0
             want_s = meta.src_to_id.get(src, -1) if src else 0
             if (cat and want_c < 0) or (src and want_s < 0):
                 return []
+            excl_c_ids = [meta.cat_to_id[c] for c in excl_cats if c in meta.cat_to_id]
             fetch_k = min(len(idx), max(limit * 6, 300))
             for _attempt in range(2):
                 matches = idx.search(q, fetch_k)
@@ -1094,6 +1161,8 @@ class KnowledgeStore:
                     mask = mask & (meta.cat_arr[safe_keys] == want_c)
                 if src:
                     mask = mask & (meta.src_arr[safe_keys] == want_s)
+                for ec_id in excl_c_ids:
+                    mask = mask & (meta.cat_arr[safe_keys] != ec_id)
                 filtered_keys = keys[mask][:limit]
                 filtered_dists = dists[mask][:limit]
                 if len(filtered_keys) >= limit or fetch_k >= len(idx):
@@ -1231,12 +1300,17 @@ class KnowledgeStore:
             ORDER BY ci.is_kev DESC,
                      CASE ci.source
                          WHEN 'cisa-kev' THEN 1
-                         WHEN 'nuclei' THEN 2
-                         WHEN 'exploitdb' THEN 3
-                         WHEN 'poc-in-github' THEN 4
-                         WHEN 'cvelist-v5' THEN 5
-                         WHEN 'hacktricks' THEN 6
-                         ELSE 7
+                         WHEN 'vulhub-pocs' THEN 2
+                         WHEN 'nuclei' THEN 3
+                         WHEN 'metasploit-docs' THEN 4
+                         WHEN 'exploitdb' THEN 5
+                         WHEN 'trickest-cve' THEN 6
+                         WHEN 'poc-in-github' THEN 7
+                         WHEN 'hackerone-disclosed' THEN 8
+                         WHEN 'ghsa-advisories' THEN 9
+                         WHEN 'cvelist-v5' THEN 10
+                         WHEN 'hacktricks' THEN 11
+                         ELSE 12
                      END ASC
             LIMIT ?
             """,

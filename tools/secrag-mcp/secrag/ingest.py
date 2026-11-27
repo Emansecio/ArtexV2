@@ -24,10 +24,14 @@ from .chunker import (
     infer_category_from_path,
     parse_atomic_yaml,
     parse_cve_v5_json,
+    parse_ghsa_json,
+    parse_hackerone_report_md,
     parse_mitre_stix,
     parse_nuclei_yaml,
     parse_poc_in_github_json,
+    parse_semgrep_yaml,
     parse_sigma_yaml,
+    parse_trickest_cve_md,
     strip_frontmatter,
 )
 from .embeddings import LocalEmbedder
@@ -957,6 +961,453 @@ def ingest_primus_seed(store: KnowledgeStore, src_dir: Path, max_docs: int = 150
     return f"stream:{max_docs}"
 
 
+# ---- Phase 3 Ingesters (Deep Bug Bounty, Exploit PoCs, Whitebox & Package Advisories) ----
+
+def ingest_hackerone_disclosed(store: KnowledgeStore, src_dir: Path) -> str:
+    dest = src_dir / "hackerone-disclosed"
+    rev = _git_sync(
+        "https://github.com/ajaysenr/HackerOne-Disclosed-Reports.git",
+        dest,
+        sparse_paths=["reports"],
+    )
+    reports_dir = dest / "reports"
+    total = 0
+    high_sig = 0
+    lexical_only = 0
+    batch = 0
+    if reports_dir.exists():
+        for p in _iter_files(reports_dir, {".md", ".markdown"}, max_bytes=300_000):
+            rel = str(p.relative_to(reports_dir))
+            try:
+                raw = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            c_hash = sha256_text(raw)
+            if store.document_unchanged("hackerone-disclosed", rel, c_hash):
+                continue
+            parsed = parse_hackerone_report_md(raw, rel)
+            if not parsed:
+                continue
+            should_embed = bool(parsed.get("is_high_signal"))
+            store.upsert_document(
+                source="hackerone-disclosed",
+                category=parsed["category"],
+                rel_path=rel,
+                title=parsed["title"],
+                url=parsed["url"],
+                tags=parsed["tags"],
+                cves=parsed["cves"],
+                full_text=parsed["full_text"],
+                sections_with_chunks=parsed["sections"],
+                cve_entries=parsed["cve_entries"],
+                content_hash=c_hash,
+                embed_chunks=should_embed,
+            )
+            total += 1
+            if should_embed:
+                high_sig += 1
+            else:
+                lexical_only += 1
+            batch += 1
+            if batch >= 300:
+                store.conn.commit()
+                batch = 0
+    if batch:
+        store.conn.commit()
+    log(
+        f"hackerone-disclosed: indexed {total} disclosed reports "
+        f"(vector-queued={high_sig}, lexical-only={lexical_only}, rev {rev})"
+    )
+    return rev
+
+
+def ingest_portswigger_labs(store: KnowledgeStore, src_dir: Path) -> str:
+    repos = [
+        ("portswigger-all-labs", "https://github.com/hanzalaghayasabbasi/portswigger-all-labs.git", "PortSwigger Labs"),
+        ("portswigger-writeups", "https://github.com/M1SD4Q/Portswigger-Writeups.git", "PortSwigger Deep Writeups"),
+    ]
+    revs = []
+    total = 0
+    for folder, url, label in repos:
+        dest = src_dir / folder
+        try:
+            rev = _git_sync(url, dest)
+            revs.append(f"{folder}:{rev}")
+            total += _ingest_markdown_tree(
+                store,
+                source="portswigger-labs",
+                root=dest,
+                root_label=label,
+                url_base=url.removesuffix(".git") + "/blob/main",
+                prefix_rel=folder,
+                category_override="web",
+                extra_tags=["portswigger", "web-security", "bug-bounty"],
+            )
+        except Exception as e:
+            if store.conn.in_transaction:
+                store.conn.rollback()
+            log(f"portswigger-labs ({folder}) warning: {e}")
+    log(f"portswigger-labs: indexed {total} new/updated docs ({', '.join(revs)})")
+    return ",".join(revs)
+
+
+def ingest_bounty_methodology(store: KnowledgeStore, src_dir: Path) -> str:
+    repos = [
+        ("howtohunt", "https://github.com/KathanP19/HowToHunt.git", "HowToHunt", None, None, ["bug-bounty", "methodology"]),
+        ("advanced-sqli", "https://github.com/kleiton0x00/Advanced-SQL-Injection-Cheatsheet.git", "Advanced SQLi", "web", None, ["sqli", "waf-bypass"]),
+        ("owasp-llm", "https://github.com/OWASP/www-project-top-10-for-large-language-model-applications.git", "OWASP LLM Top 10", "web", ["2_0_vulns"], ["llm", "ai-security", "owasp"]),
+        ("owasp-asvs", "https://github.com/OWASP/ASVS.git", "OWASP ASVS", "web", ["5.0/en"], ["asvs", "checklist", "owasp"]),
+    ]
+    revs = []
+    total = 0
+    for folder, url, label, cat_ov, sparse, tags in repos:
+        dest = src_dir / folder
+        try:
+            rev = _git_sync(url, dest, sparse_paths=sparse)
+            revs.append(f"{folder}:{rev}")
+            root_dir = dest / sparse[0] if (sparse and (dest / sparse[0]).exists()) else dest
+            total += _ingest_markdown_tree(
+                store,
+                source="bounty-methodology",
+                root=root_dir,
+                root_label=label,
+                url_base=url.removesuffix(".git") + "/blob/main",
+                prefix_rel=folder,
+                category_override=cat_ov,
+                extra_tags=tags,
+            )
+        except Exception as e:
+            if store.conn.in_transaction:
+                store.conn.rollback()
+            log(f"bounty-methodology ({folder}) warning: {e}")
+    log(f"bounty-methodology: indexed {total} new/updated docs ({', '.join(revs)})")
+    return ",".join(revs)
+
+
+def ingest_the_hacker_recipes(store: KnowledgeStore, src_dir: Path) -> str:
+    dest = src_dir / "the-hacker-recipes"
+    rev = _git_sync(
+        "https://github.com/The-Hacker-Recipes/The-Hacker-Recipes.git",
+        dest,
+        sparse_paths=["docs"],
+    )
+    root = dest / "docs" if (dest / "docs").exists() else dest
+    n = _ingest_markdown_tree(
+        store,
+        source="the-hacker-recipes",
+        root=root,
+        root_label="The Hacker Recipes",
+        url_base="https://github.com/The-Hacker-Recipes/The-Hacker-Recipes/blob/main/docs",
+        extra_tags=["the-hacker-recipes"],
+    )
+    log(f"the-hacker-recipes: indexed {n} new/updated docs (rev {rev})")
+    return rev
+
+
+def ingest_hacking_the_cloud(store: KnowledgeStore, src_dir: Path) -> str:
+    repos = [
+        ("hacking-the-cloud", "https://github.com/Hacking-the-Cloud/hackingthe.cloud.git", "HackingTheCloud", ["content"], ["cloud", "aws", "gcp", "azure"]),
+        ("stratus-red-team", "https://github.com/DataDog/stratus-red-team.git", "Stratus Red Team", ["docs/attack-techniques"], ["cloud", "stratus", "k8s"]),
+    ]
+    revs = []
+    total = 0
+    for folder, url, label, sparse, tags in repos:
+        dest = src_dir / folder
+        try:
+            rev = _git_sync(url, dest, sparse_paths=sparse)
+            revs.append(f"{folder}:{rev}")
+            root_dir = dest / sparse[0] if (dest / sparse[0]).exists() else dest
+            total += _ingest_markdown_tree(
+                store,
+                source="hacking-the-cloud",
+                root=root_dir,
+                root_label=label,
+                url_base=url.removesuffix(".git") + "/blob/main/" + sparse[0],
+                prefix_rel=folder,
+                category_override="cloud",
+                extra_tags=tags,
+            )
+        except Exception as e:
+            if store.conn.in_transaction:
+                store.conn.rollback()
+            log(f"hacking-the-cloud ({folder}) warning: {e}")
+    log(f"hacking-the-cloud: indexed {total} new/updated docs ({', '.join(revs)})")
+    return ",".join(revs)
+
+
+def ingest_vulhub_pocs(store: KnowledgeStore, src_dir: Path) -> str:
+    dest = src_dir / "vulhub"
+    rev = _git_sync("https://github.com/vulhub/vulhub.git", dest)
+    total = 0
+    batch = 0
+    for p in _iter_files(dest, {".md"}, max_bytes=200_000):
+        # Keep only English lab README.md inside product/vuln subdirectories
+        if p.name.lower() != "readme.md" or p.parent == dest:
+            continue
+        rel = str(p.relative_to(dest))
+        try:
+            raw = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if len(raw.strip()) < 100:
+            continue
+        c_hash = sha256_text(raw)
+        if store.document_unchanged("vulhub-pocs", rel, c_hash):
+            continue
+        parts = Path(rel).parent.parts
+        title_line = ""
+        for ln in raw.splitlines()[:6]:
+            if ln.startswith("# "):
+                title_line = ln[2:].strip()
+                break
+        title = title_line or " / ".join(parts[-2:])
+        bc = " > ".join(["Vulhub", *parts[-2:]])
+        sections = chunk_markdown(raw[:40_000], doc_title=title[:200], root_breadcrumb=bc)
+        if not sections:
+            continue
+        cves = extract_cves(rel + "\n" + raw)
+        cve_entries = [(c, "", False, f"Vulhub PoC ({'/'.join(parts[-2:])}): {title[:180]}") for c in cves[:8]] or None
+        store.upsert_document(
+            source="vulhub-pocs",
+            category="exploits",
+            rel_path=rel,
+            title=f"Vulhub: {title}"[:240],
+            url=f"https://github.com/vulhub/vulhub/blob/master/{rel}",
+            tags=list(dict.fromkeys(["vulhub", "poc", "exploit", *(parts[:2]), *cves[:4]])),
+            cves=cves,
+            full_text=raw[:40_000],
+            sections_with_chunks=sections,
+            cve_entries=cve_entries,
+            content_hash=c_hash,
+        )
+        total += 1
+        batch += 1
+        if batch >= 200:
+            store.conn.commit()
+            batch = 0
+    if batch:
+        store.conn.commit()
+    log(f"vulhub-pocs: indexed {total} English CVE/exploit PoC walkthroughs (rev {rev})")
+    return rev
+
+
+def ingest_metasploit_docs(store: KnowledgeStore, src_dir: Path) -> str:
+    dest = src_dir / "metasploit-docs"
+    rev = _git_sync(
+        "https://github.com/rapid7/metasploit-framework.git",
+        dest,
+        sparse_paths=["documentation/modules"],
+    )
+    mod_root = dest / "documentation" / "modules"
+    total = 0
+    batch = 0
+    if mod_root.exists():
+        for p in _iter_files(mod_root, {".md"}, max_bytes=200_000):
+            if p.name.lower() in SKIP_MD_NAMES or p.name.lower() == "module_doc_template.md":
+                continue
+            rel = str(p.relative_to(mod_root))
+            try:
+                raw = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if len(raw.strip()) < 100:
+                continue
+            c_hash = sha256_text(raw)
+            if store.document_unchanged("metasploit-docs", rel, c_hash):
+                continue
+            mod_name = rel.removesuffix(".md")
+            title_stem = p.stem.replace("_", " ").strip()
+            bc = " > ".join(["Metasploit", *Path(mod_name).parts[:3], title_stem])
+            sections = chunk_markdown(raw[:35_000], doc_title=mod_name, root_breadcrumb=bc)
+            if not sections:
+                continue
+            cves = extract_cves(mod_name.replace("_", "-") + "\n" + raw)
+            cve_entries = [(c, "", False, f"Metasploit module {mod_name}") for c in cves[:8]] or None
+            store.upsert_document(
+                source="metasploit-docs",
+                category="exploits",
+                rel_path=rel,
+                title=f"MSF {mod_name}"[:240],
+                url=f"https://github.com/rapid7/metasploit-framework/blob/master/documentation/modules/{rel}",
+                tags=list(dict.fromkeys(["metasploit", "exploit", *(Path(mod_name).parts[:2]), *cves[:4]])),
+                cves=cves,
+                full_text=raw[:35_000],
+                sections_with_chunks=sections,
+                cve_entries=cve_entries,
+                content_hash=c_hash,
+            )
+            total += 1
+            batch += 1
+            if batch >= 250:
+                store.conn.commit()
+                batch = 0
+    if batch:
+        store.conn.commit()
+    log(f"metasploit-docs: indexed {total} module docs (rev {rev})")
+    return rev
+
+
+def ingest_trickest_cve(store: KnowledgeStore, src_dir: Path) -> str:
+    dest = src_dir / "trickest-cve"
+    end_year = datetime.date.today().year
+    years = [str(y) for y in range(2021, end_year + 1)]
+    rev = _git_sync("https://github.com/trickest/cve.git", dest, sparse_paths=years)
+    total = 0
+    batch = 0
+    for y in years:
+        ydir = dest / y
+        if not ydir.exists():
+            continue
+        for p in _iter_files(ydir, {".md"}, max_bytes=160_000):
+            if not p.name.upper().startswith("CVE-"):
+                continue
+            rel = str(p.relative_to(dest))
+            try:
+                raw = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            c_hash = sha256_text(raw)
+            if store.document_unchanged("trickest-cve", rel, c_hash):
+                continue
+            parsed = parse_trickest_cve_md(raw, rel)
+            if not parsed:
+                continue
+            store.upsert_document(
+                source="trickest-cve",
+                category=parsed["category"],
+                rel_path=rel,
+                title=parsed["title"],
+                url=parsed["url"],
+                tags=parsed["tags"],
+                cves=parsed["cves"],
+                full_text=parsed["full_text"],
+                sections_with_chunks=parsed["sections"],
+                cve_entries=parsed["cve_entries"],
+                content_hash=c_hash,
+            )
+            total += 1
+            batch += 1
+            if batch >= 400:
+                store.conn.commit()
+                batch = 0
+    if batch:
+        store.conn.commit()
+    log(f"trickest-cve: indexed {total} PoC-backed CVEs 2021-{end_year} (rev {rev})")
+    return rev
+
+
+def ingest_ghsa_advisories(store: KnowledgeStore, src_dir: Path) -> str:
+    dest = src_dir / "ghsa-advisories"
+    end_year = datetime.date.today().year
+    years = [f"advisories/github-reviewed/{y}" for y in range(2022, end_year + 1)]
+    rev = _git_sync("https://github.com/github/advisory-database.git", dest, sparse_paths=years)
+    total = 0
+    high_sig = 0
+    lexical_only = 0
+    batch = 0
+    for y in years:
+        ydir = dest / y
+        if not ydir.exists():
+            continue
+        for p in _iter_files(ydir, {".json"}, max_bytes=200_000):
+            if not p.name.upper().startswith("GHSA-"):
+                continue
+            rel = str(p.relative_to(dest))
+            try:
+                raw = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            c_hash = sha256_text(raw)
+            if store.document_unchanged("ghsa-advisories", rel, c_hash):
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            parsed = parse_ghsa_json(data, rel)
+            if not parsed:
+                continue
+            should_embed = bool(parsed.get("is_high_signal"))
+            store.upsert_document(
+                source="ghsa-advisories",
+                category=parsed["category"],
+                rel_path=rel,
+                title=parsed["title"],
+                url=parsed["url"],
+                tags=parsed["tags"],
+                cves=parsed["cves"],
+                full_text=parsed["full_text"],
+                sections_with_chunks=parsed["sections"],
+                cve_entries=parsed["cve_entries"],
+                content_hash=c_hash,
+                embed_chunks=should_embed,
+            )
+            total += 1
+            if should_embed:
+                high_sig += 1
+            else:
+                lexical_only += 1
+            batch += 1
+            if batch >= 400:
+                store.conn.commit()
+                batch = 0
+    if batch:
+        store.conn.commit()
+    log(
+        f"ghsa-advisories: indexed {total} package advisories 2022-{end_year} "
+        f"(vector-queued={high_sig}, lexical-only={lexical_only}, rev {rev})"
+    )
+    return rev
+
+
+def ingest_semgrep_rules(store: KnowledgeStore, src_dir: Path) -> str:
+    dest = src_dir / "semgrep-rules"
+    langs = ["javascript", "typescript", "python", "go", "java", "php", "ruby", "csharp", "rust", "solidity", "generic"]
+    rev = _git_sync("https://github.com/semgrep/semgrep-rules.git", dest, sparse_paths=langs)
+    total = 0
+    batch = 0
+    for lang in langs:
+        ldir = dest / lang
+        if not ldir.exists():
+            continue
+        for p in _iter_files(ldir, {".yml", ".yaml"}, max_bytes=120_000):
+            if p.name.endswith(".test.yaml") or p.name.endswith(".test.yml"):
+                continue
+            rel = str(p.relative_to(dest))
+            try:
+                raw = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            c_hash = sha256_text(raw)
+            if store.document_unchanged("semgrep-rules", rel, c_hash):
+                continue
+            parsed = parse_semgrep_yaml(raw, rel)
+            if not parsed:
+                continue
+            store.upsert_document(
+                source="semgrep-rules",
+                category=parsed["category"],
+                rel_path=rel,
+                title=parsed["title"],
+                url=parsed["url"],
+                tags=parsed["tags"],
+                cves=parsed["cves"],
+                full_text=parsed["full_text"],
+                sections_with_chunks=parsed["sections"],
+                cve_entries=parsed["cve_entries"],
+                content_hash=c_hash,
+            )
+            total += 1
+            batch += 1
+            if batch >= 300:
+                store.conn.commit()
+                batch = 0
+    if batch:
+        store.conn.commit()
+    log(f"semgrep-rules: indexed {total} whitebox security rules (rev {rev})")
+    return rev
+
+
 SOURCES: list[tuple[str, int, Callable[[KnowledgeStore, Path], str]]] = [
     # Phase 1 — Core Tactical Pack
     ("cisa-kev", 1, ingest_cisa_kev),
@@ -974,8 +1425,19 @@ SOURCES: list[tuple[str, int, Callable[[KnowledgeStore, Path], str]]] = [
     ("exploitdb", 2, ingest_exploitdb),
     ("poc-in-github", 2, ingest_poc_in_github),
     ("cvelist-v5", 2, ingest_cvelist_v5),
-    # Phase 3 — Optional gated HF corpus (requires HF_TOKEN)
-    ("primus-seed", 3, ingest_primus_seed),
+    # Phase 3 — Anti-Duplicate Bug Bounty, PoCs, Cloud/AD & Package Advisories (100% open, zero-gate)
+    ("portswigger-labs", 3, ingest_portswigger_labs),
+    ("bounty-methodology", 3, ingest_bounty_methodology),
+    ("the-hacker-recipes", 3, ingest_the_hacker_recipes),
+    ("hacking-the-cloud", 3, ingest_hacking_the_cloud),
+    ("vulhub-pocs", 3, ingest_vulhub_pocs),
+    ("metasploit-docs", 3, ingest_metasploit_docs),
+    ("semgrep-rules", 3, ingest_semgrep_rules),
+    ("hackerone-disclosed", 3, ingest_hackerone_disclosed),
+    ("trickest-cve", 3, ingest_trickest_cve),
+    ("ghsa-advisories", 3, ingest_ghsa_advisories),
+    # Phase 4 — Optional gated HF corpus (requires HF_TOKEN)
+    ("primus-seed", 4, ingest_primus_seed),
 ]
 
 
@@ -1060,8 +1522,8 @@ def run_embedding_pass(store: KnowledgeStore, batch_size: int = 512, checkpoint_
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest & index ArtexV2 Cybersecurity Knowledge Base")
     parser.add_argument("--data-dir", default=None, help="Target data directory (default: data/secrag)")
-    parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=None, help="Ingest only Phase 1, 2, or 3 sources")
-    parser.add_argument("--all", action="store_true", help="Ingest Phase 1 and Phase 2 open sources")
+    parser.add_argument("--phase", type=int, choices=[1, 2, 3, 4], default=None, help="Ingest only Phase 1, 2, 3, or 4 sources")
+    parser.add_argument("--all", action="store_true", help="Ingest all open zero-gate sources (Phases 1, 2, and 3)")
     parser.add_argument("--source", action="append", default=[], help="Ingest specific source(s) by name")
     parser.add_argument("--skip-embed", action="store_true", help="Only populate SQLite + FTS5; skip vector embedding pass")
     parser.add_argument("--embed-only", action="store_true", help="Run vector embedding pass on pending chunks without fetching sources")
@@ -1102,7 +1564,7 @@ def main() -> None:
                     if name in want_sources:
                         selected.append((name, phase, fn))
                 elif args.all:
-                    if phase in (1, 2):
+                    if phase in (1, 2, 3):
                         selected.append((name, phase, fn))
                 elif args.phase is not None:
                     if phase == args.phase:
